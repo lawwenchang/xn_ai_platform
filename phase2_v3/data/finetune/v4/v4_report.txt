@@ -1,0 +1,19 @@
+[扩产] zh_excel_qa_bank 全量 489 条，excel_zh 池 510 → 510
+── 独本数据池（去重后） ──
+  dag          17 条
+  audit_qa     33 条
+  style        31 条
+  excel_zh     510 条
+  excel_mixed  1300 条
+  en_code      3500 条
+  旧验证集     12 条
+[DAG扩增] 7 场景种子 → 114 条变体
+── 产出 ──
+  -> v4_stage1_zh_code.jsonl: 4496 条
+  -> v4_stage2_audit_dag.jsonl: 758 条
+  -> v4_stage3_mix.jsonl: 881 条
+  -> v4_val.jsonl: 38 条
+── 第二轮构成（按类型） ──
+{"dag": 202, "excel": 300, "audit_qa": 132, "style": 124}
+验证集: 38 条（旧val 12 + DAG变体 14 + 中文Excel 12，签名去重后）
+训练∩验证 重叠检查: 0 条（应为 0）

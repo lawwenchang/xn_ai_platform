@@ -1,0 +1,70 @@
+        elif op_name == "Diff":
+            dep_ids = params.get("depends_on", [])
+            src_vars = []
+            for dep_id in dep_ids:
+                dep_op = op_map.get(dep_id)
+                if dep_op:
+                    src_vars.append(alias_vars.get(dep_op.get('output_alias'), f'df_{dep_id}'))
+            if len(src_vars) < 2:
+                all_vars = list(alias_vars.values())
+                src_vars = all_vars[-2:] if len(all_vars) >= 2 else (src_vars + ['df', 'df'])
+            left_var, right_var = (src_vars[0], src_vars[1]) if len(src_vars) >= 2 else ('df', 'df')
+            keys = params.get("keys", params.get("on", [])) or []
+            if isinstance(keys, str):
+                keys = [keys]
+            col_a = str(params.get("col_a", "auto"))
+            col_b = str(params.get("col_b", "auto"))
+            tol_abs = params.get("tolerance_abs")
+            tol_pct = params.get("tolerance_pct")
+            try:
+                tol_repr = repr(float(tol_abs)) if tol_abs is not None else "None"
+            except (ValueError, TypeError):
+                tol_repr = "None"
+            try:
+                pct_repr = repr(float(tol_pct)) if tol_pct is not None else "None"
+            except (ValueError, TypeError):
+                pct_repr = "None"
+            # 按业务键 outer 对齐（indicator 标记仅左/仅右/双方），拒绝按行号比对
+            code_lines.extend([
+                f"if '{left_var}' in dir() and '{right_var}' in dir():",
+                f"    _keys = [c for c in {keys} if c in {left_var}.columns and c in {right_var}.columns and not _is_meaningless_key(c, {left_var})]",
+                f"    if not _keys:",
+                f"        _keys = [c for c in list({left_var}.columns) if c in {right_var}.columns and not _is_meaningless_key(c, {left_var})]",
+                f"        print('[Diff] 未指定有效键，回退公共有意义键: ' + str(_keys))",
+                f"    if not _keys:",
+                f"        print('[Diff] ❌ 两表无公共有意义键，拒绝按行号比对！左列: ' + str(list({left_var}.columns)) + ' | 右列: ' + str(list({right_var}.columns)))",
+                f"        {op_alias} = pd.DataFrame()",
+                f"    else:",
+                f"        _m = pd.merge({left_var}, {right_var}, on=_keys, how='outer', indicator=True, suffixes=('_A', '_B'))",
+                f"        _ca, _cb = {col_a!r}, {col_b!r}",
+                f"        if _ca == 'auto':",
+                f"            _na = [c for c in {left_var}.columns if pd.api.types.is_numeric_dtype({left_var}[c]) and not _is_meaningless_key(c, {left_var})]",
+                f"            _ca = _na[0] if _na else None",
+                f"        if _cb == 'auto':",
+                f"            _nb = [c for c in {right_var}.columns if pd.api.types.is_numeric_dtype({right_var}[c]) and not _is_meaningless_key(c, {right_var})]",
+                f"            _cb = _nb[0] if _nb else None",
+                f"        _ca2 = _ca if _ca in _m.columns else (str(_ca) + '_A' if str(_ca) + '_A' in _m.columns else None)",
+                f"        _cb2 = _cb if _cb in _m.columns else (str(_cb) + '_B' if str(_cb) + '_B' in _m.columns else None)",
+                f"        if _ca2 and _cb2:",
+                f"            _m['差异'] = pd.to_numeric(_m[_ca2], errors='coerce') - pd.to_numeric(_m[_cb2], errors='coerce')",
+                f"            _tol_abs, _tol_pct = {tol_repr}, {pct_repr}",
+                f"            if _tol_abs is not None:",
+                f"                _m['差异超限'] = _m['差异'].abs() > _tol_abs",
+                f"                print('[Diff] 容差: ±' + str(_tol_abs) + ' 元（绝对）')",
+                f"            elif _tol_pct is not None:",
+                f"                _base = pd.to_numeric(_m[_cb2], errors='coerce').abs().clip(lower=0.01)",
+                f"                _m['差异超限'] = (_m['差异'].abs() / _base * 100) > _tol_pct",
+                f"                print('[Diff] 容差: ' + str(_tol_pct) + '%（仅汇总层面适用，逐笔核对请用 tolerance_abs=0.01）')",
+                f"            else:",
+                f"                _m['差异超限'] = _m['差异'].abs() > 0.01",
+                f"                print('[Diff] 未指定容差，默认 ±0.01 元（精确到分）')",
+                f"        else:",
+                f"            print('[Diff] ⚠ 未找到可比数值列: ' + str((_ca, _cb)))",
+                f"        _m['对齐状态'] = _m['_merge'].map({{'both': '双方都有', 'left_only': '仅左表有', 'right_only': '仅右表有'}})",
+                f"        {op_alias} = _m.drop(columns=['_merge'])",
+                f"        print('[Diff] 键=' + str(_keys) + ', 仅左=' + str(int((_m['_merge'] == 'left_only').sum())) + ', 仅右=' + str(int((_m['_merge'] == 'right_only').sum())) + ', 双方=' + str(int((_m['_merge'] == 'both').sum())))",
+                f"else:",
+                f"    {op_alias} = pd.DataFrame()",
+            ])
+            alias_vars[op_alias] = op_alias
+            last_df_var = op_alias

@@ -1,0 +1,12 @@
+==============================================================
+白皮书 V2.7 基础设施连通性验证
+==============================================================
+[FAIL] Docker: DockerException: Error while fetching server API version: (2, 'CreateFile', '系统找不到指定的文件。')
+[FAIL] vLLM 隧道 localhost:18000 端口未通（先建 SSH 隧道）
+[WARN] Dify 工作流引擎 (localhost:5001) 未启动
+[WARN] Redis (Celery broker) (localhost:6379) 未启动
+[PASS] FastAPI 后端 /docs -> HTTP 200
+[WARN] Vue 前端 dev server (localhost:3000) 未启动
+--------------------------------------------------------------
+汇总: {"Docker": "离线", "vLLM隧道": "离线", "Dify": "离线", "Redis": "离线", "后端": "在线", "前端": "离线"}
+报告 -> D:\Liu\ai_platform_code\phase2_v3\data\verify_stack_report.txt

@@ -1,0 +1,12 @@
+==============================================================
+白皮书 V2.7 基础设施连通性验证
+==============================================================
+[PASS] Docker daemon 在线 (v29.6.1)
+       相关镜像: ['audit-sandbox:alpine-v2', 'langgenius/dify-agent-local-sandbox:1.16.0-rc1', 'python:3.11-alpine', 'langgenius/dify-sandbox:0.2.15']
+[FAIL] vLLM 隧道 localhost:30000 端口未通（先建 SSH 隧道）
+[PASS] Dify 工作流引擎 (localhost:5001) 在线
+[WARN] Redis (Celery broker) (localhost:6379) 未启动
+[PASS] FastAPI 后端 /docs -> HTTP 200
+[WARN] Vue 前端 dev server (localhost:3000) 未启动
+--------------------------------------------------------------
+汇总: {"Docker": "在线", "vLLM隧道": "离线", "Dify": "在线", "Redis": "离线", "后端": "在线", "前端": "离线"}

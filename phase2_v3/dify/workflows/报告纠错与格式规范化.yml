@@ -1,0 +1,265 @@
+app:
+  description: 数字勾稽检查+措辞合规审查+格式统一
+  icon: 🤖
+  icon_background: '#FFEAD5'
+  icon_type: emoji
+  mode: workflow
+  name: 报告纠错与格式规范化
+  use_icon_as_answer_icon: false
+dependencies:
+- current_identifier: null
+  type: marketplace
+  value:
+    marketplace_plugin_unique_identifier: langgenius/openai_api_compatible:0.0.55@d64be9924f2edf13fd5329fc03fdfc0d0e0e36e0aef5321c4942f0845de8c030
+    version: null
+kind: app
+version: 0.6.0
+workflow:
+  conversation_variables: []
+  environment_variables: []
+  features:
+    file_upload:
+      allowed_file_extensions:
+      - .JPG
+      - .JPEG
+      - .PNG
+      - .GIF
+      - .WEBP
+      - .SVG
+      allowed_file_types:
+      - image
+      allowed_file_upload_methods:
+      - local_file
+      - remote_url
+      enabled: false
+      fileUploadConfig:
+        attachment_image_file_size_limit: 2
+        audio_file_size_limit: 50
+        batch_count_limit: 5
+        file_size_limit: 15
+        file_upload_limit: 20
+        image_file_batch_limit: 10
+        image_file_size_limit: 10
+        single_chunk_attachment_limit: 10
+        video_file_size_limit: 100
+        workflow_file_upload_limit: 10
+      image:
+        enabled: false
+        number_limits: 3
+        transfer_methods:
+        - local_file
+        - remote_url
+      number_limits: 3
+    opening_statement: ''
+    retriever_resource:
+      enabled: false
+    sensitive_word_avoidance:
+      enabled: false
+    speech_to_text:
+      enabled: false
+    suggested_questions: []
+    suggested_questions_after_answer:
+      enabled: false
+    text_to_speech:
+      enabled: false
+      language: ''
+      voice: ''
+  graph:
+    edges:
+    - data:
+        sourceType: start
+        targetType: llm
+      id: e1
+      source: start
+      sourceHandle: source
+      target: llm
+      targetHandle: target
+      type: custom
+    - data:
+        sourceType: llm
+        targetType: code
+      id: e2
+      source: llm
+      sourceHandle: source
+      target: code_validator
+      targetHandle: target
+      type: custom
+    - data:
+        sourceType: code
+        targetType: end
+      id: e3
+      source: code_validator
+      sourceHandle: source
+      target: end_node
+      targetHandle: target
+      type: custom
+    nodes:
+    - data:
+        desc: ''
+        selected: false
+        title: 开始
+        type: start
+        variables:
+        - label: catalog_text
+          required: true
+          type: paragraph
+          variable: catalog_text
+        - label: user_intent
+          required: true
+          type: paragraph
+          variable: user_intent
+        - label: report_content
+          required: false
+          type: paragraph
+          variable: report_content
+      height: 160
+      id: start
+      position:
+        x: 80
+        y: 200
+      positionAbsolute:
+        x: 80
+        y: 200
+      selected: false
+      type: custom
+      width: 242
+    - data:
+        context:
+          enabled: false
+        desc: ''
+        model:
+          completion_params:
+            enable_thinking: true
+            max_tokens: 4096
+            temperature: 0.3
+            top_p: 1
+          mode: chat
+          name: qwen3-235b
+          provider: langgenius/openai_api_compatible/openai_api_compatible
+        prompt_template:
+        - id: e1e5064a-df47-429b-823c-26f5588986a1
+          role: system
+          text: '你是「审计报告纠错与格式规范化编译器」。检查报告质量问题并输出修正建议。
+
+
+            ## 三层检查
+
+            1. 数字勾稽：正文数字vs底稿审定数是否一致、小计加总是否正确、上下年衔接
+
+            2. 措辞合规：审计意见措辞合规性、是否有遗漏披露、前后表述矛盾
+
+            3. 格式规范：字体字号(标题黑体14号/正文宋体11号/附注楷体9号)、页边距、编号连续性
+
+
+            ## 输出格式(严格JSON)
+
+            {"blueprint_id":"review_001","generated_at":"ISO时间","issues":[{"type":"数字勾稽|措辞合规|格式规范","severity":"高|中|低","location":"位置","description":"描述","suggested_fix":"建议"}],"format_dag":{"operators":[...]},"human_review_points":[...]}
+
+            - 只输出JSON
+
+            - issues数组不可为空(全部通过也要输出"未发现问题"条目)
+
+            '
+        - id: 9299cd6e-e2d9-451e-8097-713ac6d1a8e5
+          role: user
+          text: '## 数据目录
+
+            {{#start.catalog_text#}}
+
+
+            ## 审计意图
+
+            {{#start.user_intent#}}
+
+
+            ## 报告内容
+
+            {{#start.report_content#}}'
+        selected: true
+        title: 报告纠错器
+        type: llm
+        vision:
+          enabled: false
+      height: 87
+      id: llm
+      position:
+        x: 380
+        y: 180
+      positionAbsolute:
+        x: 380
+        y: 180
+      selected: true
+      type: custom
+      width: 242
+    - data:
+        code: "def main(llm_output: str) -> dict:\n    c=llm_output.strip()\n    if\
+          \ c.startswith(\"```json\"): c=c[7:]\n    if c.startswith(\"```\"): c=c[3:]\n\
+          \    if c.endswith(\"```\"): c=c[:-3]\n    try: return {\"result\":json.dumps(json.loads(c.strip()),ensure_ascii=False),\"\
+          is_valid\":True,\"errors\":[]}\n    except Exception as e: return {\"result\"\
+          :c,\"is_valid\":False,\"errors\":[str(e)]}\n"
+        code_language: python3
+        desc: ''
+        language: python
+        outputs:
+          errors:
+            type: array[string]
+          is_valid:
+            type: boolean
+          result:
+            type: string
+        retry_config:
+          max_retries: 3
+          retry_enabled: true
+          retry_interval: 1000
+        selected: false
+        title: 输出校验
+        type: code
+        variables:
+        - value_selector:
+          - llm
+          - text
+          value_type: string
+          variable: llm_output
+      height: 81
+      id: code_validator
+      position:
+        x: 680
+        y: 180
+      positionAbsolute:
+        x: 680
+        y: 180
+      selected: false
+      type: custom
+      width: 242
+    - data:
+        desc: ''
+        outputs:
+        - value_selector:
+          - code_validator
+          - result
+          value_type: string
+          variable: result
+        - value_selector:
+          - code_validator
+          - is_valid
+          value_type: boolean
+          variable: status
+        selected: false
+        title: 结束
+        type: end
+      height: 114
+      id: end_node
+      position:
+        x: 980
+        y: 200
+      positionAbsolute:
+        x: 980
+        y: 200
+      selected: false
+      type: custom
+      width: 242
+    viewport:
+      x: 0
+      y: 0
+      zoom: 1
+  rag_pipeline_variables: []

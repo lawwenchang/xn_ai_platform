@@ -1,0 +1,16 @@
+"""生成5个Dify工作流 - 完整Prompt版，运行: python dify/workflows/gen_all.py"""
+import json,uuid,os
+OUT=os.path.dirname(__file__)
+CODE='''def main(llm_output: str) -> dict:
+    c=llm_output.strip()
+    if c.startswith("```json"): c=c[7:]
+    if c.startswith("```"): c=c[3:]
+    if c.endswith("```"): c=c[:-3]
+    try: return {"result":json.dumps(json.loads(c.strip()),ensure_ascii=False),"is_valid":True,"errors":[]}
+    except Exception as e: return {"result":c,"is_valid":False,"errors":[str(e)]}
+'''
+T='''app:\n  description: {desc}\n  icon: "\U0001F916"\n  icon_background: "#FFEAD5"\n  mode: workflow\n  name: {name}\n  use_icon_as_answer_icon: false\ndependencies:\n- current_identifier: null\n  type: marketplace\n  value:\n    marketplace_plugin_unique_identifier: langgenius/openai_api_compatible:0.0.55@d64be9924f2edf13fd5329fc03fdfc0d0e0e36e0aef5321c4942f0845de8c030\n    version: null\nkind: app\nversion: 0.6.0\nworkflow:\n  graph:\n    edges:\n    - data: {{sourceType: start, targetType: llm}}\n      id: e1; source: start; sourceHandle: source; target: llm; targetHandle: target; type: custom\n    - data: {{sourceType: llm, targetType: code}}\n      id: e2; source: llm; sourceHandle: source; target: code_validator; targetHandle: target; type: custom\n    - data: {{sourceType: code, targetType: end}}\n      id: e3; source: code_validator; sourceHandle: source; target: end_node; targetHandle: target; type: custom\n    nodes:\n    - data: {{desc: "", selected: false, title: "\u5f00\u59cb", type: start, variables: {sv}}}\n      height: 140; id: start; position: {{x: 80, y: 200}}; type: custom; width: 242\n    - data:\n        context: {{enabled: false}}\n        model:\n          completion_params: {{enable_thinking: true, max_tokens: 2048, temperature: 0.3, top_p: 1}}\n          mode: chat; name: qwen3-235b\n          provider: langgenius/openai_api_compatible/openai_api_compatible\n        prompt_template: {pt}\n        selected: true; title: {llm_title}; type: llm\n      height: 87; id: llm; position: {{x: 380, y: 180}}; type: custom; width: 242\n    - data:\n        code: {vc}; code_language: python3; language: python\n        outputs: {{result: {{type: string}}, is_valid: {{type: boolean}}, errors: {{type: "array[string]"}}}}\n        retry_config: {{max_retries: 3, retry_enabled: true, retry_interval: 1000}}\n        title: "\u8f93\u51fa\u6821\u9a8c"; type: code\n        variables: [{{value_selector: [llm, text], value_type: string, variable: llm_output}}]\n      height: 81; id: code_validator; position: {{x: 680, y: 180}}; type: custom; width: 242\n    - data:\n        desc: ""; outputs:\n        - {{value_selector: [code_validator, result], value_type: string, variable: result}}\n        - {{value_selector: [code_validator, is_valid], value_type: boolean, variable: status}}\n        title: "\u7ed3\u675f"; type: end\n      height: 90; id: end_node; position: {{x: 980, y: 200}}; type: custom; width: 242\n    viewport: {{x: 0, y: 0, zoom: 1}}\n'''
+def g(n,d,t,v,sp,up):
+    pt=json.dumps([{"id":str(uuid.uuid4()),"role":"system","text":sp},{"id":str(uuid.uuid4()),"role":"user","text":up}],ensure_ascii=False,indent=8)
+    open(f"{OUT}/{n.replace(' ','_')}.yml","w",encoding="utf-8").write(T.format(desc=d,name=n,llm_title=t,sv=json.dumps(v,ensure_ascii=False),pt=pt,vc=json.dumps(CODE)))
+    print(f"OK {n}")

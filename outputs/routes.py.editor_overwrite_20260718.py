@@ -1,0 +1,1869 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+异步生灭路由网关 (routes.py) - 高防御修复版
+=============================
+"全无状态生命周期与语义编译版"白皮书 §3.3 + §5 的核心实现
+
+核心设计理念：
+- 任何新动作 → 毫秒级分发唯一 Run_ID
+- 生命周期钩子 → 执行完毕 + 成果物落盘 → 触发容器销毁
+- 时序完全解耦 → 前后 Run 互不冲突
+- 状态查询 → 通过 Run_ID 查询元数据库
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+import zipfile
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+
+import httpx
+from fastapi import (
+    APIRouter, BackgroundTasks, FastAPI, File, Form, HTTPException,
+    UploadFile, Request
+)
+from pydantic import BaseModel, Field
+
+import re as _re
+
+# ── 文件上传安全常量 ──────────────────────────────────
+MAX_UPLOAD_SIZE = 100 * 1024 * 1024           # 100MB
+ALLOWED_EXTENSIONS = {".xlsx", ".xls", ".csv", ".zip", ".rar", ".7z"}
+ALLOWED_MIME_TYPES = {
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-excel",
+    "text/csv",
+    "application/zip",
+    "application/x-rar-compressed",
+    "application/x-7z-compressed",
+    "application/octet-stream",
+}
+MAX_COMPRESSION_RATIO = 100                   # zip bomb 检测阈值
+MAX_DAG_JSON_SIZE = 100 * 1024                # DAG JSON 最大 100KB
+
+# ── 代码安全清洗常量 ──────────────────────────────────
+_VALID_OPERATORS_FOR_CODE = {
+    "Load", "RegexFilter", "ColumnFilter", "GroupBy", "Merge",
+    "Sort", "ConditionCheck", "Extract", "Transform", "NoiseFilter",
+    "Aggregate", "Diff", "Export", "Reconcile", "AuditAdjustment",
+}
+_VALID_COMPARISON_OPS = {">", "<", ">=", "<=", "==", "!="}
+
+# ── 内部导入 ──────────────────────────────────────────
+sys.path.append(str(Path(__file__).parent.parent))
+
+from core.chaos_input import ChaosInputProcessor
+from core.dag_compiler import DAGBlueprint, DAGParser, Operator, DAGToCodeDescription
+from core.run_snapshot import AssetCatalog, RunRecord, RunSnapshotManager
+from core.privacy_firewall import get_firewall  # 隐私防火墙
+from core.constraint_engine import parse_constraints, format_constraint_report  # 约束引擎
+from core.rag_engine import inject_compliance_context, build_index  # RAG
+from core.format_engine import normalize_format, extract_word_format, extract_excel_format, apply_word_format, apply_excel_format
+from core.format_engine import extract_word_print, extract_excel_print, apply_word_print, apply_excel_print
+from core.template_manager import get_available_templates, get_rules, TEMPLATES_DIR
+from config.fallback_prompts import detect_scenario, get_fallback_prompt
+from engine.sandbox_v3 import EphemeralSandbox, LifecycleHooks, LifecycleResult
+
+# ═══════════════════════════════════════════════════════════════
+# 配置常量
+# ═══════════════════════════════════════════════════════════════
+BASE_DIR = Path(__file__).resolve().parent.parent
+DIFY_BASE_URL = "http://localhost:5001"
+DIFY_API_KEY = "app-G4pfbREbMwbtJwnBixy6z6mv"
+
+# SSH 隧道：AutoDL vLLM → 本地 localhost:18000
+VLLM_TUNNEL_URL = "http://localhost:18000/v1/chat/completions"
+VLLM_API_KEY = "EMPTY"
+VLLM_MODEL = os.environ.get("VLLM_MODEL", "qwen3-235b")  # 可切换: qwen3-235b / qwen2.5-32b / deepseek-r1
+
+# 审计领域知识（内置，增强模型对业务的理解）
+AUDIT_DOMAIN_KNOWLEDGE = """
+## 审计领域知识（系统内置）
+
+### 银行流水核对最佳实践
+1. 匹配策略优先级：先按金额精确匹配，再按日期±3天模糊匹配，最后按对方户名模糊匹配（阈值≥0.85）
+2. 多列联合筛选优于单列：同时检查摘要、对方客户名称、附言等信息列
+3. 金额列优先用单列"交易金额"（正=收入，负=支出），而非收入/支出双列
+4. 医保回款关键词：医保、统筹、社保、YBTD、医疗统筹、回款、医管、新农合、异地就医
+5. 噪音排除：手续费、短信费、年费、利息、账户管理费、冲正、测试
+
+### 跨表数据匹配原则
+1. 优先识别两表共有的关键列（如机构名称、日期、金额）
+2. 机构名称需标准化（去除市县区中心管理等后缀后再比对）
+3. 金额比对需设定容差（医保回款建议相对容差5%以内）
+4. 正负金额含义：正=收入（回款），负=支出（退费/冲正）
+5. 时间维度：按年度、季度、月份分段比对更精准
+
+### DAG 算子使用指南
+- Load：每个文件一个 Load，必须设置 source_file
+- RegexFilter：筛选用的正则列应覆盖摘要+对方客户名称+附言
+- Aggregate：优先用单一金额列（amount_col），其次收入-支出
+- Merge/Diff：两表比对时 on 键使用标准化后的机构名称
+- ConditionCheck：差异超过用户设定阈值时标记
+"""
+
+DIFY_DAG_WORKFLOW_ID = "c46f68e0-a757-424c-868a-1144eb5a4260"
+DIFY_REFINE_WORKFLOW_ID = "f273495a-28e4-498f-a017-389f3e3b37b8"
+DIFY_SINGLE_TABLE_ID = "ca45a52f-1dc0-41aa-88c7-cc3046f66b0c"
+DIFY_REPORT_GEN_ID = "49dda78f-1ae2-4c16-84d1-2c306c0a22b3"
+DIFY_REPORT_REVIEW_ID = "d0cb295d-4545-4afd-956c-059992fdc63f"
+DIFY_KNOWLEDGE_QA_ID = "f97a2880-92a1-45b2-9fbd-0479a6c81255"
+
+CELERY_BROKER_URL = "redis://localhost:6379/0"
+CELERY_RESULT_BACKEND = "redis://localhost:6379/0"
+
+
+# ═══════════════════════════════════════════════════════════════
+# Pydantic 请求/响应模型
+# ═══════════════════════════════════════════════════════════════
+
+class CreateRunRequest(BaseModel):
+    project_code: str = Field(..., description="项目编号，如 A2025001")
+    subject: str = Field(..., description="审计科目/主题")
+    user_intent: str = Field(..., description="大白话审计意图")
+    preset_button: Optional[str] = Field(None, description="预设按钮名称")
+    parent_run_id: Optional[str] = Field(None, description="继承的父 Run ID")
+
+
+class CreateRunResponse(BaseModel):
+    run_id: str
+    status: str
+    message: str
+    compile_task_id: Optional[str] = None
+
+
+class ExecuteRequest(BaseModel):
+    confirmed: bool = Field(True, description="审计师已确认 DAG")
+
+
+class StatusResponse(BaseModel):
+    run_id: str
+    status: str
+    progress: int
+    current_step: str
+    elapsed_seconds: float
+    retry_count: int
+    output_files: List[str]
+
+
+class DownloadResponse(BaseModel):
+    task_id: str
+    status: str
+    message: str
+
+
+# ═══════════════════════════════════════════════════════════════
+# 生命周期钩子实现
+# ═══════════════════════════════════════════════════════════════
+
+class AuditLifecycleHooks(LifecycleHooks):
+    def __init__(self, snapshot_mgr: RunSnapshotManager):
+        self.snapshot = snapshot_mgr
+
+    def on_born(self, run_id: str, container_id: str, run_dir: Path) -> None:
+        pass
+
+    def on_complete(self, run_id: str, container_id: str, result: LifecycleResult, run_dir: Path) -> None:
+        output_dir = run_dir / "outputs"
+        if output_dir.exists():
+            files = [str(f.name) for f in output_dir.iterdir() if f.is_file()]
+            result.output_files = files
+
+    def on_destroy(self, run_id: str, container_id: str) -> None:
+        self.snapshot.cleanup_temp(run_id)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 路由定义
+# ═══════════════════════════════════════════════════════════════
+
+router = APIRouter(prefix="/api/v3", tags=["Run 管理"])
+
+# 💡 修复一：使用兼容性更好的 Optional 替代 | 符号，防止低版本 Python 启动报错
+_snapshot_mgr: Optional[RunSnapshotManager] = None
+_chaos_processor: Optional[ChaosInputProcessor] = None
+_sandbox: Optional[EphemeralSandbox] = None
+
+
+def _get_snapshot_mgr() -> RunSnapshotManager:
+    global _snapshot_mgr
+    if _snapshot_mgr is None:
+        _snapshot_mgr = RunSnapshotManager()
+    return _snapshot_mgr
+
+
+def _get_chaos_processor() -> ChaosInputProcessor:
+    global _chaos_processor
+    if _chaos_processor is None:
+        _chaos_processor = ChaosInputProcessor()
+    return _chaos_processor
+
+
+def _get_sandbox() -> EphemeralSandbox:
+    global _sandbox
+    if _sandbox is None:
+        _sandbox = EphemeralSandbox(hooks=AuditLifecycleHooks(_get_snapshot_mgr()))
+        # 确保沙箱镜像存在（自动构建）
+        import docker
+        try:
+            client = docker.from_env()
+            try:
+                client.images.get("audit-sandbox:alpine-v2")
+                print("[Sandbox] 镜像 audit-sandbox:alpine-v2 已存在")
+            except docker.errors.ImageNotFound:
+                print("[Sandbox] 镜像不存在，正在构建 audit-sandbox:alpine-v2 ...")
+                if _sandbox.build_image():
+                    print("[Sandbox] 镜像构建成功")
+                else:
+                    print("[Sandbox] 镜像构建失败！将跳过 Docker 沙箱，使用直接执行模式")
+            finally:
+                client.close()
+        except Exception as e:
+            print(f"[Sandbox] 镜像检查/构建失败: {e}，将在首次执行时尝试")
+    return _sandbox
+
+
+# ── 后台编译任务 ─────────────────────────────────────
+
+async def _background_compile(
+        run_id: str,
+        catalog: AssetCatalog,
+        user_intent: str,
+        preset_button: Optional[str],
+        parent_run_id: Optional[str],
+) -> None:
+    print(f"DEBUG: 开始编译 Run {run_id}")  # 确认任务是否启动
+    try:
+        _get_snapshot_mgr().update_status(run_id, "COMPILING")
+
+        dag_blueprint = await _call_dify_compiler(
+            catalog=catalog,
+            user_intent=user_intent,
+            preset_button=preset_button,
+            parent_run_id=parent_run_id,
+        )
+        print(f"DEBUG: 编译完成，结果: {dag_blueprint is not None}")
+        if dag_blueprint is None:
+            raise ValueError("编译器返回了空结果")
+
+        record = _get_snapshot_mgr().get_run(run_id)
+        if record is None:
+            raise ValueError(f"Run {run_id} 不存在")
+
+        # 高防御字典化
+        blueprint_dict = dag_blueprint.to_dict() if hasattr(dag_blueprint, "to_dict") else dag_blueprint.__dict__
+        _get_snapshot_mgr().update_blueprint(run_id, blueprint_dict)
+
+        # 保存 DAG JSON 文件
+        dag_path = record.run_dir / "dag_blueprint.json"
+        with open(dag_path, "w", encoding="utf-8") as f:
+            if hasattr(dag_blueprint, "to_json"):
+                f.write(dag_blueprint.to_json())
+            else:
+                json.dump(blueprint_dict, f, ensure_ascii=False, indent=2)
+
+        # 尝试生成自然语言计划（防报错）
+        plan_path = record.run_dir / "execution_plan.txt"
+        try:
+            plan_text = DAGToCodeDescription.describe(dag_blueprint)
+        except Exception as e:
+            plan_text = f"执行计划解析降级: 包含 {len(blueprint_dict.get('operators', []))} 个物理算子"
+
+        with open(plan_path, "w", encoding="utf-8") as f:
+            f.write(plan_text)
+
+        # 生成自然语言匹配逻辑说明
+        try:
+            explanation = await _explain_dag(blueprint_dict, catalog, user_intent)
+            if explanation:
+                explanation_path = record.run_dir / "match_explanation.txt"
+                with open(explanation_path, "w", encoding="utf-8") as f:
+                    f.write(explanation)
+                blueprint_dict["match_explanation"] = explanation
+                _get_snapshot_mgr().update_blueprint(run_id, blueprint_dict)
+        except Exception as e:
+            print(f"[后台编译] 自然语言说明生成失败（非致命）: {e}")
+
+        _get_snapshot_mgr().update_status(run_id, "PENDING_REVIEW")
+        print(f"[后台编译] Run {run_id} 编译完成，等待人工确认")
+
+    except Exception as e:
+        import traceback
+        error_detail = traceback.format_exc()
+        print(f"[后台编译] Run {run_id} 编译失败: {error_detail}")
+
+        # 最终兜底：从 catalog 直接生成最小 DAG
+        try:
+            print(f"[后台编译] 激活最终兜底：从数据目录生成基础 DAG")
+            dag_blueprint = _build_fallback_dag(catalog, user_intent)
+            if dag_blueprint:
+                record = _get_snapshot_mgr().get_run(run_id)
+                if record:
+                    blueprint_dict = dag_blueprint.to_dict() if hasattr(dag_blueprint, "to_dict") else dag_blueprint.__dict__
+                    _get_snapshot_mgr().update_blueprint(run_id, blueprint_dict)
+                    dag_path = record.run_dir / "dag_blueprint.json"
+                    with open(dag_path, "w", encoding="utf-8") as f:
+                        json.dump(blueprint_dict, f, ensure_ascii=False, indent=2)
+                    _get_snapshot_mgr().update_status(run_id, "PENDING_REVIEW")
+                    print(f"[后台编译] Run {run_id} 兜底编译完成")
+                    return
+        except Exception as e2:
+            print(f"[后台编译] 兜底编译也失败: {e2}")
+
+        _get_snapshot_mgr().update_status(run_id, "FAILED")
+
+        # 💡 修复二：解决 sqlite 报错问题，动态探查 DB_PATH
+        try:
+            from core.run_snapshot import DB_PATH
+            db_target = DB_PATH
+        except ImportError:
+            db_target = Path("data/audit_platform.db")
+
+        try:
+            with sqlite3.connect(str(db_target)) as conn:
+                conn.execute(
+                    "UPDATE runs SET execution_logs = ? WHERE run_id = ?",
+                    (json.dumps([f"编译失败: {str(e)}", error_detail], ensure_ascii=False), run_id)
+                )
+                conn.commit()
+        except Exception as db_err:
+            print(f"保存错误日志失败: {db_err}")
+
+
+# ── 1. 创建新 Run ─────────────────────────
+@router.post("/runs", response_model=CreateRunResponse, summary="创建新 Run（异步）")
+async def create_run(
+        project_code: Optional[str] = Form(None),
+        subject: Optional[str] = Form("未命名审计"),
+        user_intent: Optional[str] = Form(None),
+        files: List[UploadFile] = File(..., description="混沌输入（Excel/ZIP/文件夹）"),
+        preset_button: Optional[str] = Form(None),
+        parent_run_id: Optional[str] = Form(None),
+        background_tasks: BackgroundTasks = BackgroundTasks(),
+) -> CreateRunResponse:
+    # 【核心调试代码】
+
+    if not subject:
+        raise HTTPException(status_code=400, detail=f"后端未收到 subject 字段。")
+    print(f"DEBUG: 接收到的参数 -> project_code={project_code}, subject={subject}, user_intent={user_intent}, files={len(files)}")
+
+    temp_dir = Path("data/temp") / f"upload_{uuid.uuid4().hex[:8]}"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    # 保存所有上传文件
+    upload_paths = []
+    for file in files:
+        safe_filename = _validate_upload(file)
+        upload_path = temp_dir / safe_filename
+        with open(upload_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+        upload_paths.append(upload_path)
+
+    # 逐个处理文件，合并 catalog
+    all_files = []
+    global_hash = hashlib.md5()
+    all_flat_dirs = []
+    for up in upload_paths:
+        try:
+            # 使用唯一临时 run_id 而非硬编码 "PENDING"，避免不同上传的文件串扰
+            temp_rid = f"proc_{uuid.uuid4().hex[:8]}"
+            flat_dir, catalog = _get_chaos_processor().process(
+                str(up), run_id=temp_rid,
+            )
+            all_files.extend(catalog.files)
+            global_hash.update(catalog.global_hash.encode())
+            all_flat_dirs.append(flat_dir)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"混沌输入处理失败 ({Path(up).name}): {e}")
+
+    from core.chaos_input import AssetCatalog
+    catalog = AssetCatalog(
+        files=all_files,
+        total_files=len(all_files),
+        global_hash=global_hash.hexdigest(),
+    )
+
+    try:
+        record = _get_snapshot_mgr().create_run(
+            project_code=project_code,
+            subject=subject,
+            user_intent=user_intent,
+            input_catalog=catalog,
+            parent_run_id=parent_run_id,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Run 创建失败: {e}")
+
+    run_input_dir = record.input_dir
+    if run_input_dir.exists():
+        shutil.rmtree(str(run_input_dir), ignore_errors=True)
+    run_input_dir.mkdir(parents=True, exist_ok=True)
+    # 拷贝所有文件的扁平化目录到 inputs
+    for fd in all_flat_dirs:
+        for item in fd.iterdir():
+            dest = run_input_dir / item.name
+            if item.is_dir():
+                shutil.copytree(str(item), str(dest), dirs_exist_ok=True)
+            else:
+                shutil.copy2(str(item), str(dest))
+    _get_snapshot_mgr().lock_readonly(run_input_dir)
+
+    background_tasks.add_task(
+        _background_compile,
+        run_id=record.run_id,
+        catalog=catalog,
+        user_intent=user_intent,
+        preset_button=preset_button,
+        parent_run_id=parent_run_id,
+    )
+
+    return CreateRunResponse(
+        run_id=record.run_id,
+        status="COMPILING",
+        message="文件已接收，DAG 正在后台编译中，请稍后刷新查看结果...",
+        compile_task_id=record.run_id,
+    )
+
+@router.get("/runs", summary="获取所有 Run 列表")
+async def list_runs():
+    """获取最近的 Run 记录列表"""
+    try:
+        records = _get_snapshot_mgr().get_recent_runs(limit=50)
+        return {"runs": [r.to_dict() for r in records]}
+    except Exception as e:
+        return {"runs": []}
+
+
+@router.delete("/runs/{run_id}", summary="删除单个 Run")
+async def delete_run(run_id: str):
+    """删除指定 Run 的数据库记录 + 磁盘目录"""
+    import shutil
+    from core.run_snapshot import RUNS_BASE, DB_PATH
+    try:
+        # 删除磁盘目录
+        disk_dir = RUNS_BASE / run_id
+        if disk_dir.exists():
+            shutil.rmtree(str(disk_dir), ignore_errors=True)
+        # 删除数据库记录
+        with sqlite3.connect(str(DB_PATH)) as conn:
+            conn.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
+            conn.commit()
+        return {"success": True, "message": f"已删除 {run_id}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@router.post("/runs/cleanup", summary="批量清理历史 Run 和临时文件")
+async def cleanup_runs(keep_latest: int = 5, clean_temp: bool = True):
+    """
+    批量清理：
+    - keep_latest: 保留最近 N 个 Run，其余删除
+    - clean_temp: 是否同时清理 data/temp 残留目录
+    """
+    import shutil
+    from core.run_snapshot import RUNS_BASE, DB_PATH, TEMP_BASE
+    result = {"deleted_runs": [], "cleaned_temp": 0}
+
+    try:
+        # 清理历史 Run
+        records = _get_snapshot_mgr().get_recent_runs(limit=200)
+        if len(records) > keep_latest:
+            to_delete = records[keep_latest:]
+            with sqlite3.connect(str(DB_PATH)) as conn:
+                for r in to_delete:
+                    rid = r.run_id if hasattr(r, 'run_id') else r.get('run_id', '')
+                    disk_dir = RUNS_BASE / rid
+                    if disk_dir.exists():
+                        shutil.rmtree(str(disk_dir), ignore_errors=True)
+                    conn.execute("DELETE FROM runs WHERE run_id = ?", (rid,))
+                    result["deleted_runs"].append(rid)
+                conn.commit()
+
+        # 清理 temp 目录
+        if clean_temp and TEMP_BASE.exists():
+            for d in TEMP_BASE.iterdir():
+                if d.is_dir():
+                    shutil.rmtree(str(d), ignore_errors=True)
+                    result["cleaned_temp"] += 1
+
+        return {"success": True, "data": result}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# ── 2. 查询 Run（💡 修复三：注入高防御物理探测逻辑）─────────────────────────
+@router.get("/runs/{run_id}", summary="查询 Run 详情（含编译状态）")
+async def get_run(run_id: str) -> Dict[str, Any]:
+    record = _get_snapshot_mgr().get_run(run_id)
+    if not record:
+        # 防御性回退：DB 中无记录但磁盘目录存在时，从 run_meta.json 重建
+        from core.run_snapshot import RUNS_BASE
+        disk_dir = RUNS_BASE / run_id
+        meta_file = disk_dir / "run_meta.json"
+        if meta_file.exists():
+            try:
+                with open(meta_file, "r", encoding="utf-8") as f:
+                    result = json.load(f)
+                result["_source"] = "disk_fallback"
+                result.setdefault("execution_plan", "未生成执行计划")
+                result.setdefault("outputs", [])
+                out_dir = disk_dir / "outputs"
+                if out_dir.exists():
+                    try:
+                        result["outputs"] = [f.name for f in out_dir.iterdir() if f.is_file()]
+                    except Exception:
+                        pass
+                if not result.get("dag_blueprint"):
+                    dag_file = disk_dir / "dag_blueprint.json"
+                    if dag_file.exists():
+                        try:
+                            with open(dag_file, "r", encoding="utf-8") as f:
+                                result["dag_blueprint"] = json.load(f)
+                        except Exception:
+                            pass
+                return result
+            except Exception:
+                pass
+        raise HTTPException(status_code=404, detail="Run 不存在")
+
+    result = record.to_dict()
+
+    # 物理防崩溃探测
+    run_dir = Path(record.run_dir) if hasattr(record, "run_dir") else None
+    result["execution_plan"] = "未生成执行计划"
+    result["outputs"] = []
+
+    if run_dir and run_dir.exists():
+        plan_path = run_dir / "execution_plan.txt"
+        if plan_path.exists():
+            try:
+                with open(plan_path, "r", encoding="utf-8") as f:
+                    result["execution_plan"] = f.read()
+            except Exception:
+                result["execution_plan"] = "执行计划文件读取失败"
+
+        out_dir = run_dir / "outputs"
+        if out_dir.exists():
+            try:
+                result["outputs"] = [f.name for f in out_dir.iterdir() if f.is_file()]
+            except Exception:
+                pass
+
+        # 防御性回退：如果 DB 中 dag_blueprint 为空但磁盘文件存在，从磁盘读取
+        if not result.get("dag_blueprint"):
+            dag_file = run_dir / "dag_blueprint.json"
+            if dag_file.exists():
+                try:
+                    with open(dag_file, "r", encoding="utf-8") as f:
+                        result["dag_blueprint"] = json.load(f)
+                except Exception:
+                    pass
+
+    if record.status == "COMPILING":
+        result["compile_progress"] = "编译中，请稍后..."
+        result["poll_interval"] = 2
+    elif record.status == "PENDING_REVIEW":
+        result["compile_progress"] = "编译完成"
+    elif record.status == "FAILED":
+        result["compile_progress"] = "编译失败"
+        # 提取真实错误信息
+        logs = record.execution_logs or []
+        result["error_msg"] = logs[-1] if logs else (
+            record.sandbox_code and "沙箱执行失败，请检查算子逻辑" or "编译失败，请检查 DAG 蓝图"
+        )
+
+    return result
+
+
+# ── 3. 获取 DAG 蓝图 ──────────────────────────────────
+@router.get("/runs/{run_id}/dag", summary="获取 DAG 蓝图")
+async def get_dag(run_id: str) -> Dict[str, Any]:
+    record = _get_snapshot_mgr().get_run(run_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Run 不存在")
+    if record.status == "COMPILING":
+        raise HTTPException(status_code=425, detail="DAG 正在编译中")
+    if not record.dag_blueprint:
+        # 防御性回退：从磁盘文件读取
+        dag_file = record.run_dir / "dag_blueprint.json"
+        if dag_file.exists():
+            try:
+                with open(dag_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        raise HTTPException(status_code=404, detail="DAG 蓝图不存在")
+    return record.dag_blueprint
+
+
+# ── 4. 触发执行 ───────────────────────────────────────
+@router.post("/runs/{run_id}/execute", summary="确认 DAG 并触发执行")
+async def execute_run(
+        run_id: str,
+        request: ExecuteRequest,
+        background_tasks: BackgroundTasks,
+) -> StatusResponse:
+    record = _get_snapshot_mgr().get_run(run_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Run 不存在")
+    if record.status == "COMPILING":
+        raise HTTPException(status_code=425, detail="DAG 正在编译中")
+    if record.status not in ("PENDING_REVIEW", "QUEUED"):
+        raise HTTPException(status_code=400, detail=f"当前状态 {record.status} 不允许执行")
+
+    _get_snapshot_mgr().update_status(run_id, "RUNNING")
+
+    try:
+        dag_source = record.dag_blueprint or {}
+        code = _dag_to_python(dag_source, record)
+    except Exception as e:
+        _get_snapshot_mgr().update_status(run_id, "FAILED")
+        raise HTTPException(status_code=500, detail=f"底层算子编译失败: {str(e)}")
+
+    code_path = record.run_dir / "sandbox_code.py"
+    with open(code_path, "w", encoding="utf-8") as f:
+        f.write(code)
+
+    # 同步写入数据库，方便前端展示真实错误
+    _get_snapshot_mgr().update_sandbox_code(run_id, code)
+
+    background_tasks.add_task(
+        _execute_in_sandbox,
+        run_id=run_id,
+        code=code,
+        run_dir=record.run_dir,
+    )
+
+    return StatusResponse(
+        run_id=run_id, status="RUNNING", progress=0,
+        current_step="正在启动 Docker 沙箱...", elapsed_seconds=0.0,
+        retry_count=0, output_files=[],
+    )
+
+
+# ── 5. 查询执行状态 ───────────────────────────────────
+@router.get("/runs/{run_id}/status", summary="查询执行状态")
+async def get_execution_status(run_id: str) -> StatusResponse:
+    record = _get_snapshot_mgr().get_run(run_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Run 不存在")
+
+    output_files = record.output_files or []
+    output_dir = record.run_dir / "outputs"
+    if output_dir.exists():
+        output_files = [str(f.name) for f in output_dir.iterdir() if f.is_file()]
+
+    return StatusResponse(
+        run_id=run_id, status=record.status,
+        progress=50 if record.status == "RUNNING" else (
+            100 if record.status in ("COMPLETED", "FAILED", "SUCCESS") else 0),
+        current_step=record.status, elapsed_seconds=0.0,
+        retry_count=record.retry_count, output_files=output_files,
+    )
+
+
+@router.get("/projects/{project_code}/tree", summary="获取版本树")
+async def get_version_tree(project_code: str, subject: Optional[str] = None) -> List[Dict]:
+    mgr = _get_snapshot_mgr()
+    if subject:
+        records = mgr.get_version_tree(project_code, subject)
+    else:
+        records = mgr.get_recent_runs(limit=100)
+        records = [r for r in records if r.project_code == project_code]
+    return [r.to_dict() for r in records]
+
+
+@router.get("/runs/{run_id}/download", summary="异步打包下载")
+async def download_run(run_id: str) -> DownloadResponse:
+    record = _get_snapshot_mgr().get_run(run_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Run 不存在")
+
+    task_id = f"dl_{run_id}_{uuid.uuid4().hex[:6]}"
+    output_dir = record.run_dir / "outputs"
+
+    if not output_dir.exists():
+        raise HTTPException(status_code=404, detail="成果物不存在")
+
+    download_dir = Path("data/downloads")
+    download_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = download_dir / f"{task_id}.zip"
+
+    with zipfile.ZipFile(str(zip_path), 'w', zipfile.ZIP_DEFLATED) as zf:
+        for file_path in output_dir.iterdir():
+            if file_path.is_file():
+                zf.write(str(file_path), arcname=file_path.name)
+        dag_path = record.run_dir / "dag_blueprint.json"
+        if dag_path.exists():
+            zf.write(str(dag_path), arcname="dag_blueprint.json")
+        plan_path = record.run_dir / "execution_plan.txt"
+        if plan_path.exists():
+            zf.write(str(plan_path), arcname="execution_plan.txt")
+
+    return DownloadResponse(task_id=task_id, status="COMPLETED", message=f"打包完成: {zip_path.name}")
+
+
+@router.get("/download/status/{task_id}", summary="查询下载状态")
+async def get_download_status(task_id: str) -> Dict[str, Any]:
+    zip_path = Path("data/downloads") / f"{task_id}.zip"
+    if zip_path.exists():
+        return {
+            "task_id": task_id, "status": "COMPLETED",
+            "download_url": f"/api/v3/download/file/{task_id}.zip",
+            "file_size": zip_path.stat().st_size,
+        }
+    return {"task_id": task_id, "status": "PROCESSING", "message": "打包中..."}
+
+
+@router.get("/download/file/{filename:path}", summary="下载成果物文件")
+async def download_file(filename: str):
+    from fastapi.responses import FileResponse
+    file_path = Path("data/downloads") / filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="文件不存在")
+    return FileResponse(str(file_path), media_type="application/zip", filename=filename)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 内部函数
+# ═══════════════════════════════════════════════════════════════
+
+# ── 上传安全校验 ──────────────────────────────────────
+
+def _validate_upload(file: UploadFile) -> str:
+    """
+    安全校验上传文件，返回清洗后的安全文件名。
+    
+    校验规则：
+    1. 去路径遍历字符（仅保留纯文件名）
+    2. 扩展名白名单
+    3. 文件大小限制
+    """
+    # 1. 文件名去路径遍历
+    safe_name = Path(file.filename).name if file.filename else ""
+    if not safe_name:
+        raise HTTPException(status_code=400, detail="文件名为空")
+    if safe_name != file.filename:
+        raise HTTPException(status_code=400, detail="文件名包含非法路径字符")
+
+    # 2. 扩展名白名单
+    ext = Path(safe_name).suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400,
+                           detail=f"不支持的文件类型: {ext}，允许的类型: {', '.join(ALLOWED_EXTENSIONS)}")
+
+    # 3. 内容大小校验
+    if hasattr(file, "size") and file.size is not None and file.size > MAX_UPLOAD_SIZE:
+        raise HTTPException(status_code=400,
+                           detail=f"文件过大（{file.size} 字节），最大允许 {MAX_UPLOAD_SIZE // 1024 // 1024}MB")
+
+    return safe_name
+
+
+# ── 格式规范化 API ──────────────────────────────────
+
+@router.post("/format/normalize", summary="格式规范化：按模板统一排版")
+async def normalize_document_format(
+    files: List[UploadFile] = File(..., description="待排版文件 + 可选模板文件"),
+    template_index: Optional[int] = Form(None, description="指定第几个文件为模板（0-based），不指定则使用内部默认模板"),
+    output_format: Optional[str] = Form("docx", description="输出格式: docx / xlsx / auto"),
+) -> Dict[str, Any]:
+    """格式规范化：以模板为准，批量转换其他文件的格式（含打印设置）"""
+    if not files:
+        raise HTTPException(status_code=400, detail="请至少上传1个文件")
+
+    temp_dir = Path("data/temp") / f"fmt_{uuid.uuid4().hex[:8]}"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_files = []
+    for f in files:
+        safe_name = _validate_upload(f)
+        save_path = temp_dir / safe_name
+        content = await f.read()
+        if len(content) > MAX_UPLOAD_SIZE:
+            raise HTTPException(status_code=400, detail=f"文件 {safe_name} 过大")
+        with open(save_path, "wb") as fout:
+            fout.write(content)
+        saved_files.append(str(save_path))
+
+    # 确定模板：用户指定 > 内部模板 > 第一个文件推测
+    if template_index is not None and 0 <= template_index < len(saved_files):
+        template_path = saved_files[template_index]
+        targets = [p for i, p in enumerate(saved_files) if i != template_index]
+        template_source = f"用户上传（第{template_index + 1}个文件）"
+    else:
+        # 用内部默认模板
+        first_ext = Path(saved_files[0]).suffix.lower()
+        if first_ext in (".xlsx", ".xlsm", ".xls"):
+            internal = list((TEMPLATES_DIR / "excel").glob("*.xlsx"))
+        else:
+            internal = list((TEMPLATES_DIR / "word").glob("*.docx"))
+        if internal:
+            template_path = str(internal[0])
+            targets = saved_files
+            template_source = f"内部默认模板（{Path(template_path).name}）"
+        else:
+            # 回退：用第一个文件当模板
+            template_path = saved_files[0]
+            targets = saved_files[1:]
+            template_source = "自动（第一个文件）"
+
+    if not targets:
+        return {"status": "error", "message": "没有需要转换的目标文件（至少需要模板之外的1个文件）",
+                "template": template_source}
+
+    output_dir = str(temp_dir / "formatted")
+    try:
+        results = normalize_format(template_path, targets, output_dir)
+        # 将结果复制到 downloads 目录供下载
+        import shutil
+        dl_dir = Path("data/downloads")
+        dl_dir.mkdir(parents=True, exist_ok=True)
+        dl_name = f"fmt_{uuid.uuid4().hex[:6]}.zip"
+        dl_path = dl_dir / dl_name
+        import zipfile
+        with zipfile.ZipFile(str(dl_path), "w", zipfile.ZIP_DEFLATED) as zf:
+            for r in results:
+                zf.write(r, Path(r).name)
+        return {
+            "status": "success",
+            "template": template_source,
+            "converted_count": len(results),
+            "converted_files": [Path(r).name for r in results],
+            "download_url": f"/api/v3/download/file/{dl_name}",
+        }
+    except Exception as e:
+        return {"status": "error", "message": f"格式规范化失败: {str(e)}"}
+
+
+
+
+# ── 代码安全清洗 ──────────────────────────────────────
+
+def _sanitize_code_param(value: str, max_len: int = 200) -> str:
+    """
+    安全清洗拼入沙箱代码的字符串参数值。
+    
+    规则：
+    - 转义反斜杠和单引号（防止字符串逃逸）
+    - 截断超长值（防止缓冲区类攻击）
+    - 过滤控制字符（保留常用空白符 \\t \\n \\r）
+    """
+    if not isinstance(value, str):
+        value = str(value)
+    # 转义反斜杠必须先于单引号
+    value = value.replace("\\", "\\\\")
+    value = value.replace("'", "\\'")
+    # 截断
+    if len(value) > max_len:
+        value = value[:max_len]
+    # 过滤控制字符（保留常用的空白符 0x09=TAB, 0x0A=LF, 0x0D=CR）
+    value = _re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', value)
+    return value
+
+
+# ── DAG JSON 大小校验 ────────────────────────────────
+
+def _validate_dag_json_size(dag_json: str) -> None:
+    """校验 DAG JSON 大小，防止超大数据注入"""
+    if len(dag_json.encode('utf-8')) > MAX_DAG_JSON_SIZE:
+        raise ValueError(f"DAG JSON 过大（>{MAX_DAG_JSON_SIZE}字节），可能存在注入风险")
+
+
+# ── 后台编译 ─────────────────────────────────────────
+
+async def _call_dify_compiler(catalog: AssetCatalog, user_intent: str, preset_button: Optional[str],
+                              parent_run_id: Optional[str]) -> Any:
+    catalog_text = _format_catalog_for_prompt(catalog)
+
+    # 🛡️ 隐私防火墙：数据出本地前脱敏
+    fw = get_firewall()
+    catalog_text, _ = fw.sanitize(catalog_text)
+    user_intent, _ = fw.sanitize(user_intent)
+
+    # 📚 RAG 合规注入：检索相关法规片段
+    compliance_context = inject_compliance_context(user_intent)
+    if compliance_context:
+        catalog_text = compliance_context + "\n\n" + catalog_text
+
+    # 🌐 联网搜索触发器：检测是否需要最新法规/政策信息（在已有事件循环中异步执行）
+    try:
+        from core.search_trigger import search_and_inject
+        search_context = await search_and_inject(user_intent)
+        if search_context:
+            catalog_text = search_context + "\n\n" + catalog_text
+            print(f"[编译] 已注入联网搜索结果")
+    except Exception as e:
+        print(f"[编译] 搜索触发器降级（非致命）: {e}")
+
+    # 🧠 领域知识注入：审计最佳实践
+    catalog_text = AUDIT_DOMAIN_KNOWLEDGE + "\n\n" + catalog_text
+
+    parent_summary = ""
+    if parent_run_id:
+        parent_data = _get_snapshot_mgr().extract_summary_for_inheritance(parent_run_id)
+        if parent_data:
+            parent_summary = (
+                f"\n## 前序操作摘要\n"
+                f"前序意图: {parent_data.get('previous_intent', '')}\n"
+                f"前序目标: {parent_data.get('previous_objective', '')}\n"
+                f"前序算子: {parent_data.get('previous_operators', '')}\n"
+            )
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                f"{DIFY_BASE_URL}/v1/workflows/run",
+                headers={"Authorization": f"Bearer {DIFY_API_KEY}"},
+                json={
+                    "inputs": {
+                        "catalog_text": catalog_text, "user_intent": user_intent,
+                        "preset_button": preset_button or "", "parent_summary": parent_summary,
+                    },
+                    "response_mode": "blocking", "user": "audit_platform",
+                },
+            )
+            response.raise_for_status()
+            result = response.json()
+            print(f"DEBUG Dify response keys: {list(result.keys())}")
+            if "data" in result:
+                print(f"DEBUG data keys: {list(result['data'].keys())}")
+                if "outputs" in result["data"]:
+                    print(f"DEBUG outputs keys: {list(result['data']['outputs'].keys())}")
+                    print(f"DEBUG dag_json value (first 200): {str(result['data']['outputs'].get('dag_json', ''))[:200]}")
+            dag_json_str = result.get("data", {}).get("outputs", {}).get("dag_json", "")
+
+            if dag_json_str:
+                # --- 🛡️ 防御性 Patch：解析前强行注入 source_file ---
+                try:
+                    dag_data = json.loads(dag_json_str)
+                    # 获取第一个文件的名称作为默认值（如果有文件）
+                    default_file = catalog.files[0]["filename"] if catalog.files else "input.xlsx"
+
+                    if "operators" in dag_data:
+                        for op in dag_data["operators"]:
+                            # 规范化：Dify 有时用 "operator" / "type" 代替 "name"
+                            if "operator" in op and "name" not in op:
+                                op["name"] = op.pop("operator")
+                            if "name" not in op and op.get("type"):
+                                op["name"] = op["type"]
+                            # 规范化：output → output_alias
+                            if "output" in op and "output_alias" not in op:
+                                op["output_alias"] = op.pop("output")
+                            # 规范化：input_from 字符串→列表
+                            if "input_from" in op and isinstance(op["input_from"], str):
+                                op["input_from"] = [op["input_from"]]
+                            # Load 算子注入 source_file
+                            if op.get("name") in ("Load", "load"):
+                                if not op.get("source_file"):
+                                    op["source_file"] = op.get("file")
+                                if not op.get("source_file"):
+                                    op["source_file"] = catalog.files[0]["filename"] if catalog.files else "input.xlsx"
+                    dag_json_str = json.dumps(dag_data)
+
+                except Exception as e:
+                    print(f"JSON 预处理 Patch 失败: {e}")
+                # ---------------------------------------------
+
+                return DAGParser.parse(dag_json_str)
+            else:
+                raise ValueError("Dify 返回了空的 dag_json")
+
+    except Exception as e:
+        print(f"Dify 主链路失败: {e}")
+        # 尝试 vLLM 降级；vLLM 也不可用时返回 None，由上层 _build_fallback_dag 接管
+        try:
+            return await _fallback_compiler(catalog_text, user_intent, preset_button)
+        except Exception as e2:
+            print(f"vLLM 降级也失败: {e2}，交由本地兜底 DAG 接管")
+            return None
+
+
+def _extract_patterns_from_dag(dag_blueprint: dict) -> str:
+    """从 DAG 蓝图的 RegexFilter 算子中提取筛选关键词"""
+    if not dag_blueprint:
+        return ""
+    ops = dag_blueprint.get("operators", [])
+    for op in ops:
+        name = op.get("name", "").lower()
+        if name in ("regexfilter", "regex_filter", "regex", "filter"):
+            pattern = op.get("params", {}).get("pattern", "")
+            if pattern:
+                return pattern
+    # 兜底：从第一个 Load 的 source_file 和常见关键词推断
+    return ""
+
+
+async def _explain_dag(blueprint: dict, catalog: Any, user_intent: str) -> str:
+    """用 vLLM 生成匹配逻辑的自然语言说明"""
+    ops = blueprint.get("operators", [])
+    if not ops:
+        return ""
+    ops_text = "\n".join(
+        f"{i+1}. {op.get('name')}: params={json.dumps(op.get('params',{}), ensure_ascii=False)[:300]}" 
+        for i, op in enumerate(ops)
+    )
+    # 提取实际的筛选关键词
+    patterns = _extract_patterns_from_dag(blueprint) or "医保|统筹|社保"
+    prompt = f"""你是审计助手。请用自然语言向审计师解释以下匹配逻辑：
+
+用户意图：{user_intent}
+
+执行步骤（含参数）：
+{ops_text}
+
+实际筛选关键词：{patterns}
+
+请用3-5句详细说明：
+1) 平台从哪些文件加载数据
+2) 用什么关键词或规则筛选（列出具体关键词）
+3) 按什么维度汇总和比对
+4) 匹配策略流程
+直接回复说明，不要JSON。"""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                VLLM_TUNNEL_URL,
+                headers={"Authorization": f"Bearer {VLLM_API_KEY}"},
+                json={"model": VLLM_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 300},
+            )
+            response.raise_for_status()
+            return response.json()["choices"][0]["message"]["content"].strip()
+    except Exception:
+        # vLLM 不可用时用模板生成
+        names = [op.get("name") for op in ops]
+        files = [op.get("source_file", "") for op in ops if op.get("source_file")]
+        parts = [f"平台将加载 {len(files)} 个文件"]
+        if "RegexFilter" in names:
+            parts.append("通过正则筛选医保相关记录")
+        if "Aggregate" in names:
+            parts.append("按机构汇总金额")
+        if "Merge" in names or "Diff" in names:
+            parts.append("与回款汇总表进行比对，计算差额")
+        parts.append("最后导出匹配结果和审计报告")
+        return "。".join(parts) + "。"
+
+
+async def _fallback_compiler(catalog_text: str, user_intent: str, preset_button: Optional[str]) -> Any:
+    scenario = detect_scenario(user_intent)
+    system_prompt = get_fallback_prompt(scenario)
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"## 数据目录\n{catalog_text}\n\n## 审计意图\n{user_intent}"},
+    ]
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(
+            VLLM_TUNNEL_URL,
+            headers={"Authorization": f"Bearer {VLLM_API_KEY}"},
+            json={
+                "model": VLLM_MODEL, "messages": messages,
+                "temperature": 0.3, "max_tokens": 4096,
+            },
+        )
+        if response.status_code != 200:
+            print(f"[vLLM] 错误响应 ({response.status_code}): {response.text[:500]}")
+        response.raise_for_status()
+        raw_content = response.json()["choices"][0]["message"]["content"]
+
+        import re
+        json_match = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', raw_content)
+        if json_match:
+            dag_json = json_match.group(1)
+        else:
+            json_match = re.search(r'(\{[\s\S]*?("operators"|"nodes")[\s\S]*?\})', raw_content)
+            if json_match:
+                dag_json = json_match.group(1)
+            else:
+                raise ValueError("无法从 vLLM 响应中提取 JSON。")
+
+        # 🔒 安全校验：限制 DAG JSON 大小
+        _validate_dag_json_size(dag_json)
+
+        # 🛡️ 防御性 Patch：为缺少 source_file 的 Load 算子自动注入
+        try:
+            dag_data = json.loads(dag_json)
+            default_file = "input.xlsx"
+            if "operators" in dag_data:
+                for op in dag_data["operators"]:
+                    if op.get("name") in ("Load", "load") or op.get("type") in ("Load", "load"):
+                        if not op.get("source_file"):
+                            op["source_file"] = op.get("file") or default_file
+                dag_json = json.dumps(dag_data)
+        except Exception:
+            pass
+
+        try:
+            return DAGParser.parse(dag_json)
+        except Exception as e:
+            raise ValueError(f"DAG 解析失败: {e}")
+
+
+def _build_fallback_dag(catalog: Any, user_intent: str) -> Any:
+    """最终兜底：从 catalog 生成最小 DAG（不依赖任何 LLM）"""
+    from core.dag_compiler import DAGBlueprint, Operator
+
+    files = getattr(catalog, "files", [])
+    if not files:
+        return None
+
+    scenario = detect_scenario(user_intent)
+    ops = []
+
+    # 每个文件一个 Load
+    for i, f in enumerate(files):
+        fname = f.get("filename", f"file_{i}")
+        ops.append(Operator(
+            id=f"load_{i}", name="Load", description=f"读取 {fname}",
+            input_from=[], source_file=fname, params={"file_path": fname},
+            output_alias=f"df_load_{i}",
+        ))
+
+    # 根据场景加算子
+    if "匹配" in user_intent or "核对" in user_intent:
+        ops.append(Operator(
+            id="merge_0", name="Merge", description="数据合并",
+            input_from=[f"load_{i}" for i in range(len(files))],
+            params={"how": "outer"},
+            output_alias="df_merge_0",
+        ))
+    else:
+        ops.append(Operator(
+            id="export_0", name="Export", description="导出结果",
+            input_from=[f"load_{i}" for i in range(len(files))],
+            params={"filename": "analysis_result.csv"},
+            output_alias="df_export_0",
+        ))
+
+    return DAGBlueprint(
+        blueprint_id="fallback_001",
+        operators=ops,
+        objective=f"兜底编译: {user_intent[:50]}",
+        raw_intent=user_intent,
+    )
+
+
+def _format_catalog_for_prompt(catalog: AssetCatalog) -> str:
+    lines = [f"文件总数: {catalog.total_files}", "=== 文件清单 ==="]
+    for f in catalog.files:
+        lines.append(f"\n文件: {f['filename']}")
+        if "columns" in f:
+            cols = [f"{col['name']}({col['dtype']})" for col in f["columns"]]
+            lines.append(f"  列: {', '.join(cols)}")
+    return "\n".join(lines)
+
+
+# 💡 修复四：彻底解耦严格面向对象，对 dict 和 object 提供极致的防御包容
+def _dag_to_python(dag: Any, record: RunRecord) -> str:
+    # 1. 安全提取头部元数据
+    is_dict = isinstance(dag, dict)
+    objective = (dag.get("objective") if is_dict else getattr(dag, "objective", None)) or "默认合并对账"
+    raw_intent = (dag.get("raw_intent") if is_dict else getattr(dag, "raw_intent", None)) or "无预设意图"
+    blueprint_id = (dag.get("blueprint_id") if is_dict else getattr(dag, "blueprint_id",
+                                                                    None)) or f"bp_{uuid.uuid4().hex[:8]}"
+
+    # 2. 安全提取算子列表
+    raw_ops = (dag.get("operators", []) if is_dict else getattr(dag, "operators", []))
+
+    # 3. 标准化清洗算子
+    normalized_ops = []
+    for op in raw_ops:
+        op_dict = op if isinstance(op, dict) else op.__dict__ if hasattr(op, "__dict__") else {}
+
+        n_op = {
+            "id": op_dict.get("id") or f"op_{uuid.uuid4().hex[:6]}",
+            "name": op_dict.get("name") or op_dict.get("type", "UnknownOperator"),
+            "description": op_dict.get("description", ""),
+            "params": op_dict.get("params") or {},
+            "source_file": op_dict.get("source_file", ""),
+            "output_alias": op_dict.get("output_alias", "df")
+        }
+        normalized_ops.append(n_op)
+
+    # 4. 提取执行顺序
+    order = []
+    if not is_dict and hasattr(dag, "get_execution_order") and callable(dag.get_execution_order):
+        try:
+            order = dag.get_execution_order()
+        except Exception:
+            pass
+    if not order:
+        order = [op["id"] for op in normalized_ops]
+
+    op_map = {op["id"]: op for op in normalized_ops}
+
+    # 5. 代码拼装（带数据流追踪）
+    code_lines = [
+        "import pandas as pd", "import json", "import os", "",
+        "os.makedirs('outputs', exist_ok=True)",
+        "",
+        "# === 文件追踪：按序分配 inputs 目录中的文件 ===",
+        "_inputs_dir = os.path.join(os.path.dirname(__file__), 'inputs')",
+        "_used_files = []",
+        "",
+        "# === DAG 执行代码 ===",
+        f"# 目标: {objective}",
+        f"# 原始意图: {raw_intent}",
+        f"# 算子数: {len(order)}",
+        "", ""
+    ]
+
+    # 数据流追踪：output_alias → 对应的 Python 变量名
+    alias_vars = {}
+    last_df_var = None
+
+    for op_id in order:
+        op = op_map.get(op_id)
+        if not op: continue
+        code_lines.append(f"# Step: {op['name']} - {op['description']}")
+
+        op_name = op['name']
+        op_alias = op.get('output_alias', f'df_{op_id}')
+        params = op.get('params', {}) or {}
+        # 兼容 Dify 嵌套格式: {"parameters": {...}} → 解包
+        if isinstance(params, dict) and "parameters" in params and isinstance(params["parameters"], dict):
+            params = params["parameters"]
+
+        if op_name == "Load":
+            source = op.get('source_file') or "input.xlsx"
+            var_name = f"df_{op_alias}" if not op_alias.startswith('df_') else op_alias
+            code_lines.extend([
+                f"# 智能文件匹配",
+                f"_dag_file = '{source}'",
+                f"_all_inputs = os.listdir(_inputs_dir) if os.path.exists(_inputs_dir) else []",
+                f"_available = [f for f in _all_inputs if f not in _used_files and f.endswith(('.xlsx','.xls','.csv'))]",
+                f"if _available:",
+                f"    _pick = _available[0]",
+                f"    source_file = os.path.join(_inputs_dir, _pick)",
+                f"    _used_files.append(_pick)",
+                f"    print('[Load] 自动分配: ' + _pick)",
+                f"else:",
+                f"    source_file = os.path.join(_inputs_dir, _dag_file) if os.path.exists(os.path.join(_inputs_dir, _dag_file)) else 'data/readonly/' + _dag_file",
+                f"if not os.path.exists(source_file):",
+                f"    print('[Load] 跳过: 文件不存在 ' + source_file)",
+                f"    {var_name} = pd.DataFrame()",
+                f"else:",
+                f"    # 自动检测表头行",
+                f"    {var_name} = None",
+                f"    _best_score = -1",
+                f"    _best_hr = 0",
+                f"    for _hr in range(6):",
+                f"        try:",
+                f"            _tmp = pd.read_excel(source_file, header=_hr, nrows=0)",
+                f"            _cols = list(_tmp.columns)",
+                f"            _score = 0",
+                f"            for _c in _cols:",
+                f"                _cs = str(_c)",
+                f"                if _cs.startswith('Unnamed'): _score -= 1",
+                f"                elif len(_cs) > 2 and not any('\\u4e00' <= ch <= '\\u9fff' for ch in _cs): _score -= 1",
+                f"                else: _score += 1",
+                f"            # 加分：列数多的行更可能是真正的表头",
+                f"            _score += len(_cols) * 0.5",
+                f"            if _score > _best_score:",
+                f"                _best_score = _score",
+                f"                _best_hr = _hr",
+                f"        except Exception:",
+                f"            continue",
+                f"    if _best_score > 0:",
+                f"        {var_name} = pd.read_excel(source_file, header=_best_hr)",
+                f"        print('[Load] ' + os.path.basename(source_file) + ' -> {var_name}, h=' + str(_best_hr) + ', rows=' + str(len({var_name})) + ', cols=' + str(list({var_name}.columns)))",
+                f"    else:",
+                f"        {var_name} = pd.read_excel(source_file, header=None)",
+                f"        {var_name}.columns = [f'Col_{{i}}' for i in range(len({var_name}.columns))]",
+                f"        print('[Load] ' + os.path.basename(source_file) + ' -> {var_name} (无表头), rows=' + str(len({var_name})))",
+            ])
+            alias_vars[op_alias] = var_name
+            last_df_var = var_name
+
+        elif op_name == "ColumnFilter":
+            columns = params.get("columns", [])
+            dep_ids = params.get("depends_on", [])
+            src_var = last_df_var
+            for dep_id in dep_ids:
+                dep_op = op_map.get(dep_id)
+                if dep_op:
+                    src_var = alias_vars.get(dep_op.get('output_alias'), last_df_var)
+                    break
+            src_var = src_var or 'df'
+            cols_safe = [_sanitize_code_param(str(c), max_len=200) for c in columns]
+            code_lines.extend([
+                f"if '{src_var}' in dir() and {src_var} is not None:",
+                f"    {op_alias} = {src_var}[{cols_safe}].copy()",
+                f"    print('[ColumnFilter] cols=' + str({cols_safe}) + ', rows=' + str(len({op_alias})))",
+                f"else:",
+                f"    {op_alias} = pd.DataFrame()",
+            ])
+            alias_vars[op_alias] = op_alias
+            last_df_var = op_alias
+
+        elif op_name == "RegexFilter":
+            col_raw = params.get("column", "")
+            pattern_raw = params.get("pattern", "")
+            dep_ids = params.get("depends_on", [])
+            src_var = last_df_var
+            for dep_id in dep_ids:
+                dep_op = op_map.get(dep_id)
+                if dep_op:
+                    src_var = alias_vars.get(dep_op.get('output_alias'), last_df_var)
+                    break
+            src_var = src_var or 'df'
+            col_safe = _sanitize_code_param(col_raw, max_len=200)
+            pattern_safe = _sanitize_code_param(pattern_raw, max_len=1000)
+            code_lines.extend([
+                f"if '{src_var}' in dir() and {src_var} is not None and '{col_safe}' in {src_var}.columns:",
+                f"    {op_alias} = {src_var}[{src_var}['{col_safe}'].astype(str).str.contains('{pattern_safe}', na=False)]",
+                f"    print(f'[RegexFilter] pattern={pattern_safe}, rows={{len({op_alias})}}')",
+                f"else:",
+                f"    {op_alias} = {src_var}.copy() if '{src_var}' in dir() and {src_var} is not None else pd.DataFrame()",
+            ])
+            alias_vars[op_alias] = op_alias
+            last_df_var = op_alias
+        elif op_name == "GroupBy":
+            by_cols = params.get("by", params.get("columns", params.get("group_by_columns", [])))
+            aggs = params.get("aggregations", {})
+            # 保护：如果 aggs 为空，跳过聚合
+            if not aggs:
+                code_lines.append(f"# [GroupBy] 跳过：aggregations 为空")
+                code_lines.append(f"{op_alias} = {last_df_var or 'df'}")
+                alias_vars[op_alias] = op_alias
+                last_df_var = op_alias
+                code_lines.append("")
+                continue
+            # 去重：如果某列同时在 by 和 agg 里，从 by 中移除（避免 reset_index 列名冲突）
+            agg_keys = set(aggs.keys()) if isinstance(aggs, dict) else set()
+            by_cols = [c for c in by_cols if c not in agg_keys]
+            dep_ids = params.get("depends_on", [])
+            src_var = last_df_var
+            for dep_id in dep_ids:
+                dep_op = op_map.get(dep_id)
+                if dep_op:
+                    src_var = alias_vars.get(dep_op.get('output_alias'), last_df_var)
+                    break
+            src_var = src_var or 'df'
+            if by_cols:
+                by_safe = [_sanitize_code_param(str(c), max_len=200) for c in by_cols]
+                code_lines.extend([
+                    f"if '{src_var}' in dir() and {src_var} is not None and not {src_var}.empty:",
+                    f"    _by_valid = [c for c in {by_safe} if c in {src_var}.columns]",
+                    f"    _by_missing = [c for c in {by_safe} if c not in {src_var}.columns]",
+                    f"    if _by_missing:",
+                    f"        print('[GroupBy] 警告：以下列不存在，已自动跳过: ' + str(_by_missing))",
+                    f"    if _by_valid:",
+                    f"        {op_alias} = {src_var}.groupby(_by_valid).agg({aggs}).reset_index()",
+                    f"        print('[GroupBy] by=' + str(_by_valid) + ', rows=' + str(len({op_alias})))",
+                    f"    else:",
+                    f"        print('[GroupBy] 错误：没有有效的分组列！可用列: ' + str(list({src_var}.columns)))",
+                    f"        {op_alias} = pd.DataFrame()",
+                    f"else:",
+                    f"    {op_alias} = pd.DataFrame()",
+                ])
+            else:
+                # by_cols 全部在 agg 里，直接聚合
+                code_lines.extend([
+                    f"if '{src_var}' in dir() and {src_var} is not None:",
+                    f"    {op_alias} = pd.DataFrame([{src_var}.agg({aggs})])",
+                    f"    print('[GroupBy] agg-only, rows=' + str(len({op_alias})))",
+                    f"else:",
+                    f"    {op_alias} = pd.DataFrame()",
+                ])
+            alias_vars[op_alias] = op_alias
+            last_df_var = op_alias
+
+        elif op_name == "Merge":
+            on_cols = params.get("on", [])
+            how = params.get("how", "outer")
+            dep_ids = params.get("depends_on", [])
+            src_vars = []
+            for dep_id in dep_ids:
+                dep_op = op_map.get(dep_id)
+                if dep_op:
+                    src_vars.append(alias_vars.get(dep_op.get('output_alias'), f'df_{dep_id}'))
+            if len(src_vars) < 2:
+                all_vars = list(alias_vars.values())
+                src_vars = all_vars[-2:] if len(all_vars) >= 2 else (src_vars + ['df'])
+            left_var, right_var = (src_vars[0], src_vars[1]) if len(src_vars) >= 2 else ('df', 'df')
+            # 运行时自动检测：只保留两边都存在的列
+            code_lines.extend([
+                f"if '{left_var}' in dir() and '{right_var}' in dir() and not {left_var}.empty and not {right_var}.empty:",
+                f"    _merge_candidates = {on_cols}",
+                f"    _left_cols = set({left_var}.columns)",
+                f"    _right_cols = set({right_var}.columns)",
+                f"    _common = [c for c in _merge_candidates if c in _left_cols and c in _right_cols]",
+                f"    _missing = [c for c in _merge_candidates if c not in _left_cols or c not in _right_cols]",
+                f"    if _missing:",
+                f"        print('[Merge] 警告：以下列不存在于数据中，已自动跳过: ' + str(_missing))",
+                f"    if _common:",
+                f"        {op_alias} = pd.merge({left_var}, {right_var}, on=_common, how='{how}')",
+                f"        print('[Merge] on=' + str(_common) + ', how={how}, rows=' + str(len({op_alias})))",
+                f"    else:",
+                f"        print('[Merge] 错误：没有公共列可合并！左表列: ' + str(list(_left_cols)) + ', 右表列: ' + str(list(_right_cols)))",
+                f"        {op_alias} = pd.DataFrame()",
+                f"else:",
+                f"    {op_alias} = pd.DataFrame()",
+            ])
+            alias_vars[op_alias] = op_alias
+            last_df_var = op_alias
+
+        elif op_name == "Sort":
+            by_cols = params.get("by", params.get("columns", []))
+            ascending = params.get("ascending", True)
+            dep_ids = params.get("depends_on", [])
+            src_var = last_df_var
+            for dep_id in dep_ids:
+                dep_op = op_map.get(dep_id)
+                if dep_op:
+                    src_var = alias_vars.get(dep_op.get('output_alias'), last_df_var)
+                    break
+            src_var = src_var or 'df'
+            by_safe = [_sanitize_code_param(str(c), max_len=200) for c in by_cols]
+            code_lines.extend([
+                f"if '{src_var}' in dir() and {src_var} is not None and not {src_var}.empty:",
+                f"    _sort_valid = [c for c in {by_safe} if c in {src_var}.columns]",
+                f"    _sort_missing = [c for c in {by_safe} if c not in {src_var}.columns]",
+                f"    if _sort_missing:",
+                f"        print('[Sort] 警告：以下列不存在，已自动跳过: ' + str(_sort_missing))",
+                f"    if _sort_valid:",
+                f"        {op_alias} = {src_var}.sort_values(by=_sort_valid, ascending={ascending})",
+                f"        print('[Sort] by=' + str(_sort_valid) + ', asc=' + str({ascending}) + ', rows=' + str(len({op_alias})))",
+                f"    else:",
+                f"        print('[Sort] 错误：没有有效排序列！可用列: ' + str(list({src_var}.columns)))",
+                f"        {op_alias} = {src_var}.copy()",
+                f"else:",
+                f"    {op_alias} = pd.DataFrame()",
+            ])
+            alias_vars[op_alias] = op_alias
+            last_df_var = op_alias
+        elif op_name == "ConditionCheck":
+            col_raw = params.get("column", "")
+            operator_raw = params.get("operator", ">")
+            value_raw = params.get("value", 0)
+            col_safe = _sanitize_code_param(col_raw, max_len=200)
+            operator_safe = operator_raw if operator_raw in _VALID_COMPARISON_OPS else "=="
+            try:
+                value_safe = float(value_raw)
+            except (ValueError, TypeError):
+                value_safe = 0.0
+            dep_ids = params.get("depends_on", [])
+            src_var = last_df_var
+            for dep_id in dep_ids:
+                dep_op = op_map.get(dep_id)
+                if dep_op:
+                    src_var = alias_vars.get(dep_op.get('output_alias'), last_df_var)
+                    break
+            src_var = src_var or 'df'
+            code_lines.extend([
+                f"if '{src_var}' in dir() and {src_var} is not None and '{col_safe}' in {src_var}.columns:",
+                f"    mask = {src_var}['{col_safe}'] {operator_safe} {value_safe}",
+                f"    {op_alias}_passed = {src_var}[mask]",
+                f"    {op_alias}_failed = {src_var}[~mask]",
+            ])
+
+        elif op_name == "Export":
+            output_file = params.get("output_file", params.get("output_file_path", "analysis_result.csv"))
+            dep_ids = params.get("depends_on", [])
+            src_var = last_df_var
+            for dep_id in dep_ids:
+                dep_op = op_map.get(dep_id)
+                if dep_op:
+                    src_var = alias_vars.get(dep_op.get('output_alias'), last_df_var)
+                    break
+            src_var = src_var or 'df'
+            code_lines.extend([
+                f"if '{src_var}' in dir() and {src_var} is not None and not {src_var}.empty:",
+                f"    {src_var}.to_csv(os.path.join('outputs', '{output_file}'), index=False, encoding='utf-8-sig')",
+                f"    print('[Export] ' + '{output_file}' + ', rows=' + str(len({src_var})))",
+                f"else:",
+                f"    print('[Export] 跳过：数据为空，不导出空文件')",
+            ])
+
+        elif op_name == "Aggregate":
+            aggs = params.get("aggregations", {})
+            # 格式1: {"columns": ["col"], "aggregation": "sum"}（扁平）
+            if not aggs and params.get("columns"):
+                flat_cols = params.get("columns", [])
+                flat_func = params.get("aggregation", "sum")
+                if isinstance(flat_cols, list) and flat_cols:
+                    aggs = {f"{c}_{flat_func}": {"column": c, "agg_func": flat_func} for c in flat_cols}
+            # 格式2: {"columns": ["col"], "aggregations": ["sum"]}（列表）
+            if isinstance(aggs, list) and params.get("columns"):
+                cols = params.get("columns", [])
+                func = aggs[0] if aggs else "sum"
+                if isinstance(cols, list) and cols:
+                    aggs = {f"{c}_{func}": {"column": c, "agg_func": func} for c in cols}
+            if not aggs:
+                code_lines.append(f"# [Aggregate] 跳过：aggregations 为空")
+                code_lines.append(f"{op_alias} = {last_df_var or 'df'}")
+                alias_vars[op_alias] = op_alias
+                last_df_var = op_alias
+                code_lines.append("")
+                continue
+            dep_ids = params.get("depends_on", [])
+            src_var = last_df_var
+            for dep_id in dep_ids:
+                dep_op = op_map.get(dep_id)
+                if dep_op:
+                    src_var = alias_vars.get(dep_op.get('output_alias'), last_df_var)
+                    break
+            src_var = src_var or 'df'
+            # 转换 LLM 输出的嵌套格式为兼容 pandas>=0.25 的语法
+            # 输入: {"col_sum": {"column": "col", "agg_func": "sum"}}
+            # 输出: pd.DataFrame({'col_sum': [df['col'].sum()], ...})
+            agg_items = []
+            for new_name, agg_spec in aggs.items():
+                col = agg_spec.get("column", "") if isinstance(agg_spec, dict) else new_name
+                func = agg_spec.get("agg_func", "sum") if isinstance(agg_spec, dict) else agg_spec
+                safe_col = repr(str(col))
+                safe_name = repr(str(new_name))
+                agg_items.append((new_name, col, func, safe_name, safe_col))
+            if agg_items:
+                group_by = params.get("group_by", [])
+                if group_by:
+                    # 有分组列：用 groupby + named agg（现代 pandas 语法）
+                    gp_safe = [_sanitize_code_param(str(c), max_len=200) for c in group_by]
+                    code_lines.extend([
+                        f"if '{src_var}' in dir() and {src_var} is not None and not {src_var}.empty:",
+                        f"    _gp_valid = [c for c in {gp_safe} if c in {src_var}.columns]",
+                        f"    if _gp_valid:",
+                    ])
+                    gp_parts = [f"{repr(n)}: (pd.to_numeric({src_var}[{repr(c)}], errors='coerce'), '{fn}')" for n, c, fn, _, _ in agg_items]
+                    code_lines.append(
+                        f"        {op_alias} = {src_var}.groupby(_gp_valid).agg(**{{{', '.join(gp_parts)}}}).reset_index()"
+                    )
+                    code_lines.extend([
+                        f"    else:",
+                        f"        {op_alias} = pd.DataFrame()",
+                        f"else:",
+                        f"    {op_alias} = pd.DataFrame()",
+                    ])
+                else:
+                    # 无分组：用 pd.DataFrame 构造（避免嵌套 renamer 不兼容）
+                    item_lines = [f"            {sn}: [pd.to_numeric({src_var}[{sc}], errors='coerce').{fn}()]" for _, _, fn, sn, sc in agg_items]
+                    code_lines.extend([
+                        f"if '{src_var}' in dir() and {src_var} is not None:",
+                        f"    {op_alias} = pd.DataFrame({{",
+                        ",\n".join(item_lines),
+                        f"    }})",
+                    ])
+            else:
+                code_lines.append(f"{op_alias} = {last_df_var or 'df'}")
+
+        elif op_name == "Diff":
+            dep_ids = params.get("depends_on", [])
+            src_vars = []
+            for dep_id in dep_ids:
+                dep_op = op_map.get(dep_id)
+                if dep_op:
+                    src_vars.append(alias_vars.get(dep_op.get('output_alias'), f'df_{dep_id}'))
+            if len(src_vars) < 2:
+                all_vars = list(alias_vars.values())
+                src_vars = all_vars[-2:] if len(all_vars) >= 2 else (src_vars + ['df', 'df'])
+            left_var, right_var = (src_vars[0], src_vars[1]) if len(src_vars) >= 2 else ('df', 'df')
+            code_lines.extend([
+                f"if '{left_var}' in dir() and '{right_var}' in dir():",
+                f"    {op_alias}_only_left = {left_var}[~{left_var}.index.isin({right_var}.index)]",
+                f"    {op_alias}_only_right = {right_var}[~{right_var}.index.isin({left_var}.index)]",
+                f"    {op_alias}_common = pd.merge({left_var}, {right_var}, how='inner')",
+            ])
+
+        else:
+            code_lines.append(f"# [跳过] 未实现算子: {op_name}")
+
+        code_lines.append("")
+
+    # 格式化短摘要，防止越界或空值崩溃
+    safe_explanation = str(objective)[:30].replace('"', "'")
+
+    code_lines.extend([
+        "# 生成实际输出文件（基于计算结果，非硬编码）",
+        f"_final_df = {last_df_var} if '{last_df_var}' in dir() and {last_df_var} is not None and not {last_df_var}.empty else None",
+        "if _final_df is not None:",
+        "    # 导出 CSV",
+        "    _final_df.to_csv(os.path.join('outputs', 'analysis_result.csv'), index=False, encoding='utf-8-sig')",
+        "    print('[Output] CSV 已导出: analysis_result.csv, rows=' + str(len(_final_df)))",
+        "    # 同时导出 Excel（保留原表格式）",
+        "    try:",
+        "        _final_df.to_excel(os.path.join('outputs', 'analysis_result.xlsx'), index=False)",
+        "        print('[Output] Excel 已导出: analysis_result.xlsx')",
+        "    except Exception as _e:",
+        "        print('[Output] Excel 导出失败（可能缺少 openpyxl）: ' + str(_e))",
+        "    # 生成 JSON 摘要",
+        "    _summary = {",
+        "        'total_rows': len(_final_df),",
+        "        'columns': list(_final_df.columns),",
+        "        'dtypes': {str(k): str(v) for k, v in _final_df.dtypes.items()},",
+        "    }",
+        "    # 数值列统计",
+        "    _num_cols = _final_df.select_dtypes(include='number').columns.tolist()",
+        "    if _num_cols:",
+        "        _summary['numeric_summary'] = {c: {'sum': float(_final_df[c].sum()), 'mean': float(_final_df[c].mean()), 'max': float(_final_df[c].max()), 'min': float(_final_df[c].min())} for c in _num_cols}",
+        "    with open(os.path.join('outputs', 'journal_entries.json'), 'w', encoding='utf-8') as f:",
+        "        json.dump(_summary, f, ensure_ascii=False, indent=2)",
+        "    print('[Output] JSON 已导出: journal_entries.json')",
+        "else:",
+        "    print('[Output] 警告：无有效数据可导出')",
+        "    with open(os.path.join('outputs', 'journal_entries.json'), 'w', encoding='utf-8') as f:",
+        "        json.dump({'error': '无有效数据', 'columns': [], 'total_rows': 0}, f, ensure_ascii=False, indent=2)",
+    ])
+
+    return "\n".join(code_lines)
+
+
+async def _execute_in_sandbox(run_id: str, code: str, run_dir: Path) -> None:
+    """在子进程中执行审计代码（绕过 Docker 以避免路径/权限问题）"""
+    import subprocess
+    print(f"[Sandbox] 本地子进程执行 Run {run_id}")
+    try:
+        output_dir = run_dir / "outputs"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        input_dir = run_dir / "inputs"
+
+        # 🔥 匹配引擎优先：如果检测到双文件匹配场景，调用匹配引擎
+        record = _get_snapshot_mgr().get_run(run_id)
+        intent = (record.user_intent or "") if record else ""
+        input_files = list(input_dir.iterdir()) if input_dir.exists() else []
+        excel_files = [f for f in input_files if f.suffix.lower() in (".xlsx", ".xls", ".csv")]
+
+        if len(excel_files) >= 2 and ("匹配" in intent or "核对" in intent or "对账" in intent or "比对" in intent):
+            print(f"[Sandbox] 检测到匹配场景（{len(excel_files)}个文件），调用匹配引擎...")
+            logs = []
+            status = "COMPLETED"
+            try:
+                # 历史文件保护：验证 dag_blueprint 中的文件引用与当前输入目录一致
+                # 若不一致（可能是历史缓存），则仅使用当前输入目录的实际文件
+                if record and record.dag_blueprint:
+                    dag_bp = record.dag_blueprint
+                    if isinstance(dag_bp, dict):
+                        ops = dag_bp.get("operators", [])
+                        actual_input_names = {f.name for f in input_files if f.is_file()}
+                        for op in ops:
+                            sf = op.get("source_file", "")
+                            if sf and sf not in actual_input_names:
+                                print(f"[Sandbox] 注意: dag_blueprint 中引用文件 '{sf}' 不在当前输入目录，将仅使用当前上传文件进行分析")
+                                break
+
+                from core.matching_engine import run_matching_pipeline
+                # 从 DAG 蓝图提取 LLM 生成的筛选关键词
+                dag_patterns = _extract_patterns_from_dag(record.dag_blueprint) if record else ""
+                if not dag_patterns and record and record.user_intent:
+                    from core.matching_engine import _extract_patterns_via_llm
+                    dag_patterns = _extract_patterns_via_llm(record.user_intent)
+                    print(f"[Sandbox] LLM 提取关键词: '{dag_patterns}'")
+                source = "DAG蓝图" if dag_patterns else "LLM提取/兜底"
+                print(f"[Sandbox] 匹配引擎 pattern: '{dag_patterns or '(空)'}' (来源: {source})")
+                match_result = run_matching_pipeline(input_dir, output_dir, patterns=dag_patterns)
+                logs.append("[匹配引擎] 匹配流水线执行完成")
+
+                # 如果成功，更新输出文件列表
+                output_files_final = [f.name for f in output_dir.iterdir() if f.is_file()]
+                if output_files_final:
+                    _get_snapshot_mgr().update_outputs(
+                        run_id=run_id, output_files=output_files_final,
+                        validation_results=[{"check": "matching_engine", "passed": True}],
+                        all_passed=True,
+                    )
+
+                # 生成报告
+                if record:
+                    dag_ops = (record.dag_blueprint or {}).get("operators", [])
+                    input_names = [f.name for f in input_files if f.is_file()]
+                    from core.report_generator import generate_audit_report
+                    # 收集匹配逻辑信息（含用户确认的自然语言说明 + 匹配引擎实际执行结果）
+                    dag_bp = record.dag_blueprint or {}
+                    explanation = dag_bp.get("match_explanation", "") if isinstance(dag_bp, dict) else ""
+                    engine_match_logic = match_result.get("match_logic", {}) if match_result else {}
+                    engine_stats = match_result.get("match_stats", {}) if match_result else {}
+                    match_info = {
+                        "patterns": dag_patterns or engine_match_logic.get("筛选模式", "默认医保关键词"),
+                        "columns": engine_match_logic.get("筛选列", []),
+                        "amount_column": engine_match_logic.get("金额列", ""),
+                        "institution_columns": engine_match_logic.get("机构识别列", []),
+                        "method": match_result.get("strategy_name", "多列联合匹配") if match_result else "多列联合匹配",
+                        "explanation": explanation,
+                        "strategy_comparison": match_result.get("all_strategies", []) if match_result else [],
+                    }
+                    rp = generate_audit_report(
+                        run_id=run_id, user_intent=record.user_intent or "",
+                        dag_operators=dag_ops, output_dir=output_dir,
+                        input_files=input_names, execution_logs=logs,
+                        match_logic=match_info,
+                    )
+                    output_files_final.append(rp.name)
+                    print(f"[报告] Word 审计报告已生成: {rp.name}")
+
+                if output_files_final:
+                    _get_snapshot_mgr().update_outputs(
+                        run_id=run_id, output_files=output_files_final,
+                        validation_results=[{"check": "matching_engine", "passed": True}],
+                        all_passed=True,
+                    )
+                _get_snapshot_mgr().update_status(run_id, "COMPLETED")
+                print(f"[Sandbox] Run {run_id} 匹配完成")
+                return
+
+            except Exception as e:
+                print(f"[Sandbox] 匹配引擎失败: {e}，回退到 DAG 执行")
+                logs.append(f"[匹配引擎] 失败: {e}，回退到 DAG")
+                # 不回退，继续走 DAG 方式
+                pass
+
+        # DAG 方式执行
+        script_path = run_dir / "_run_script.py"
+        script_path.write_text(code, encoding="utf-8")
+        proc = subprocess.run(
+            [sys.executable, str(script_path)],
+            cwd=str(run_dir),
+            capture_output=True, text=True, timeout=120
+        )
+        status = "COMPLETED" if proc.returncode == 0 else "FAILED"
+        logs = [proc.stdout[-2000:]] if proc.stdout else []
+        if proc.stderr:
+            logs.append("STDERR: " + proc.stderr[-2000:])
+        _get_snapshot_mgr().update_status(run_id, status)
+        # 保存日志到数据库
+        try:
+            from core.run_snapshot import DB_PATH
+            with sqlite3.connect(str(DB_PATH)) as conn:
+                conn.execute(
+                    "UPDATE runs SET execution_logs = ? WHERE run_id = ?",
+                    (json.dumps(logs, ensure_ascii=False), run_id)
+                )
+                conn.commit()
+        except Exception:
+            pass
+        # 如果成功，更新输出文件列表
+        if status == "COMPLETED":
+            output_files = [f.name for f in output_dir.iterdir() if f.is_file()]
+            if output_files:
+                validations = [{"check": "local_execution", "passed": True}]
+                _get_snapshot_mgr().update_outputs(
+                    run_id=run_id,
+                    output_files=output_files,
+                    validation_results=validations,
+                    all_passed=True,
+                )
+            # 生成 Word 审计报告
+            try:
+                record = _get_snapshot_mgr().get_run(run_id)
+                if record:
+                    input_names = [f.name for f in record.input_dir.iterdir() if f.is_file()] if record.input_dir.exists() else []
+                    dag_ops = (record.dag_blueprint or {}).get("operators", [])
+                    from core.report_generator import generate_audit_report
+                    rp = generate_audit_report(
+                        run_id=run_id,
+                        user_intent=record.user_intent or "",
+                        dag_operators=dag_ops,
+                        output_dir=output_dir,
+                        input_files=input_names,
+                        execution_logs=logs,
+                    )
+                    output_files.append(rp.name)
+                    print(f"[报告] Word 审计报告已生成: {rp.name}")
+            except Exception as e:
+                print(f"[报告] 生成失败（非致命）: {e}")
+            # 更新输出列表（包含报告）
+            if output_files:
+                _get_snapshot_mgr().update_outputs(
+                    run_id=run_id,
+                    output_files=output_files,
+                    validation_results=[{"check": "local_execution", "passed": True}],
+                    all_passed=True,
+                )
+        print(f"[Sandbox] Run {run_id} 完成: status={status}, outputs={list(output_dir.iterdir()) if output_dir.exists() else []}")
+    except Exception as e:
+        print(f"[Sandbox] Run {run_id} 执行异常: {e}")
+        _get_snapshot_mgr().update_status(run_id, "FAILED")
+
+
+# ═══════════════════════════════════════════════════════════════
+# RAG 知识库管理 API
+# ═══════════════════════════════════════════════════════════════
+
+@router.get("/rag/status")
+async def rag_status():
+    """获取 RAG 知识库完整状态（索引统计 + 目录扫描 + 新鲜度检查）"""
+    try:
+        from core.rag_admin import get_rag_status
+        return {"success": True, "data": get_rag_status()}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@router.post("/rag/search")
+async def rag_search(query: str = Form(...), top_k: int = Form(5)):
+    """RAG 知识库检索（供前端知识问答使用）"""
+    try:
+        from core.rag_engine import retrieve
+        results = retrieve(query, top_k=top_k)
+        return {"success": True, "data": results}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@router.post("/rag/rebuild")
+async def rag_rebuild(force: bool = True):
+    """强制重建 RAG 索引（当审计师下载新法规后调用）"""
+    try:
+        from core.rag_admin import rebuild_index
+        result = rebuild_index(force=force)
+        return {"success": True, "data": result}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@router.get("/rag/freshness")
+async def rag_freshness():
+    """检查索引新鲜度（是否有新文件需要重建）"""
+    try:
+        from core.rag_admin import check_index_freshness
+        return {"success": True, "data": check_index_freshness()}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 应用入口
+# ═══════════════════════════════════════════════════════════════
+
+def create_app() -> FastAPI:
+    app = FastAPI(title="智能审计大脑 v3.0", version="3.0.0")
+    app.include_router(router)
+
+    # ── 启动时后台异步预建 RAG 索引（不阻塞服务启动）──
+    @app.on_event("startup")
+    async def startup_prebuild_rag():
+        import asyncio
+        loop = asyncio.get_event_loop()
+        print("[Startup] 后台预建 RAG 知识库索引（服务已就绪，无需等待）...")
+
+        def _build():
+            from core.rag_engine import build_index
+            try:
+                count = build_index(True)
+                print(f"[Startup] RAG 索引就绪: {count} 个文本块")
+            except Exception as e:
+                print(f"[Startup] RAG 索引预建失败（非致命）: {e}")
+
+        # fire-and-forget：不阻塞启动
+        loop.run_in_executor(None, _build)
+
+    return app
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    app = create_app()
+    uvicorn.run(app, host="0.0.0.0", port=8000)

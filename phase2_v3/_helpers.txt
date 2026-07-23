@@ -1,0 +1,97 @@
+def _run_constraint_check(run_id, output_dir, logs):
+    try:
+        record = _get_snapshot_mgr().get_run(run_id)
+        if not record or not record.user_intent: return
+        from core.constraint_engine import parse_constraints, format_constraint_report
+        constraints = parse_constraints(record.user_intent)
+        if not constraints: return
+        excel_files = list(output_dir.glob("*.xlsx"))
+        import pandas as pd
+        all_passed = True
+        for xf in excel_files:
+            try:
+                df = pd.read_excel(xf)
+                for c in constraints:
+                    if c.field == "差异金额" and "差异金额" in df.columns:
+                        max_diff = df["差异金额"].abs().max()
+                        c.actual_value = max_diff
+                        c.satisfied = max_diff < c.value
+                        if not c.satisfied: all_passed = False
+            except: continue
+        report = format_constraint_report(constraints)
+        logs.append(f"[约束校验] {'PASS' if all_passed else 'FAIL'}: {report}")
+        if not all_passed:
+            _get_snapshot_mgr().update_status(run_id, "FAILED")
+            _run_constraint_retry(run_id, record.user_intent, logs)
+    except Exception as e:
+        print(f"[约束校验] 校验失败(非致命): {e}")
+
+
+def _write_audit_trace(run_id, user_intent, dag_blueprint):
+    import json as _j
+    p = Path(os.environ.get("AUDIT_TRACE_DIR", str(Path(__file__).resolve().parent.parent / "data" / "audit_traces")))
+    p.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(p / "v5_audit_traces.jsonl", "a", encoding="utf-8") as f:
+            f.write(_j.dumps({"run_id": run_id, "timestamp": datetime.now().isoformat(), "instruction": user_intent or "", "output": _j.dumps(dag_blueprint or {}, ensure_ascii=False)}, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[审计采集] 写入失败(非致命): {e}")
+
+
+def _append_approval_hash(run_id, user_intent, dag_blueprint, confirmed):
+    import hashlib, sqlite3, json as _j
+    try:
+        from core.run_snapshot import DB_PATH
+        chain_data = _j.dumps({"run_id": run_id, "timestamp": datetime.now().isoformat(), "intent": user_intent[:200], "confirmed": confirmed}, ensure_ascii=False, sort_keys=True)
+        current_hash = hashlib.sha256(chain_data.encode()).hexdigest()
+        with sqlite3.connect(str(DB_PATH)) as conn:
+            prev = conn.execute("SELECT approval_hash FROM approval_chain ORDER BY id DESC LIMIT 1").fetchone()
+            conn.execute("CREATE TABLE IF NOT EXISTS approval_chain (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, hash TEXT, prev_hash TEXT, data TEXT, created_at TEXT)")
+            conn.execute("INSERT INTO approval_chain (run_id, hash, prev_hash, data, created_at) VALUES (?,?,?,?,?)", (run_id, current_hash, prev[0] if prev else "GENESIS", chain_data, datetime.now().isoformat()))
+            conn.commit()
+    except Exception as e:
+        print(f"[哈希链] 记录失败(非致命): {e}")
+
+
+def _run_constraint_retry(run_id, user_intent, logs):
+    try:
+        from core.constraint_engine import parse_constraints
+        constraints = parse_constraints(user_intent)
+        failed = [c for c in constraints if hasattr(c, "satisfied") and not c.satisfied]
+        if not failed: return False
+        hint = "约束未满足："
+        for c in failed: hint += f" {c.field} 实际={c.actual_value} vs 要求<={c.value};"
+        logs.append(f"[约束重试] {hint}")
+        return True
+    except: return False
+
+
+def _ensure_essential_operators(blueprint_dict, user_intent):
+    ops = list(blueprint_dict.get("operators", []))
+    existing = {op.get("name", "") for op in ops}
+    max_id = max((int(op.get("id", "").replace("op_", "0")) for op in ops if op.get("id", "").replace("op_", "").isdigit()), default=0)
+    last = [ops[-1]["id"]] if ops else []
+    changed = False
+    need_merge = any(k in user_intent for k in ["核对", "对账", "匹配", "比对", "两表"])
+    need_diff = any(k in user_intent for k in ["差异", "对比", "比较", "差额"])
+    need_group = any(k in user_intent for k in ["汇总", "分组", "按月"])
+    need_sort = any(k in user_intent for k in ["排序", "从大到小", "从小到大"])
+    need_save = any(k in user_intent for k in ["导出", "保存", "下载"])
+    load_count = sum(1 for op in ops if op.get("name") in ("Load", "load"))
+    if need_merge and "Merge" not in existing and load_count >= 2:
+        max_id += 1; load_ids = [op["id"] for op in ops if op.get("name") in ("Load", "load")]
+        ops.append({"id": f"op_{max_id}", "name": "Merge", "input_from": load_ids, "params": {"how": "outer"}, "output_alias": f"df_merged_{max_id}"}); last = [f"op_{max_id}"]; existing.add("Merge"); changed = True
+    if need_group and "GroupBy" not in existing:
+        max_id += 1
+        ops.append({"id": f"op_{max_id}", "name": "GroupBy", "input_from": last, "params": {"by": ["对方客户名称"], "aggregations": {"交易金额": "sum"}}, "output_alias": f"df_grouped_{max_id}"}); last = [f"op_{max_id}"]; existing.add("GroupBy"); changed = True
+    if need_diff and "Diff" not in existing and ("Merge" in existing or load_count >= 2):
+        max_id += 1
+        ops.append({"id": f"op_{max_id}", "name": "Diff", "input_from": last, "params": {"col_a": "交易金额", "col_b": "业务金额", "tolerance_pct": 1.0}, "output_alias": f"df_diff_{max_id}"}); last = [f"op_{max_id}"]; existing.add("Diff"); changed = True
+    if need_sort and "Sort" not in existing:
+        max_id += 1; sc = "交易金额" if "交易金额" in str(ops) else "金额"
+        ops.append({"id": f"op_{max_id}", "name": "Sort", "input_from": last, "params": {"by": [sc], "ascending": False}, "output_alias": f"df_sorted_{max_id}"}); last = [f"op_{max_id}"]; existing.add("Sort"); changed = True
+    if need_save and "Export" not in existing:
+        max_id += 1
+        ops.append({"id": f"op_{max_id}", "name": "Export", "input_from": last, "params": {"filename": "审计结果.xlsx"}, "output_alias": f"df_output_{max_id}"}); changed = True
+    if changed: blueprint_dict["operators"] = ops
+    return blueprint_dict

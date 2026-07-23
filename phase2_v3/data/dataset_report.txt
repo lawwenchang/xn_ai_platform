@@ -1,0 +1,48 @@
+﻿
+=== training_data.jsonl ===
+样本数: 18612
+assistant 中文占比均值: 0.0% | 中文<30%的样本: 18612 (100%)
+字符长度 p50/p90/p99/max: 512/1026/5882/21408
+system 提示分布(前4):
+    18612  'You are an expert Python programming'
+
+=== final_train.jsonl ===
+样本数: 1965
+assistant 中文占比均值: 26.1% | 中文<30%的样本: 1480 (75%)
+字符长度 p50/p90/p99/max: 494/876/1590/1605
+system 提示分布(前4):
+     1310  '你是数据处理与Excel专家，精通Excel公式、Pandas和数据分析'
+      330  '你是资深审计专家。基于中国注册会计师审计准则，准确回答审计师的专业问题。'
+      170  '你是审计 DAG 编译器。将审计师意图编译为 DAG JSON。可用算子'
+      155  '你是资深审计师助手。输出必须符合审计工作规范：结构化、用词严谨、数字保留'
+
+=== final_val.jsonl ===
+样本数: 12
+assistant 中文占比均值: 49.5% | 中文<30%的样本: 7 (58%)
+字符长度 p50/p90/p99/max: 643/742/967/967
+system 提示分布(前4):
+        7  '你是审计 DAG 编译器。将审计师意图编译为 DAG JSON。可用算子'
+        5  '你是资深审计专家。基于中国注册会计师审计准则，准确回答审计师的专业问题。'
+
+=== round3_train_final.jsonl ===
+样本数: 589
+assistant 中文占比均值: 67.2% | 中文<30%的样本: 38 (6%)
+字符长度 p50/p90/p99/max: 175/399/1577/1605
+system 提示分布(前4):
+      508  '你是数据处理与Excel专家，精通Excel公式、Pandas和数据分析'
+       33  '你是资深审计专家。基于中国注册会计师审计准则，准确回答审计师的专业问题。'
+       31  '你是资深审计师助手。输出必须符合审计工作规范：结构化、用词严谨、数字保留'
+       17  '你是审计 DAG 编译器。将审计师意图编译为 DAG JSON。可用算子'
+
+=== zh_excel_qa_500.jsonl ===
+样本数: 500
+assistant 中文占比均值: 66.0% | 中文<30%的样本: 11 (2%)
+字符长度 p50/p90/p99/max: 171/227/399/596
+system 提示分布(前4):
+      500  '你是数据处理与Excel专家，精通Excel公式、Pandas和数据分析'
+
+=== 文件间重叠（user+assistant 签名） ===
+final_train.jsonl ∩ round3_train_final.jsonl: 91 条 (占 round3_train_final.jsonl 的 15%)
+round3_train_final.jsonl ∩ zh_excel_qa_500.jsonl: 498 条 (占 zh_excel_qa_500.jsonl 的 100%)
+
+体检完成。

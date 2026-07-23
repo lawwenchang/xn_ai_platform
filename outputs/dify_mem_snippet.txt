@@ -1,0 +1,2 @@
+natural language", "memory": {"role_prefix": {"assistant": "", "user": ""}, "window": {"enabled": false, "size": 50}}, "model": {"completion_params": {"frequency_penalty": 0, "presence_penalty": 0, "temperature": 0.1, "top_p": 1, "enable_thinking": true, "reasoning_effort": "medium", "max_tokens": 8192}, "mode": "chat"
+

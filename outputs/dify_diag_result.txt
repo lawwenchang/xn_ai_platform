@@ -1,0 +1,11 @@
+Output format is unaligned.
+DRAFT | workflow | c46f68e0 | 语义编译�?| mem=0 win=0 rp=0 | 2026-07-18 07:01:19.732017
+DRAFT | workflow | 818363ff | 知识问答 | mem=0 win=0 rp=0 | 2026-07-18 07:01:11.766365
+DRAFT | workflow | c214cf73 | 报告纠错与格式规范化 | mem=0 win=0 rp=0 | 2026-07-18 06:59:44.13145
+DRAFT | workflow | 42f0fdb6 | DAG精修与纠�?| mem=0 win=0 rp=0 | 2026-07-18 06:58:33.913544
+DRAFT | workflow | 02d3af05 | 单表筛�?| mem=0 win=0 rp=0 | 2026-07-18 06:57:13.713673
+DRAFT | workflow | 41b929ba | 报告生成 | mem=0 win=0 rp=0 | 2026-07-18 06:55:18.536802
+DRAFT | advanced-chat | e913235e | Knowledge Retrieval + Chatbot  | mem=1 win=1 rp=1 | 2026-07-18 06:51:39.267151
+LATEST_PUB | advanced-chat | e913235e | Knowledge Retrieval + Chatbot  | mem=1 win=1 rp=1 | 2026-07-12 00:34:38.994631
+LATEST_PUB | workflow | c46f68e0 | 语义编译�?| mem=0 win=0 rp=0 | 2026-07-18 06:09:35.858918
+

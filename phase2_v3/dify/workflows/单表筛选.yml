@@ -1,0 +1,250 @@
+app:
+  description: 对单张数据表进行条件筛选汇总
+  icon: 🤖
+  icon_background: '#FFEAD5'
+  icon_type: emoji
+  mode: workflow
+  name: 单表筛选
+  use_icon_as_answer_icon: false
+dependencies:
+- current_identifier: null
+  type: marketplace
+  value:
+    marketplace_plugin_unique_identifier: langgenius/openai_api_compatible:0.0.55@d64be9924f2edf13fd5329fc03fdfc0d0e0e36e0aef5321c4942f0845de8c030
+    version: null
+kind: app
+version: 0.6.0
+workflow:
+  conversation_variables: []
+  environment_variables: []
+  features:
+    file_upload:
+      allowed_file_extensions:
+      - .JPG
+      - .JPEG
+      - .PNG
+      - .GIF
+      - .WEBP
+      - .SVG
+      allowed_file_types:
+      - image
+      allowed_file_upload_methods:
+      - local_file
+      - remote_url
+      enabled: false
+      fileUploadConfig:
+        attachment_image_file_size_limit: 2
+        audio_file_size_limit: 50
+        batch_count_limit: 5
+        file_size_limit: 15
+        file_upload_limit: 20
+        image_file_batch_limit: 10
+        image_file_size_limit: 10
+        single_chunk_attachment_limit: 10
+        video_file_size_limit: 100
+        workflow_file_upload_limit: 10
+      image:
+        enabled: false
+        number_limits: 3
+        transfer_methods:
+        - local_file
+        - remote_url
+      number_limits: 3
+    opening_statement: ''
+    retriever_resource:
+      enabled: false
+    sensitive_word_avoidance:
+      enabled: false
+    speech_to_text:
+      enabled: false
+    suggested_questions: []
+    suggested_questions_after_answer:
+      enabled: false
+    text_to_speech:
+      enabled: false
+      language: ''
+      voice: ''
+  graph:
+    edges:
+    - data:
+        sourceType: start
+        targetType: llm
+      id: e1
+      source: start
+      sourceHandle: source
+      target: llm
+      targetHandle: target
+      type: custom
+    - data:
+        sourceType: llm
+        targetType: code
+      id: e2
+      source: llm
+      sourceHandle: source
+      target: code_validator
+      targetHandle: target
+      type: custom
+    - data:
+        sourceType: code
+        targetType: end
+      id: e3
+      source: code_validator
+      sourceHandle: source
+      target: end_node
+      targetHandle: target
+      type: custom
+    nodes:
+    - data:
+        desc: ''
+        selected: false
+        title: 开始
+        type: start
+        variables:
+        - label: catalog_text
+          required: true
+          type: paragraph
+          variable: catalog_text
+        - label: user_intent
+          required: true
+          type: paragraph
+          variable: user_intent
+      height: 134
+      id: start
+      position:
+        x: 80
+        y: 200
+      positionAbsolute:
+        x: 80
+        y: 200
+      selected: false
+      type: custom
+      width: 242
+    - data:
+        context:
+          enabled: false
+        desc: ''
+        model:
+          completion_params:
+            enable_thinking: true
+            max_tokens: 4096
+            temperature: 0.3
+            top_p: 1
+          mode: chat
+          name: qwen3-235b
+          provider: langgenius/openai_api_compatible/openai_api_compatible
+        prompt_template:
+        - id: 37747f75-1d99-4e87-87e2-161215823a85
+          role: system
+          text: "你是「审计单表筛选编译器」。将审计师的自然语言筛选条件编译为可执行的单表 Pandas DAG。\n\n## 核心规则\n1. 仅处理单表筛选。Data\
+            \ Catalog 有多张表且用户未指定时，优先选第一张，并在\n   human_review_points 注明\"已默认使用第一张表\"\
+            。\n2. 深度解析筛选意图，将自然语言映射为算子参数（示例仅为映射方式示范，\n   关键词必须来自意图本身，不得照抄）：\n   - \"\
+            大于50万\" → ConditionCheck(column=\"金额列\", operator=\">\", value=500000)\n\
+            \   - \"包含XX\" → RegexFilter(column=\"文本列\", pattern=\"XX\")\n   - \"\
+            排除XX\" → NoiseFilter 或 RegexFilter 取反\n3. 典型 DAG：Load→[RegexFilter/ColumnFilter/ConditionCheck]→GroupBy→Sort→Export\n\
+            4. 有汇总需求时生成 GroupBy+Aggregate；金额列、分组列以 Catalog 真实列名为准\n5. 抽样纪律：抽样走 MUS（货币单位抽样：间隔+随机起点+固定种子），\n\
+            \   禁止\"Sort 降序取前 N\"冒充抽样\n6. 列名/文件名必须逐字来自 Data Catalog；无业务含义列（序号/编号）不参与筛选键\n\
+            \n## 可用算子\nLoad, RegexFilter, ColumnFilter, GroupBy, Sort, ConditionCheck,\
+            \ Extract, NoiseFilter, Export\n\n## 输出格式（严格 JSON）\n{\"blueprint_id\"\
+            :\"single_table_001\",\"generated_at\":\"ISO时间\",\"run_id\":null,\n \"\
+            objective\":\"目标\",\"raw_intent\":\"原始输入\",\"confidence_score\":0.85,\n\
+            \ \"operators\":[...],\"context\":\"说明\",\"risk_alerts\":[],\"human_review_points\"\
+            :[],\n \"expected_outputs\":[]}\n- 只输出 JSON\n- confidence_score<0.5 时\
+            \ human_review_points 至少 3 条\n"
+        - id: 46a10c01-a3d5-46c4-8360-058327807675
+          role: user
+          text: '## 数据目录
+
+            {{#start.catalog_text#}}
+
+
+            ## 审计意图
+
+            {{#start.user_intent#}}'
+        selected: false
+        title: 单表筛选编译器
+        type: llm
+        vision:
+          enabled: false
+      height: 87
+      id: llm
+      position:
+        x: 380
+        y: 180
+      positionAbsolute:
+        x: 380
+        y: 180
+      selected: false
+      type: custom
+      width: 242
+    - data:
+        code: "def main(llm_output: str) -> dict:\n    c=llm_output.strip()\n    if\
+          \ c.startswith(\"```json\"): c=c[7:]\n    if c.startswith(\"```\"): c=c[3:]\n\
+          \    if c.endswith(\"```\"): c=c[:-3]\n    try: return {\"result\":json.dumps(json.loads(c.strip()),ensure_ascii=False),\"\
+          is_valid\":True,\"errors\":[]}\n    except Exception as e: return {\"result\"\
+          :c,\"is_valid\":False,\"errors\":[str(e)]}\n"
+        code_language: python3
+        desc: ''
+        language: python
+        outputs:
+          errors:
+            type: array[string]
+          is_valid:
+            type: boolean
+          result:
+            type: string
+        retry_config:
+          max_retries: 3
+          retry_enabled: true
+          retry_interval: 1000
+        selected: false
+        title: 输出校验
+        type: code
+        variables:
+        - value_selector:
+          - llm
+          - text
+          value_type: string
+          variable: llm_output
+      height: 81
+      id: code_validator
+      position:
+        x: 680
+        y: 180
+      positionAbsolute:
+        x: 680
+        y: 180
+      selected: false
+      type: custom
+      width: 242
+    - data:
+        desc: ''
+        outputs:
+        - value_selector:
+          - code_validator
+          - result
+          value_type: string
+          variable: result
+        - value_selector:
+          - code_validator
+          - is_valid
+          value_type: boolean
+          variable: status
+        selected: false
+        title: 结束
+        type: end
+      height: 114
+      id: end_node
+      position:
+        x: 980
+        y: 200
+      positionAbsolute:
+        x: 980
+        y: 200
+      selected: false
+      type: custom
+      width: 242
+    viewport:
+      x: 0
+      y: 0
+      zoom: 1
+  rag_pipeline_variables: []

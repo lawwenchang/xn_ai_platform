@@ -1,0 +1,5 @@
+port 8000: LISTENING pid=13536
+port 3000: NOT_LISTENING
+port 5173: NOT_LISTENING
+frontend.log exists: False
+backend.log exists: True

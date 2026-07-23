@@ -1,0 +1,5 @@
+e913235e-c9bf-4fbd-86e6-290884656af5 | advanced-chat | Knowledge Retrieval + Chatbot 
+c46f68e0-a757-424c-868a-1144eb5a4260 | workflow | 语义编译�?41b929ba-f774-42b9-8615-2f5cbb10206f | workflow | 报告生成
+02d3af05-b900-4bde-a9cc-171d67226a78 | workflow | 单表筛�?42f0fdb6-c7a3-491f-8a57-c155e76a2ce0 | workflow | DAG精修与纠�?c214cf73-f562-42b4-bc49-967f2cc51ae7 | workflow | 报告纠错与格式规范化
+818363ff-2d9e-41b1-847f-448df3160afe | workflow | 知识问答
+

@@ -1,0 +1,3975 @@
+﻿#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+寮傛鐢熺伃璺敱缃戝叧 (routes.py) - 楂橀槻寰′慨澶嶇増
+=============================
+"鍏ㄦ棤鐘舵€佺敓鍛藉懆鏈熶笌璇箟缂栬瘧鐗?鐧界毊涔?搂3.3 + 搂5 鐨勬牳蹇冨疄鐜?
+鏍稿績璁捐鐞嗗康锛?- 浠讳綍鏂板姩浣?鈫?姣绾у垎鍙戝敮涓€ Run_ID
+- 鐢熷懡鍛ㄦ湡閽╁瓙 鈫?鎵ц瀹屾瘯 + 鎴愭灉鐗╄惤鐩?鈫?瑙﹀彂瀹瑰櫒閿€姣?- 鏃跺簭瀹屽叏瑙ｈ€?鈫?鍓嶅悗 Run 浜掍笉鍐茬獊
+- 鐘舵€佹煡璇?鈫?閫氳繃 Run_ID 鏌ヨ鍏冩暟鎹簱
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+import zipfile
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import httpx
+from fastapi import (
+    APIRouter, BackgroundTasks, FastAPI, File, Form, HTTPException,
+    UploadFile, Request
+)
+from pydantic import BaseModel, Field
+
+import re as _re
+
+# 鈹€鈹€ 鏂囦欢涓婁紶瀹夊叏甯搁噺 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+MAX_UPLOAD_SIZE = 100 * 1024 * 1024           # 100MB
+ALLOWED_EXTENSIONS = {".xlsx", ".xls", ".csv", ".docx", ".doc",
+                      ".pdf", ".md", ".txt", ".zip", ".rar", ".7z"}
+ALLOWED_MIME_TYPES = {
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-excel",
+    "application/pdf",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "text/plain", "text/markdown",
+    "text/csv",
+    "application/zip",
+    "application/x-rar-compressed",
+    "application/x-7z-compressed",
+    "application/octet-stream",
+}
+MAX_COMPRESSION_RATIO = 100                   # zip bomb 妫€娴嬮槇鍊?MAX_DAG_JSON_SIZE = 100 * 1024                # DAG JSON 鏈€澶?100KB
+
+# 鈹€鈹€ 浠ｇ爜瀹夊叏娓呮礂甯搁噺 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+_VALID_OPERATORS_FOR_CODE = {
+    "Load", "RegexFilter", "ColumnFilter", "GroupBy", "Merge",
+    "Sort", "ConditionCheck", "Extract", "Transform", "NoiseFilter",
+    "Aggregate", "Diff", "Export", "Reconcile", "AuditAdjustment",
+}
+_VALID_COMPARISON_OPS = {">", "<", ">=", "<=", "==", "!="}
+
+# 鈹€鈹€ 鍐呴儴瀵煎叆 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+sys.path.append(str(Path(__file__).parent.parent))
+
+from core.chaos_input import ChaosInputProcessor
+from core.dag_compiler import DAGBlueprint, DAGParser, Operator, DAGToCodeDescription
+from core.run_snapshot import AssetCatalog, RunRecord, RunSnapshotManager
+from core.privacy_firewall import get_firewall  # 闅愮闃茬伀澧?from core.constraint_engine import parse_constraints, format_constraint_report  # 绾︽潫寮曟搸
+from core.rag_engine import inject_compliance_context, build_index  # RAG
+try:
+    from core.pipeline_trace import record as trace_record  # B2 鍏ㄩ摼璺彲瑙傛祴
+except Exception:  # 鍩嬬偣妯″潡缂哄け涓嶅奖鍝嶄笟鍔?    def trace_record(*a, **k):
+        pass
+
+from core.format_engine import normalize_format
+from core.template_manager import TEMPLATES_DIR
+from config.fallback_prompts import detect_scenario, get_fallback_prompt
+from engine.sandbox_v3 import EphemeralSandbox, LifecycleHooks, LifecycleResult
+
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?# 鎬ц兘浼樺寲锛氬叡浜?HTTP 瀹㈡埛绔紙杩炴帴澶嶇敤 + 杩炴帴姹狅級
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?_shared_http_client: Optional[httpx.AsyncClient] = None
+_client_loop_id: Optional[int] = None
+
+def _get_http_client() -> httpx.AsyncClient:
+    """鍏变韩 httpx.AsyncClient锛堣繛鎺ユ睜澶嶇敤锛涗簨浠跺惊鐜垏鎹㈡椂鑷姩閲嶅缓锛岄槻姝?'Event loop is closed'锛?""
+    global _shared_http_client, _client_loop_id
+    try:
+        loop_id = id(asyncio.get_running_loop())
+    except RuntimeError:
+        loop_id = None
+    if (_shared_http_client is None or _shared_http_client.is_closed
+            or loop_id != _client_loop_id):
+        _shared_http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(60.0, connect=10.0),
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=50),
+            http2=False,  # 鐜鏈 h2 鍖咃紝涓?vLLM/Dify 鍧囦负 HTTP/1.1锛屽紑鍚弽鑰屽叏閾捐矾鎶ラ敊
+        )
+        _client_loop_id = loop_id
+    return _shared_http_client
+
+# 娌欑骞跺彂鎺у埗淇″彿閲忥紙闃叉 Docker 鐬椂杩囪浇锛?_SANDBOX_SEMAPHORE = asyncio.Semaphore(3)  # 鏈€澶?3 涓苟鍙戝鍣?
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?# 閰嶇疆甯搁噺
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?BASE_DIR = Path(__file__).resolve().parent.parent
+DIFY_BASE_URL = os.environ.get("DIFY_BASE_URL", "http://localhost:5001")
+DIFY_API_KEY = os.environ.get("DIFY_API_KEY", "app-default-key-replace-me")
+
+# SSH 闅ч亾锛欰utoDL vLLM 鈫?鏈湴 localhost:18000
+VLLM_TUNNEL_URL = "http://localhost:18000/v1/chat/completions"
+VLLM_API_KEY = "EMPTY"
+VLLM_MODEL = os.environ.get("VLLM_MODEL", "qwen3-235b")  # 鍙垏鎹? qwen3-235b / qwen2.5-32b / deepseek-r1
+
+# 瀹¤棰嗗煙鐭ヨ瘑锛堝唴缃紝澧炲己妯″瀷瀵逛笟鍔＄殑鐞嗚В锛?AUDIT_DOMAIN_KNOWLEDGE = """
+## 瀹¤棰嗗煙鐭ヨ瘑锛堢郴缁熷唴缃級
+
+### 閾惰瀵硅处绗竴甯歌瘑锛堟柟鍚戦暅鍍忥紝蹇呴』閬靛畧锛?1. 浼佷笟搴忔椂璐?鏃ヨ璐︼細鍊熸柟閲戦=閾惰瀛樻澧炲姞锛岃捶鏂归噾棰?鍑忓皯 鈫?鍑€棰?鍊熸柟鈭掕捶鏂?2. 閾惰娴佹按锛氳捶鏂癸紙鏀跺叆锛?瀛樻澧炲姞锛屽€熸柟锛堟敮鍙栵級=鍑忓皯 鈫?鍑€棰?璐锋柟鏀跺叆鈭掑€熸柟鏀彇
+3. 鍙屾柟璁拌处鏂瑰悜浜掍负闀滃儚锛氬簭鏃惰处"鍊熸柟閲戦"瀵瑰簲娴佹按"璐锋柟锛堟敹鍏ワ級"锛屽簭鏃惰处"璐锋柟閲戦"瀵瑰簲娴佹按"鍊熸柟锛堟敮鍙栵級"
+4. 娴佹按鍚涓摱琛岃处鎴枫€佸簭鏃惰处涓哄崟璐︽埛鏃讹細蹇呴』鍏堟寜閾惰璐﹀彿杩囨护娴佹按鍐嶅璐?
+### 鍒楀悕璺ㄨ〃鏄犲皠锛圡erge 鏃跺繀椤绘纭厤瀵癸級
+搴忔椂璐︿笌閾惰娴佹按鐨勫垪鍚嶆槧灏勬槸鏂瑰悜闀滃儚锛屼笉鏄悓鍚嶆槧灏勶細
+- 搴忔椂璐?鍊熸柟閲戦 鈫愨啋 閾惰娴佹按.璐锋柟锛堟敹鍏ワ級   銆愬瓨娆惧鍔犳柟鍚戙€?- 搴忔椂璐?璐锋柟閲戦 鈫愨啋 閾惰娴佹按.鍊熸柟锛堟敮鍙栵級   銆愬瓨娆惧噺灏戞柟鍚戙€?- 搴忔椂璐?閾惰璐﹀彿 鈫愨啋 閾惰娴佹按.閾惰璐﹀彿       銆愬悓鍚嶃€?- 搴忔椂璐?鏃ユ湡     鈫愨啋 閾惰娴佹按.鏃ユ湡           銆愬悓鍚嶃€?- 搴忔椂璐?鎽樿     鈫愨啋 閾惰娴佹按.鎽樿           銆愬悓鍚嶏紝浣嗚〃杩板彲鑳戒笉鍚屻€?鈿狅笍 鍏抽敭锛歁erge 鐨?left_on/right_on 蹇呴』浣跨敤浠ヤ笂鏄犲皠锛屼弗绂佹寜鍚屽悕鍒楀悕纭尮閰嶏紒
+
+### 浼氳瀹炲姟璁拌处鏂瑰紡锛堝璐﹀樊寮傛牴鍥狅級
+1. 銆愭眹鎬昏璐︺€戝绗旈摱琛屾祦姘村悎骞朵负1绗斾細璁″垎褰曪細
+   褰撳ぉ10绗旀敮浠樺疂鍒拌处鈫掍細璁″彧鍋?绗旀眹鎬?鍊燂細閾惰瀛樻/璐凤細涓昏惀涓氬姟鏀跺叆"
+   鈫?閲戦涔嬪拰鐩哥瓑浣嗙瑪鏁颁笉瀵癸紝闇€鎸夋棩鏈?閲戦绐楀彛鍋?n:1 鍖归厤
+2. 銆愭媶鍒嗗叆璐︺€?绗旈摱琛屾祦姘存媶鎴愬绗斿垎褰曪細
+   涓€绗?00涓囦粯娆惧搴?涓儴闂ㄨ垂鐢ㄢ啋鎷嗘垚40+35+25涓夌瑪
+   鈫?闇€鎸夋棩鏈熺獥鍙ｅ仛 1:n 鍚堣鍖归厤
+3. 銆愯法鏈熷埌璐︺€戦摱琛屽凡鎵ｆ浣嗕紒涓氭鏈堟墠璁拌处锛堟垨鍙嶄箣锛夛細
+   甯歌浜庢湀鏈渶鍚庡嚑澶╃殑浜ゆ槗锛屾棩鏈熷樊鈮?澶╁睘浜庢甯哥獥鍙?4. 銆愬皬棰濊垂鐢ㄣ€戦摱琛屾墸鎵嬬画璐?鍒╂伅/璐︽埛绠＄悊璐癸紝浼佷笟鍙兘鏈堟湯缁熶竴璁拌处鎴栦笉璁拌处
+   鈫?杩欑被宸紓閲戦閫氬父寰堝皬锛?100鍏冿級锛屽崟鐙垚绫昏緭鍑猴紝涓嶆贩鍏ユ湭杈捐处椤?5. 銆愬悓鍚嶅紓鎴枫€戝悓涓€绗旀浠庡啘琛?927鍑轰絾浼氳閿欒鍒板啘琛?310
+   鈫?闇€鎸夐摱琛岃处鍙疯繃婊ゅ悗鍒嗗埆瀵硅处
+6. 銆愬€熻捶鏂瑰悜棰犲€掋€戦摱琛屾祦姘?鏀跺叆"鍦ㄤ紒涓氳处涓婅璁板埌鍊熸柟
+   鈫?闇€鏂瑰悜鎰熺煡鍖归厤锛堣嚜鍔ㄥ彇缁濆鍊?鍙栬礋鍙峰悗鍐嶆瘮锛?
+### 鏈揪璐﹂」鍥涘垎绫伙紙鏃堕棿宸鑷寸殑姝ｅ父宸紓锛?1. 閾惰宸叉敹銆佷紒涓氭湭鏀讹細閽卞埌璐︿簡浣嗕細璁¤繕娌¤锛堝鍒╂伅鏀跺叆銆丳OS闅旀棩鍒拌处锛?2. 閾惰宸蹭粯銆佷紒涓氭湭浠橈細閽辨墸浜嗕絾浼氳杩樻病璁帮紙濡傞摱琛屾墸鎵嬬画璐广€佽捶娆惧埄鎭級
+3. 浼佷笟宸叉敹銆侀摱琛屾湭鏀讹細浼氳璁颁簡浣嗛摱琛岃繕娌″埌璐︼紙濡傚湪閫旀敮绁ㄣ€佽法琛岃浆璐︼級
+4. 浼佷笟宸蹭粯銆侀摱琛屾湭浠橈細浼氳璁颁簡浣嗛摱琛岃繕娌℃墸锛堝寮€鍑烘敮绁ㄥ鏂规湭鍏戜粯锛?
+### 閫愮瑪鏍稿涓庡宸紙涓嶅緱娣锋穯锛?1. 閾惰瀛樻閫愮瑪鏍稿蹇呴』绮剧‘鍒板垎锛埪?.01 鍏冿級锛屽樊涓€鍒嗛挶閮藉繀椤绘煡鏄庡師鍥?2. 鐧惧垎姣斿宸紙濡?1%锛夊彧閫傜敤浜庢眹鎬诲眰闈㈢殑鍒嗘瀽鎬у鏍革紝缁濅笉鍙敤浜庨€愮瑪鏍稿
+3. 鍖归厤绛栫暐浼樺厛绾э細
+   L1: 閲戦绮剧‘+鍚屾棩 鈫?鑷姩纭
+   L2: 閲戦绮剧‘+鏃ユ湡绐楀彛(卤3澶? 鈫?鑷姩纭
+   L3: 鍚屾棩鍚屾柟鍚?n:m 鍚堣鐩哥瓑锛堝悎骞?鎷嗗垎鍏ヨ处锛夆啋 鏍囪涓?鍚堝苟鍏ヨ处寰呯‘璁?
+   L4: 鎽樿/瀵规柟鎴峰悕妯＄硦 鈫?浠呰繘浜哄伐澶嶆牳锛屼笉鑷姩纭
+4. 鏈尮閰嶉」榛樿"寰呬汉宸ユ牳鏌?锛涘彧鏈夋帴杩戞湡鏈笖鏈夌獥鍙ｈ瘉鎹殑鎵嶈兘鍒椾负鏈揪璐﹂」鍊欓€?5. 鍒╂伅銆佹墜缁垂銆佸啿姝ｄ笉鍒犻櫎銆佸崟鐙垚绫昏緭鍑?
+### 璺ㄨ〃鏁版嵁鍖归厤鍘熷垯
+1. 浼樺厛璇嗗埆涓よ〃鍏辨湁鐨勬湁涓氬姟鍚箟鐨勫叧閿垪锛涗弗绂佷娇鐢?搴忓彿/缂栧彿/琛屽彿"浣滀负杩炴帴閿?2. 鍒楀悕浠?Data Catalog 涓殑鐪熷疄鍒楀悕涓哄噯锛屼弗绂佺収鎶勭ず渚嬩腑鐨勬枃浠跺悕/鍒楀悕
+3. 鏈烘瀯鍚嶇О"鍘诲競鍘垮尯涓績绠＄悊鍚庣紑"鐨勬爣鍑嗗寲浠呯敤浜庡尰淇濆洖娆惧満鏅紝鍏朵粬鍦烘櫙绂佹
+4. 閲戦姹囨€绘瘮瀵瑰宸敱鐢ㄦ埛鎸囧畾锛堝"宸紓鎺у埗鍦?涓囦互鍐?锛夛紝閫愮瑪鏍稿涓€寰?卤0.01 鍏?5. 鏀寔鏂囨。鏍煎紡杈撳叆锛坉ocx/doc/pdf/md/txt锛夛紝鏂囨。涓殑琛ㄦ牸涓?Excel 鍚屾潈鍙備笌姣斿
+6. 鈿狅笍 Merge 鐨?left_on/right_on 蹇呴』浣跨敤鏈煡璇嗕腑鐨勫垪鍚嶈法琛ㄦ槧灏勶紝涓嶈绠€鍗曞湴鎸夊悓鍚嶅尮閰?
+### DAG 绠楀瓙浣跨敤鎸囧崡
+- Load锛氭瘡涓枃浠朵竴涓?Load锛屽繀椤昏缃?source_file
+- NoiseFilter锛氭寜"鎽樿"鍒楄繃婊ゅ櫔闊筹紙鍒╂伅銆佹墜缁垂銆佸啿姝ｇ瓑锛夛紝杩囨护鍚庡崟鐙緭鍑哄櫔闊虫竻鍗?- Sort锛氭寜鏃ユ湡+閲戦鍒楁帓搴忥紝涓?Merge 鐨勬棩鏈熺獥鍙ｅ尮閰嶅仛鍑嗗
+- Merge锛氫袱琛ㄦ瘮瀵规牳蹇冪畻瀛愶紝left_on鍜宺ight_on鎸夊垪鍚嶈法琛ㄦ槧灏勫～鍐?- Diff锛氭寜閲戦鍒楁瘮瀵瑰樊寮傦紝tolerance_abs=0.01
+- Export锛氬鍑哄樊寮傝〃锛屾爣娉ㄥ樊寮傛潵婧愭枃浠?- ConditionCheck锛氬樊寮傝秴杩囩敤鎴疯瀹氶槇鍊兼椂鏍囪
+
+### 瀵硅处Playbook锛堝璁″疄鍔￠搧寰嬶紝鏉ヨ嚜鐪熷疄瀹¤缁忛獙锛?
+#### P1 鍙屽悜鏍稿閾佸緥
+浠庤处鍒版祦姘达紙鏌ヨ褰曠湡瀹炴€э級+ 浠庢祦姘村埌璐︼紙鏌ュ畬鏁存€э級锛屼袱鏂瑰悜缂轰竴涓嶅彲銆?楂樺嵄杈撳嚭"娴佹按鏈夈€佽处涓婃棤"鈫?鐤戜技鏀跺叆涓嶅叆璐?鍑哄€熻处鎴?鎸敤璧勯噾锛堝厛鍏ヤ竴绗斿啀鍒嗘杞嚭鏄吀鍨嬪舰鎬侊級銆?楂樺嵄杈撳嚭"涓€鍊熶竴璐烽噾棰濈浉绛夌殑澶ч鍙戠敓棰?鈫?鐤戜技杩囨ˉ/璧勯噾鍒掕浆锛屽凡閿€鎴疯处鎴峰挨鍏惰鏌ャ€?鈫?DAG 瑙勫垝鏃?Diff 蹇呴』鍚屾椂杈撳嚭"浠呭乏琛ㄦ湁"鍜?浠呭彸琛ㄦ湁"涓ょ被宸紓銆?
+#### P2 n:m 鍖归厤瑙勫垯锛圠3 灞傦級
+- 鎷嗗垎鏀舵锛氫竴绗旇处闈㈠搴斿绗旀祦姘达紙鎬婚鐩哥瓑锛屾棩鏈熺獥鍙Ｂ?澶╋級
+- 澶氱瑪鍚堝苟鏀粯锛氬绗旇处闈㈠搴斾竴绗旀祦姘?- 鎵嬬画璐瑰崟鐙墸娆撅細娴佹按 10,000 鈫?璐﹂潰 9,995 + 鎵嬬画璐?5锛堝樊棰?10鍏冧笖鎽樿鍚?鎵嬬画璐?鈫掕嚜鍔ㄦ垚缁勶級
+- 绁ㄦ嵁璺ㄦ湡鍏戜粯锛氳处闈㈡棩鏈熶笌娴佹按鏃ユ湡璺ㄦ湡锛岄噾棰濈浉绛?- 缁撴伅/鍒╂伅锛氬崟鐙垚绫伙紝涓嶅弬涓庡尮閰嶃€佷笉鍒犻櫎
+
+#### P3 鏈揪璐﹂」鍥涘垎绫讳笌鑸炲紛淇″彿
+鍥涚被锛氫紒涓氬凡鏀堕摱琛屾湭鏀?/ 浼佷笟宸蹭粯閾惰鏈粯 / 閾惰宸叉敹浼佷笟鏈敹 / 閾惰宸蹭粯浼佷笟鏈粯銆?闀挎湡鏈揪锛?30澶╋級+ 澶ч鏈揪 鈫?鏍稿疄鍘熷洜锛屽繀瑕佹椂鍑借瘉浜ゆ槗鎬ц川銆?鏈熷悗楠岃瘉锛氳祫浜ц礋鍊鸿〃鏃ュ悗瀵硅处鍗曟槸鍚﹁褰曚簡璇ユ湭杈鹃」銆?鑸炲紛鍏稿瀷锛氶摱琛屽凡鏀朵紒涓氭湭鏀?+ 绛夐鏀嚭閰嶅悎 鈫?璋冭妭琛ㄧ湅涓嶅嚭锛涢暱鏈熸尓鐢ㄣ€?
+#### P4 澶ч鏍囧噯鍔ㄦ€佸寲
+澶ч闃堝€?= 鍥哄畾閲戦锛堢敤鎴锋寚瀹氾紝濡傗墺10涓囷級鎴栧垎浣嶆暟锛堝璇ヨ处鎴峰彂鐢熼 top 5%锛夛紝浜や簰纭鍚庣暀鐥曘€?鈫?Merge/Diff 鐨?params 涓彲璁?threshold: {type: fixed|quantile, value: 鐢ㄦ埛鎸囧畾}
+
+#### P5 瀵硅处鍗曠湡瀹炴€ф鏌ワ紙绾㈡棗瑙勫垯锛?- 瀵硅处鍗曠紪鍙锋槸鍚﹂噸澶?涓嶈繛缁?- 缁撴伅鏃ャ€佺粨鎭噾棰濇槸鍚﹀悎鐞嗭紙瀛ｅ害缁撴伅锛?/6/9/12鏈?1鏃ュ墠鍚庯級
+- 瀛樻浣欓鏄惁杩炶疮锛堜笂鏃ヤ綑棰?鍙戠敓=鏈棩浣欓锛岄€愯鍙獙锛?- 鍚岃处鎴蜂笉鍚岄樁娈垫埛鍚?璐﹀彿/寮€鎴疯鏄惁涓€鑷?- 瀵瑰叕璐︽埛鏄惁鍚?绉垎"绛夊紓甯镐俊鎭?
+#### P6 璐︽埛閫夋嫨浼樺厛绾э紙澶氳处鎴峰満鏅級
+浼樺厛瀵癸細鍩烘湰鎴枫€佷綑棰濊緝澶ф埛銆佸彂鐢熼澶т笖棰戠箒鎴枫€?楂樺嵄浼樺厛锛氬彂鐢熼澶т絾浣欓灏?闆朵綑棰?褰撴湡閿€鎴锋埛锛堣垶寮婇珮鍙戯級銆?鈫?娴佹按鍚璐︽埛鏃讹紝DAG 瑙勫垝搴斿厛娉ㄥ叆璐︽埛杩囨护姝ラ銆?"""
+
+DIFY_DAG_WORKFLOW_ID = "c46f68e0-a757-424c-868a-1144eb5a4260"
+DIFY_REFINE_WORKFLOW_ID = "f273495a-28e4-498f-a017-389f3e3b37b8"
+DIFY_SINGLE_TABLE_ID = "ca45a52f-1dc0-41aa-88c7-cc3046f66b0c"
+DIFY_REPORT_GEN_ID = "49dda78f-1ae2-4c16-84d1-2c306c0a22b3"
+DIFY_REPORT_REVIEW_ID = "d0cb295d-4545-4afd-956c-059992fdc63f"
+DIFY_KNOWLEDGE_QA_ID = "f97a2880-92a1-45b2-9fbd-0479a6c81255"
+
+CELERY_BROKER_URL = "redis://localhost:6379/0"
+CELERY_RESULT_BACKEND = "redis://localhost:6379/0"
+
+
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?# Pydantic 璇锋眰/鍝嶅簲妯″瀷
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
+class CreateRunRequest(BaseModel):
+    project_code: str = Field(..., description="椤圭洰缂栧彿锛屽 A2025001")
+    subject: str = Field(..., description="瀹¤绉戠洰/涓婚")
+    user_intent: str = Field(..., description="澶х櫧璇濆璁℃剰鍥?)
+    preset_button: Optional[str] = Field(None, description="棰勮鎸夐挳鍚嶇О")
+    parent_run_id: Optional[str] = Field(None, description="缁ф壙鐨勭埗 Run ID")
+
+
+class CreateRunResponse(BaseModel):
+    run_id: str
+    status: str
+    message: str
+    compile_task_id: Optional[str] = None
+
+
+class ExecuteRequest(BaseModel):
+    confirmed: bool = Field(True, description="瀹¤甯堝凡纭 DAG")
+
+
+class StatusResponse(BaseModel):
+    run_id: str
+    status: str
+    progress: int
+    current_step: str
+    elapsed_seconds: float
+    retry_count: int
+    output_files: List[str]
+
+
+class DownloadResponse(BaseModel):
+    task_id: str
+    status: str
+    message: str
+
+
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?# 鐢熷懡鍛ㄦ湡閽╁瓙瀹炵幇
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
+class AuditLifecycleHooks(LifecycleHooks):
+    def __init__(self, snapshot_mgr: RunSnapshotManager):
+        self.snapshot = snapshot_mgr
+
+    def on_born(self, run_id: str, container_id: str, run_dir: Path) -> None:
+        pass
+
+    def on_complete(self, run_id: str, container_id: str, result: LifecycleResult, run_dir: Path) -> None:
+        output_dir = run_dir / "outputs"
+        if output_dir.exists():
+            files = [str(f.name) for f in output_dir.iterdir() if f.is_file()]
+            result.output_files = files
+
+    def on_destroy(self, run_id: str, container_id: str) -> None:
+        self.snapshot.cleanup_temp(run_id)
+
+
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?# 璺敱瀹氫箟
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
+router = APIRouter(prefix="/api/v3", tags=["Run 绠＄悊"])
+
+# 馃挕 淇涓€锛氫娇鐢ㄥ吋瀹规€ф洿濂界殑 Optional 鏇夸唬 | 绗﹀彿锛岄槻姝綆鐗堟湰 Python 鍚姩鎶ラ敊
+_snapshot_mgr: Optional[RunSnapshotManager] = None
+_chaos_processor: Optional[ChaosInputProcessor] = None
+_sandbox: Optional[EphemeralSandbox] = None
+
+
+def _get_snapshot_mgr() -> RunSnapshotManager:
+    global _snapshot_mgr
+    if _snapshot_mgr is None:
+        _snapshot_mgr = RunSnapshotManager()
+    return _snapshot_mgr
+
+
+def _get_chaos_processor() -> ChaosInputProcessor:
+    global _chaos_processor
+    if _chaos_processor is None:
+        _chaos_processor = ChaosInputProcessor()
+    return _chaos_processor
+
+
+def _get_sandbox() -> EphemeralSandbox:
+    global _sandbox
+    if _sandbox is None:
+        _sandbox = EphemeralSandbox(hooks=AuditLifecycleHooks(_get_snapshot_mgr()))
+        # 纭繚娌欑闀滃儚瀛樺湪锛堣嚜鍔ㄦ瀯寤猴級
+        import docker
+        try:
+            client = docker.from_env()
+            try:
+                client.images.get("audit-sandbox:alpine-v2")
+                print("[Sandbox] 闀滃儚 audit-sandbox:alpine-v2 宸插瓨鍦?)
+            except docker.errors.ImageNotFound:
+                print("[Sandbox] 闀滃儚涓嶅瓨鍦紝姝ｅ湪鏋勫缓 audit-sandbox:alpine-v2 ...")
+                if _sandbox.build_image():
+                    print("[Sandbox] 闀滃儚鏋勫缓鎴愬姛")
+                else:
+                    print("[Sandbox] 闀滃儚鏋勫缓澶辫触锛佸皢璺宠繃 Docker 娌欑锛屼娇鐢ㄧ洿鎺ユ墽琛屾ā寮?)
+            finally:
+                client.close()
+        except Exception as e:
+            print(f"[Sandbox] 闀滃儚妫€鏌?鏋勫缓澶辫触: {e}锛屽皢鍦ㄩ娆℃墽琛屾椂灏濊瘯")
+    return _sandbox
+
+
+# 鈹€鈹€ 鎻愬彇鏍稿蹇溅閬擄紙璇嶅吀鍛戒腑鈫掑厤LLM缁勮DAG锛夆攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+
+def _detect_extract_pair(input_dir: Path) -> Optional[Tuple]:
+    """妫€娴嬮摱琛屾祦姘?姹囨€昏〃鏂囦欢瀵广€傝繑鍥?(bank_path, ledger_path, bank_df, ledger_df) 鎴?None銆?""
+    try:
+        from core.matching_engine import detect_file_type
+        excel_files = [f for f in input_dir.glob("*")
+                       if f.suffix.lower() in (".xlsx", ".xls", ".csv")]
+        if len(excel_files) < 2:
+            return None
+        import pandas as _pd
+        bank_f, ledger_f = None, None
+        bank_df, ledger_df = None, None
+        for f in excel_files:
+            df = _pd.read_csv(f, encoding="utf-8-sig", nrows=1000) \
+                if f.suffix.lower() == ".csv" \
+                else _pd.read_excel(f, nrows=1000)
+            ft = detect_file_type(df, f.name)
+            if ft == "bank_statement" and bank_f is None:
+                bank_f, bank_df = f, df
+            elif ft in ("summary_table", "journal") and ledger_f is None:
+                ledger_f, ledger_df = f, df
+        if not bank_f and not ledger_f and len(excel_files) >= 2:
+            bank_f, ledger_f = excel_files[0], excel_files[1]
+            bank_df = _pd.read_csv(bank_f, encoding="utf-8-sig", nrows=1000) \
+                if bank_f.suffix.lower() == ".csv" \
+                else _pd.read_excel(bank_f, nrows=1000)
+            ledger_df = _pd.read_csv(ledger_f, encoding="utf-8-sig", nrows=1000) \
+                if ledger_f.suffix.lower() == ".csv" \
+                else _pd.read_excel(ledger_f, nrows=1000)
+        # 涓€鏂瑰凡纭畾銆佸彟涓€鏂规湭鐭?鈫?鏈煡鏂圭洿鎺ヤ綔涓哄彟涓€鏂?        if bank_f and not ledger_f:
+            other = [f for f in excel_files if f != bank_f]
+            if other:
+                ledger_f = other[0]
+                ledger_df = _pd.read_csv(ledger_f, encoding="utf-8-sig", nrows=1000) \
+                    if ledger_f.suffix.lower() == ".csv" \
+                    else _pd.read_excel(ledger_f, nrows=1000)
+        elif ledger_f and not bank_f:
+            other = [f for f in excel_files if f != ledger_f]
+            if other:
+                bank_f = other[0]
+                bank_df = _pd.read_csv(bank_f, encoding="utf-8-sig", nrows=1000) \
+                    if bank_f.suffix.lower() == ".csv" \
+                    else _pd.read_excel(bank_f, nrows=1000)
+        if not bank_f or not ledger_f:
+            return None
+        return (bank_f, ledger_f, bank_df, ledger_df)
+    except Exception as e:
+        print(f"[鎻愬彇蹇溅閬揮 鏂囦欢閰嶅澶辫触: {e}")
+        return None
+
+
+def _assemble_extraction_dag(bank_file: Path, ledger_file: Path,
+                              kw: dict, b_cols: dict, l_cols: dict) -> dict:
+    """鍥哄畾鎷撴墤锛歀oad脳2 鈫?RegexFilter 鈫?GroupBy 鈫?Merge 鈫?Diff 鈫?Export銆?    涓?LLM 鐢熸垚鐨?DAG 鍚屾瀯锛屼笅娓告墽琛?鍕剧ń/鎶ュ憡閾捐矾闆舵敼鍔ㄣ€?""
+    desc_col = b_cols.get("desc_col", "鎽樿")
+    amt_col = b_cols.get("amount_col") or b_cols.get("income_col") or "閲戦"
+    name_col = l_cols.get("name_col", "鏈烘瀯鍚嶇О")
+    total_col = l_cols.get("total_col", "鍚堣")
+    patterns = kw["patterns"]
+    exclude = kw.get("exclude", "")
+    agg_key = b_cols.get("counterparty_col") or b_cols.get("name_col") or name_col
+
+    operators = [
+        {"id": "op_1", "name": "Load", "source_file": bank_file.name,
+         "params": {}, "output_alias": "df_bank"},
+        {"id": "op_2", "name": "Load", "source_file": ledger_file.name,
+         "params": {}, "output_alias": "df_ledger"},
+        {"id": "op_3", "name": "RegexFilter", "input_from": ["op_1"],
+         "output_alias": "df_filtered",
+         "params": {"columns": kw["columns"],
+                    "pattern": patterns, "case_sensitive": False}},
+    ]
+    next_input = ["op_3"]
+    next_alias = "df_filtered"
+    if exclude:
+        operators.append(
+            {"id": "op_3b", "name": "NoiseFilter", "input_from": ["op_3"],
+             "output_alias": "df_excluded",
+             "params": {"columns": kw["columns"],
+                        "noise_patterns": [p.strip() for p in exclude.split("|") if p.strip()]}},
+        )
+        next_input = ["op_3b"]
+        next_alias = "df_excluded"
+    operators += [
+        {"id": "op_4", "name": "GroupBy", "input_from": next_input,
+         "output_alias": "df_bank_agg",
+         "params": {"by": [agg_key], "aggregations": {amt_col: "sum"}}},
+        {"id": "op_5", "name": "Merge", "input_from": ["op_4", "op_2"],
+         "output_alias": "df_merged",
+         "params": {"how": "outer", "left_on": [agg_key],
+                    "right_on": [name_col]}},
+        {"id": "op_6", "name": "Diff", "input_from": ["op_5"],
+         "output_alias": "df_result",
+         "params": {"col_a": f"{amt_col}_sum", "col_b": total_col,
+                    "tolerance_pct": 1.0, "output_mode": "all"}},
+        {"id": "op_7", "name": "Export", "input_from": ["op_6"],
+         "params": {"filename": "鎻愬彇鏍稿缁撴灉.xlsx"}},
+    ]
+
+    return {
+        "objective": f"鎻愬彇寮忔牳瀵? {kw['dict_key']}",
+        "compiled_by": "fastlane_template",
+        "kw_source": "dictionary",
+        "dict_key": kw["dict_key"],
+        "operators": operators,
+    }
+
+
+def _try_extraction_fastlane(input_dir: Path, user_intent: str,
+                              run_dir: Path) -> Optional[dict]:
+    """鎻愬彇鏍稿蹇溅閬擄細璇嶅吀鍛戒腑 + 鏂囦欢绫诲瀷纭畾 + 鍒楁槧灏勯綈鍏?鈫?鍏峀LM缁勮DAG銆?    浠讳竴鏉′欢涓嶆弧瓒?鈫?杩斿洖 None锛屽洖閫€甯歌LLM缂栬瘧閾俱€?""
+    # 鈶?璇嶅吀蹇呴』鍛戒腑
+    from config.extraction_dictionary import resolve_patterns_full
+    kw = resolve_patterns_full(user_intent)
+    if not kw or kw.get("source") not in ("dictionary", "dictionary_fuzzy"):
+        return None  # LLM鎻愭璺緞瑕佽蛋纭锛屼笉鑳藉揩杩?    # 鈶?涓€娴佹按涓€姹囨€昏〃锛岀被鍨嬬‘瀹?    pair = _detect_extract_pair(input_dir)
+    if not pair:
+        return None
+    bank_f, ledger_f, bank_df, ledger_df = pair
+    # 鈶?鍒楁槧灏勯綈鍏?    from core.matching_engine import identify_columns
+    b_cols = identify_columns(bank_df, "bank_statement")
+    l_cols = identify_columns(ledger_df, "summary_table")
+    if not (b_cols.get("desc_col") and
+            (b_cols.get("amount_col") or b_cols.get("income_col"))
+            and l_cols.get("name_col") and l_cols.get("total_col")):
+        return None
+    # 缁勮
+    return _assemble_extraction_dag(bank_f, ledger_f, kw, b_cols, l_cols)
+
+
+# 鈹€鈹€ 鍚庡彴缂栬瘧浠诲姟 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+
+async def _background_compile(
+        run_id: str,
+        catalog: AssetCatalog,
+        user_intent: str,
+        preset_button: Optional[str],
+        parent_run_id: Optional[str],
+) -> None:
+    print(f"DEBUG: 寮€濮嬬紪璇?Run {run_id}")  # 纭浠诲姟鏄惁鍚姩
+    from time import time as _now
+    _t0 = _now()
+    try:
+        _get_snapshot_mgr().update_status(run_id, "COMPILING")
+
+        # 鈹€鈹€ 鎻愬彇鏍稿蹇溅閬擄細璇嶅吀鍛戒腑鈫掑厤LLM缁勮DAG 鈹€鈹€
+        dag_blueprint = None
+        record = _get_snapshot_mgr().get_run(run_id)
+        if record:
+            fast_dag = _try_extraction_fastlane(
+                record.input_dir, user_intent, record.run_dir)
+            if fast_dag:
+                print(f"[鎻愬彇蹇溅閬揮 璇嶅吀鍛戒腑锛屽厤LLM缁勮DAG锛坽len(fast_dag['operators'])}绠楀瓙锛?)
+                blueprint_dict = fast_dag
+                _get_snapshot_mgr().update_blueprint(run_id, blueprint_dict)
+                dag_path = record.run_dir / "dag_blueprint.json"
+                with open(dag_path, "w", encoding="utf-8") as f:
+                    json.dump(blueprint_dict, f, ensure_ascii=False, indent=2)
+                plan_path = record.run_dir / "execution_plan.txt"
+                plan_text = f"鎻愬彇鏍稿路蹇溅閬撴ā鏉? {fast_dag['objective']}\n" \
+                            f"绛涢€夊叧閿瘝: {blueprint_dict.get('kw_source','?')}:{blueprint_dict.get('dict_key','?')}\n" \
+                            f"绠楀瓙閾? Load鈫扲egexFilter鈫扜roupBy鈫扢erge鈫扗iff鈫扙xport"
+                with open(plan_path, "w", encoding="utf-8") as f:
+                    f.write(plan_text)
+                _get_snapshot_mgr().update_status(run_id, "PENDING_REVIEW")
+                trace_record(run_id, "dag_fastlane", "OK", (_now() - _t0) * 1000)
+                print(f"[鎻愬彇蹇溅閬揮 Run {run_id} 缂栬瘧瀹屾垚锛堟ā鏉匡級锛岀瓑寰呬汉宸ョ‘璁?)
+                return  # 鈿?鍏抽敭锛氱洿鎺eturn锛屽埆婊戣繘LLM缂栬瘧娈?
+        dag_blueprint = None
+        is_single = (catalog.total_files == 1 and any(k in user_intent for k in ["绛涢€?, "绛涙煡", "鍒嗙被"]) and not any(k in user_intent for k in ["鏍稿", "瀵硅处", "鍖归厤", "姣斿"]))
+        if is_single:
+            catalog_text = _format_catalog_for_prompt(catalog)
+            single_result = await _call_dify_single_table(catalog_text, user_intent)
+            if single_result:
+                print(f"[鍦烘櫙璺敱] 鍗曡〃绛涢€夋ā寮?)
+                dag_blueprint = _parse_single_table_result(single_result, catalog)
+        if dag_blueprint is None:
+            dag_blueprint = await _call_dify_compiler(
+                catalog=catalog,
+            user_intent=user_intent,
+            preset_button=preset_button,
+            parent_run_id=parent_run_id,
+        )
+        print(f"DEBUG: 缂栬瘧瀹屾垚锛岀粨鏋? {dag_blueprint is not None}")
+        if dag_blueprint is None:
+            raise ValueError("缂栬瘧鍣ㄨ繑鍥炰簡绌虹粨鏋?)
+
+        # 鈹€鈹€ 馃摎 鍒嗗眰鐭ヨ瘑娉ㄥ叆锛圴2.7 鏂板锛夆攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        # 閬嶅巻 DAG 涓殑绠楀瓙绫诲瀷锛屼负姣忕绠楀瓙娉ㄥ叆鍏朵笓灞炵煡璇嗗瓙闆?        try:
+            from core.rag_engine import inject_layered_context, OPERATOR_KNOWLEDGE_MAP
+            operators = (
+                dag_blueprint.operators
+                if hasattr(dag_blueprint, "operators")
+                else (dag_blueprint if isinstance(dag_blueprint, dict) else {}).get("operators", [])
+            )
+            op_types = set()
+            for op in operators:
+                name = op.name if hasattr(op, "name") else op.get("name", "")
+                if name in OPERATOR_KNOWLEDGE_MAP and OPERATOR_KNOWLEDGE_MAP[name]:
+                    op_types.add(name)
+
+            if op_types:
+                layered_parts = []
+                for ot in sorted(op_types):
+                    ctx = inject_layered_context(user_intent, ot)
+                    if ctx:
+                        layered_parts.append(ctx)
+
+                if layered_parts:
+                    layered_text = (
+                        "## 绠楀瓙涓撻」鐭ヨ瘑锛堝垎灞傛敞鍏ワ級\n"
+                        + f"娑夊強绠楀瓙: {', '.join(sorted(op_types))}\n\n"
+                        + "\n---\n".join(layered_parts)
+                    )
+                    # 宓屽叆鍒?DAG 鐨?context 涓?                    if hasattr(dag_blueprint, "context"):
+                        existing = dag_blueprint.context or {}
+                        existing["_layered_knowledge"] = layered_text
+                    else:
+                        dag_blueprint["context"] = dag_blueprint.get("context", {})
+                        dag_blueprint["context"]["_layered_knowledge"] = layered_text
+                    print(f"[鍒嗗眰娉ㄥ叆] 涓?{len(op_types)} 绫荤畻瀛?{', '.join(sorted(op_types))})娉ㄥ叆浜嗕笓椤圭煡璇?)
+        except Exception as e:
+            print(f"[鍒嗗眰娉ㄥ叆] 璺宠繃锛堥潪鑷村懡锛? {e}")
+
+        record = _get_snapshot_mgr().get_run(run_id)
+        if record is None:
+            raise ValueError(f"Run {run_id} 涓嶅瓨鍦?)
+
+        # 楂橀槻寰″瓧鍏稿寲
+        blueprint_dict = dag_blueprint.to_dict() if hasattr(dag_blueprint, "to_dict") else dag_blueprint.__dict__
+        blueprint_dict = _ensure_essential_operators(blueprint_dict, user_intent)
+        _get_snapshot_mgr().update_blueprint(run_id, blueprint_dict)
+
+        # 淇濆瓨 DAG JSON 鏂囦欢
+        dag_path = record.run_dir / "dag_blueprint.json"
+        with open(dag_path, "w", encoding="utf-8") as f:
+            if hasattr(dag_blueprint, "to_json"):
+                f.write(dag_blueprint.to_json())
+            else:
+                json.dump(blueprint_dict, f, ensure_ascii=False, indent=2)
+
+        # 灏濊瘯鐢熸垚鑷劧璇█璁″垝锛堥槻鎶ラ敊锛?        plan_path = record.run_dir / "execution_plan.txt"
+        try:
+            plan_text = DAGToCodeDescription.describe(dag_blueprint)
+        except Exception as e:
+            plan_text = f"鎵ц璁″垝瑙ｆ瀽闄嶇骇: 鍖呭惈 {len(blueprint_dict.get('operators', []))} 涓墿鐞嗙畻瀛?
+
+        with open(plan_path, "w", encoding="utf-8") as f:
+            f.write(plan_text)
+
+        # 鐢熸垚鑷劧璇█鍖归厤閫昏緫璇存槑
+        try:
+            explanation = await _explain_dag(blueprint_dict, catalog, user_intent)
+            if explanation:
+                explanation_path = record.run_dir / "match_explanation.txt"
+                with open(explanation_path, "w", encoding="utf-8") as f:
+                    f.write(explanation)
+                blueprint_dict["match_explanation"] = explanation
+                _get_snapshot_mgr().update_blueprint(run_id, blueprint_dict)
+            else:
+                # DAG 涓虹┖鏃讹紙Dify 涓嶅彲鐢級锛屼粠鍦烘櫙娉ㄥ唽琛ㄧ敓鎴愬尮閰嶈鍒?                _generate_fallback_plan(record.run_dir, user_intent, preset_button, catalog)
+        except Exception as e:
+            print(f"[鍚庡彴缂栬瘧] 鑷劧璇█璇存槑鐢熸垚澶辫触锛堥潪鑷村懡锛? {e}")
+            _generate_fallback_plan(record.run_dir, user_intent, preset_button, catalog)
+
+        _get_snapshot_mgr().update_status(run_id, "PENDING_REVIEW")
+        trace_record(run_id, "dag_compile", "OK", (_now() - _t0) * 1000)
+        print(f"[鍚庡彴缂栬瘧] Run {run_id} 缂栬瘧瀹屾垚锛岀瓑寰呬汉宸ョ‘璁?)
+
+    except Exception as e:
+        import traceback
+        error_detail = traceback.format_exc()
+        print(f"[鍚庡彴缂栬瘧] Run {run_id} 缂栬瘧澶辫触: {error_detail}")
+
+        # 鏈€缁堝厹搴曪細浠?catalog 鐩存帴鐢熸垚鏈€灏?DAG
+        try:
+            trace_record(run_id, "dag_fallback", "WARN",
+                         (_now() - _t0) * 1000, str(e)[:200])
+            print(f"[鍚庡彴缂栬瘧] 婵€娲绘渶缁堝厹搴曪細浠庢暟鎹洰褰曠敓鎴愬熀纭€ DAG")
+            dag_blueprint = _build_fallback_dag(catalog, user_intent)
+            if dag_blueprint:
+                record = _get_snapshot_mgr().get_run(run_id)
+                if record:
+                    blueprint_dict = dag_blueprint.to_dict() if hasattr(dag_blueprint, "to_dict") else dag_blueprint.__dict__
+                    _get_snapshot_mgr().update_blueprint(run_id, blueprint_dict)
+                    dag_path = record.run_dir / "dag_blueprint.json"
+                    with open(dag_path, "w", encoding="utf-8") as f:
+                        json.dump(blueprint_dict, f, ensure_ascii=False, indent=2)
+                    _get_snapshot_mgr().update_status(run_id, "PENDING_REVIEW")
+                    _generate_fallback_plan(record.run_dir, user_intent, preset_button, catalog)
+                    # 鍚屾鍒拌摑鍥撅紝鍓嶇浠?dag_blueprint.match_explanation 璇诲彇
+                    try:
+                        _plan_file = record.run_dir / "match_explanation.txt"
+                        if _plan_file.exists():
+                            blueprint_dict["match_explanation"] = _plan_file.read_text(encoding="utf-8")
+                            _get_snapshot_mgr().update_blueprint(run_id, blueprint_dict)
+                    except Exception:
+                        pass
+                    print(f"[鍚庡彴缂栬瘧] Run {run_id} 鍏滃簳缂栬瘧瀹屾垚")
+                    return
+        except Exception as e2:
+            print(f"[鍚庡彴缂栬瘧] 鍏滃簳缂栬瘧涔熷け璐? {e2}")
+
+        trace_record(run_id, "dag_compile", "FAIL",
+                     (_now() - _t0) * 1000, str(e)[:200])
+        _get_snapshot_mgr().update_status(run_id, "FAILED")
+
+        # 馃挕 淇浜岋細瑙ｅ喅 sqlite 鎶ラ敊闂锛屽姩鎬佹帰鏌?DB_PATH
+        try:
+            from core.run_snapshot import DB_PATH
+            db_target = DB_PATH
+        except ImportError:
+            db_target = Path("data/audit_platform.db")
+
+        try:
+            with sqlite3.connect(str(db_target)) as conn:
+                conn.execute(
+                    "UPDATE runs SET execution_logs = ? WHERE run_id = ?",
+                    (json.dumps([f"缂栬瘧澶辫触: {str(e)}", error_detail], ensure_ascii=False), run_id)
+                )
+                conn.commit()
+        except Exception as db_err:
+            print(f"淇濆瓨閿欒鏃ュ織澶辫触: {db_err}")
+
+
+# 鈹€鈹€ 琛ㄦ牸鑷姩褰掍竴鍖栵紙鐢ㄦ埛鏃犳劅锛屾渶浣冲姫鍔涳級 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+
+def _normalize_input_tables(input_dir: Path, catalog: Any) -> None:
+    """瀵逛笂浼犵殑 Excel/CSV 鏂囦欢鑷姩鍋氳〃澶村畾浣?娓呮礂+褰掍竴鍖栥€?    
+    涓嶉樆鏂富娴佺▼锛屽け璐ラ潤榛橀檷绾с€傞摱琛屽璐︽枃浠朵細鑷姩璺宠繃锛堝璐﹀紩鎿庤嚜澶勭悊锛夈€?    褰掍竴鍖栧悗鐨勬枃浠朵繚瀛樺湪 {filename}_normalized.csv銆?    """
+    try:
+        from core.table_normalizer import normalize_and_validate, clean_dataframe
+    except Exception as e:
+        print(f"[褰掍竴鍖朷 妯″潡涓嶅彲鐢紝璺宠繃: {e}")
+        return
+
+    excel_exts = {".xlsx", ".xls", ".csv"}
+    for item in sorted(input_dir.iterdir()):
+        if not item.is_file():
+            continue
+        if item.suffix.lower() not in excel_exts:
+            continue
+        # 璺宠繃宸插綊涓€鍖栫殑鏂囦欢锛堥槻閲嶅澶勭悊锛?        if "_normalized" in item.stem:
+            continue
+
+        try:
+            import pandas as pd
+            if item.suffix.lower() == ".csv":
+                df = pd.read_csv(item, encoding="utf-8-sig", nrows=None)
+            else:
+                df = pd.read_excel(item, nrows=None)
+
+            if df.empty or len(df.columns) == 0:
+                continue
+
+            # 娓呮礂锛氳嚜鍔ㄦ壘琛ㄥご銆佷涪鍨冨溇琛屻€佺┖鏍艰浆绌哄€?            cleaned = clean_dataframe(df, auto_header=True, strip_blank_rows=True)
+            if cleaned.empty:
+                continue
+
+            # 鍒ゆ柇鏄惁鐪熺殑鏈夊彉鍖栵紙鏃犲彉鍖栧氨璺宠繃锛屼笉浜х敓澶氫綑鏂囦欢锛?            same_shape = (len(cleaned) == len(df) and
+                          list(cleaned.columns) == list(df.columns))
+            if same_shape:
+                continue  # 鏍囧噯闀胯〃锛屾棤闇€褰掍竴鍖?
+            # 淇濆瓨褰掍竴鍖栫増鏈?            out_path = item.parent / f"{item.stem}_normalized.csv"
+            cleaned.to_csv(out_path, index=False, encoding="utf-8-sig")
+
+            # 鏇存柊 catalog锛氭妸褰掍竴鍖栧悗鐨勫垪鍚嶅悓姝ュ埌 AssetCatalog
+            if hasattr(catalog, "files") and catalog.files:
+                for f_info in catalog.files:
+                    if f_info.get("filename") == item.name:
+                        f_info["normalized_file"] = out_path.name
+                        f_info["normalized_columns"] = [
+                            {"name": str(c), "dtype": str(cleaned[c].dtype)}
+                            for c in cleaned.columns
+                        ]
+                        break
+
+            print(f"[褰掍竴鍖朷 {item.name}: {len(df)}琛屸啋{len(cleaned)}琛? "
+                  f"鍒? {list(df.columns)[:5]}鈫抺list(cleaned.columns)[:5]}")
+
+        except Exception as e:
+            print(f"[褰掍竴鍖朷 {item.name} 澶勭悊澶辫触锛堥潪闃绘柇锛? {e}")
+            continue
+
+
+def _reverse_validation_for_report(match_result: dict, input_dir: Path) -> dict:
+    """浠庡尮閰嶇粨鏋滀腑鎻愬彇鍙嶅悜鏍￠獙鏁版嵁锛堟湭鍖归厤琛屾憳瑕佽仛绫伙級銆?""
+    try:
+        from core.matching_engine import reverse_validate_unmatched
+        # 灏濊瘯鍔犺浇鏈尮閰嶆暟鎹?        unmatched_path = input_dir.parent / "outputs" / "unmatched_detail.csv"
+        if not unmatched_path.exists():
+            return {}
+        import pandas as pd
+        df = pd.read_csv(unmatched_path)
+        if df.empty:
+            return {"total_unmatched": 0, "clusters": []}
+        desc_col = None
+        for c in ["鎽樿", "瀵规柟瀹㈡埛鍚嶇О", "闄勮█"]:
+            if c in df.columns:
+                desc_col = c
+                break
+        if desc_col:
+            return reverse_validate_unmatched(df, desc_col=desc_col)
+        return {"total_unmatched": len(df), "clusters": [],
+                "note": "鏈尮閰嶆槑缁嗘棤鎽樿鍒楋紝鏃犳硶鑱氱被"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# 鈹€鈹€ 1. 鍒涘缓鏂?Run 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+@router.post("/runs", response_model=CreateRunResponse, summary="鍒涘缓鏂?Run锛堝紓姝ワ級")
+async def create_run(
+        project_code: Optional[str] = Form(None),
+        subject: Optional[str] = Form("鏈懡鍚嶅璁?),
+        user_intent: Optional[str] = Form(None),
+        files: List[UploadFile] = File(..., description="娣锋矊杈撳叆锛圗xcel/ZIP/鏂囦欢澶癸級"),
+        preset_button: Optional[str] = Form(None),
+        parent_run_id: Optional[str] = Form(None),
+        background_tasks: BackgroundTasks = BackgroundTasks(),
+) -> CreateRunResponse:
+    # 銆愭牳蹇冭皟璇曚唬鐮併€?
+    if not subject:
+        raise HTTPException(status_code=400, detail=f"鍚庣鏈敹鍒?subject 瀛楁銆?)
+    print(f"DEBUG: 鎺ユ敹鍒扮殑鍙傛暟 -> project_code={project_code}, subject={subject}, user_intent={user_intent}, files={len(files)}")
+
+    from core.run_snapshot import TEMP_BASE
+    TEMP_BASE.mkdir(parents=True, exist_ok=True)
+    temp_dir = TEMP_BASE / f"upload_{uuid.uuid4().hex[:8]}"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    # 淇濆瓨鎵€鏈変笂浼犳枃浠?    upload_paths = []
+    for file in files:
+        safe_filename = _validate_upload(file)
+        upload_path = temp_dir / safe_filename
+        with open(upload_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+        upload_paths.append(upload_path)
+
+    # 閫愪釜澶勭悊鏂囦欢锛屽悎骞?catalog
+    all_files = []
+    global_hash = hashlib.md5()
+    all_flat_dirs = []
+    for up in upload_paths:
+        try:
+            # 浣跨敤鍞竴涓存椂 run_id 鑰岄潪纭紪鐮?"PENDING"锛岄伩鍏嶄笉鍚屼笂浼犵殑鏂囦欢涓叉壈
+            temp_rid = f"proc_{uuid.uuid4().hex[:8]}"
+            flat_dir, catalog = _get_chaos_processor().process(
+                str(up), run_id=temp_rid,
+            )
+            all_files.extend(catalog.files)
+            global_hash.update(catalog.global_hash.encode())
+            all_flat_dirs.append(flat_dir)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"娣锋矊杈撳叆澶勭悊澶辫触 ({Path(up).name}): {e}")
+
+    from core.chaos_input import AssetCatalog
+    catalog = AssetCatalog(
+        files=all_files,
+        total_files=len(all_files),
+        global_hash=global_hash.hexdigest(),
+    )
+
+    try:
+        record = _get_snapshot_mgr().create_run(
+            project_code=project_code,
+            subject=subject,
+            user_intent=user_intent,
+            input_catalog=catalog,
+            parent_run_id=parent_run_id,
+            preset_button=preset_button,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Run 鍒涘缓澶辫触: {e}")
+
+    run_input_dir = record.input_dir
+    if run_input_dir.exists():
+        shutil.rmtree(str(run_input_dir), ignore_errors=True)
+    run_input_dir.mkdir(parents=True, exist_ok=True)
+    # 鎷疯礉鎵€鏈夋枃浠剁殑鎵佸钩鍖栫洰褰曞埌 inputs
+    for fd in all_flat_dirs:
+        for item in fd.iterdir():
+            dest = run_input_dir / item.name
+            if item.is_dir():
+                shutil.copytree(str(item), str(dest), dirs_exist_ok=True)
+            else:
+                shutil.copy2(str(item), str(dest))
+    _get_snapshot_mgr().lock_readonly(run_input_dir)
+
+    # 鈹€鈹€ 琛ㄦ牸褰掍竴鍖栵紙鑷姩娓呮礂琛ㄥご鍋忕Щ/绌烘牸/鍚堣琛岋紝鐢ㄦ埛鏃犳劅锛?鈹€鈹€
+    _normalize_input_tables(run_input_dir, catalog)
+
+    # 鎷疯礉瀹屾垚鍚庢竻鐞嗕复鏃剁洰褰?    try:
+        shutil.rmtree(str(temp_dir), ignore_errors=True)
+        for fd in all_flat_dirs:
+            parent = fd.parent
+            if parent != temp_dir and parent.name.startswith("upload_"):
+                shutil.rmtree(str(parent), ignore_errors=True)
+    except Exception:
+        pass
+
+    # 鈹€鈹€ B4 鏁版嵁璐ㄩ噺棰勬锛堢紪璇戝墠娉ㄥ叆璐ㄩ噺鎶ュ憡鍗★級 鈹€鈹€
+    quality_report = []
+    try:
+        from core.data_quality import inspect_catalog
+        quality_report = inspect_catalog(str(run_input_dir))
+        print(f"[璐ㄩ噺闂╙ 鎵弿 {len(quality_report)} 涓枃浠讹紝"
+              f"WARNING/POOR: {sum(1 for q in quality_report if q['overall'] in ('WARNING','POOR'))}")
+    except Exception as e:
+        print(f"[璐ㄩ噺闂╙ 棰勬闄嶇骇锛堥潪闃绘柇锛? {e}")
+
+    # 锛坬uality_report 闇€浠?Run 璁板綍鐨勬墿灞曞瓧娈垫煡璇紱鍓嶇 /runs/{id} 宸茶嚜鍔ㄨ繑鍥?dag_blueprint锛?    #  鏆備互鐙珛鐨?/runs/{id}/quality 绔偣鎻愪緵锛屼笉褰卞搷鐜版湁閾捐矾锛?    try:
+        qp = record.run_dir / "quality_report.json"
+        with open(qp, "w", encoding="utf-8") as f:
+            json.dump(quality_report, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+    background_tasks.add_task(
+        _background_compile,
+        run_id=record.run_id,
+        catalog=catalog,
+        user_intent=user_intent,
+        preset_button=preset_button,
+        parent_run_id=parent_run_id,
+    )
+
+    return CreateRunResponse(
+        run_id=record.run_id,
+        status="COMPILING",
+        message="鏂囦欢宸叉帴鏀讹紝DAG 姝ｅ湪鍚庡彴缂栬瘧涓紝璇风◢鍚庡埛鏂版煡鐪嬬粨鏋?..",
+        compile_task_id=record.run_id,
+    )
+
+@router.get("/runs", summary="鑾峰彇鎵€鏈?Run 鍒楄〃")
+async def list_runs():
+    """鑾峰彇鏈€杩戠殑 Run 璁板綍鍒楄〃"""
+    try:
+        records = _get_snapshot_mgr().get_recent_runs(limit=50)
+        return {"runs": [r.to_dict() for r in records]}
+    except Exception as e:
+        return {"runs": []}
+
+
+@router.delete("/runs/{run_id}", summary="鍒犻櫎鍗曚釜 Run")
+async def delete_run(run_id: str):
+    """鍒犻櫎鎸囧畾 Run 鐨勬暟鎹簱璁板綍 + 纾佺洏鐩綍"""
+    import shutil
+    from core.run_snapshot import RUNS_BASE, DB_PATH
+    try:
+        # 鍒犻櫎纾佺洏鐩綍
+        disk_dir = RUNS_BASE / run_id
+        if disk_dir.exists():
+            shutil.rmtree(str(disk_dir), ignore_errors=True)
+        # 鍒犻櫎鏁版嵁搴撹褰?        with sqlite3.connect(str(DB_PATH)) as conn:
+            conn.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
+            conn.commit()
+        return {"success": True, "message": f"宸插垹闄?{run_id}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@router.post("/runs/cleanup", summary="鎵归噺娓呯悊鍘嗗彶 Run 鍜屼复鏃舵枃浠?)
+async def cleanup_runs(keep_latest: int = 5, clean_temp: bool = True):
+    """
+    鎵归噺娓呯悊锛?    - keep_latest: 淇濈暀鏈€杩?N 涓?Run锛屽叾浣欏垹闄?    - clean_temp: 鏄惁鍚屾椂娓呯悊 data/temp 娈嬬暀鐩綍
+    """
+    import shutil
+    from core.run_snapshot import RUNS_BASE, DB_PATH, TEMP_BASE
+    result = {"deleted_runs": [], "cleaned_temp": 0}
+
+    try:
+        # 娓呯悊鍘嗗彶 Run
+        records = _get_snapshot_mgr().get_recent_runs(limit=200)
+        if len(records) > keep_latest:
+            to_delete = records[keep_latest:]
+            with sqlite3.connect(str(DB_PATH)) as conn:
+                for r in to_delete:
+                    rid = r.run_id if hasattr(r, 'run_id') else r.get('run_id', '')
+                    disk_dir = RUNS_BASE / rid
+                    if disk_dir.exists():
+                        shutil.rmtree(str(disk_dir), ignore_errors=True)
+                    conn.execute("DELETE FROM runs WHERE run_id = ?", (rid,))
+                    result["deleted_runs"].append(rid)
+                conn.commit()
+
+        # 娓呯悊 temp 鐩綍
+        if clean_temp and TEMP_BASE.exists():
+            for d in TEMP_BASE.iterdir():
+                if d.is_dir():
+                    shutil.rmtree(str(d), ignore_errors=True)
+                    result["cleaned_temp"] += 1
+
+        return {"success": True, "data": result}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# 鈹€鈹€ 2. 鏌ヨ Run锛堭煉?淇涓夛細娉ㄥ叆楂橀槻寰＄墿鐞嗘帰娴嬮€昏緫锛夆攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+@router.get("/runs/{run_id}", summary="鏌ヨ Run 璇︽儏锛堝惈缂栬瘧鐘舵€侊級")
+async def get_run(run_id: str) -> Dict[str, Any]:
+    record = _get_snapshot_mgr().get_run(run_id)
+    if not record:
+        # 闃插尽鎬у洖閫€锛欴B 涓棤璁板綍浣嗙鐩樼洰褰曞瓨鍦ㄦ椂锛屼粠 run_meta.json 閲嶅缓
+        from core.run_snapshot import RUNS_BASE
+        disk_dir = RUNS_BASE / run_id
+        meta_file = disk_dir / "run_meta.json"
+        if meta_file.exists():
+            try:
+                with open(meta_file, "r", encoding="utf-8") as f:
+                    result = json.load(f)
+                result["_source"] = "disk_fallback"
+                result.setdefault("execution_plan", "鏈敓鎴愭墽琛岃鍒?)
+                result.setdefault("outputs", [])
+                out_dir = disk_dir / "outputs"
+                if out_dir.exists():
+                    try:
+                        result["outputs"] = [f.name for f in out_dir.iterdir() if f.is_file()]
+                    except Exception:
+                        pass
+                if not result.get("dag_blueprint"):
+                    dag_file = disk_dir / "dag_blueprint.json"
+                    if dag_file.exists():
+                        try:
+                            with open(dag_file, "r", encoding="utf-8") as f:
+                                result["dag_blueprint"] = json.load(f)
+                        except Exception:
+                            pass
+                return result
+            except Exception:
+                pass
+        raise HTTPException(status_code=404, detail="Run 涓嶅瓨鍦?)
+
+    result = record.to_dict()
+
+    # 鐗╃悊闃插穿婧冩帰娴?    run_dir = Path(record.run_dir) if hasattr(record, "run_dir") else None
+    result["execution_plan"] = "鏈敓鎴愭墽琛岃鍒?
+    result["outputs"] = []
+
+    if run_dir and run_dir.exists():
+        plan_path = run_dir / "execution_plan.txt"
+        if plan_path.exists():
+            try:
+                with open(plan_path, "r", encoding="utf-8") as f:
+                    result["execution_plan"] = f.read()
+            except Exception:
+                result["execution_plan"] = "鎵ц璁″垝鏂囦欢璇诲彇澶辫触"
+
+        out_dir = run_dir / "outputs"
+        if out_dir.exists():
+            try:
+                result["outputs"] = [f.name for f in out_dir.iterdir() if f.is_file()]
+            except Exception:
+                pass
+
+        # 闃插尽鎬у洖閫€锛氬鏋?DB 涓?dag_blueprint 涓虹┖浣嗙鐩樻枃浠跺瓨鍦紝浠庣鐩樿鍙?        if not result.get("dag_blueprint"):
+            dag_file = run_dir / "dag_blueprint.json"
+            if dag_file.exists():
+                try:
+                    with open(dag_file, "r", encoding="utf-8") as f:
+                        result["dag_blueprint"] = json.load(f)
+                except Exception:
+                    pass
+
+    if record.status == "COMPILING":
+        result["compile_progress"] = "缂栬瘧涓紝璇风◢鍚?.."
+        result["poll_interval"] = 2
+    elif record.status == "PENDING_REVIEW":
+        result["compile_progress"] = "缂栬瘧瀹屾垚"
+    elif record.status == "FAILED":
+        result["compile_progress"] = "缂栬瘧澶辫触"
+        # 鎻愬彇鐪熷疄閿欒淇℃伅
+        logs = record.execution_logs or []
+        result["error_msg"] = logs[-1] if logs else (
+            record.sandbox_code and "娌欑鎵ц澶辫触锛岃妫€鏌ョ畻瀛愰€昏緫" or "缂栬瘧澶辫触锛岃妫€鏌?DAG 钃濆浘"
+        )
+
+    return result
+
+
+# 鈹€鈹€ 3. 鑾峰彇 DAG 钃濆浘 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+@router.get("/runs/{run_id}/dag", summary="鑾峰彇 DAG 钃濆浘")
+async def get_dag(run_id: str) -> Dict[str, Any]:
+    record = _get_snapshot_mgr().get_run(run_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Run 涓嶅瓨鍦?)
+    if record.status == "COMPILING":
+        raise HTTPException(status_code=425, detail="DAG 姝ｅ湪缂栬瘧涓?)
+    if not record.dag_blueprint:
+        # 闃插尽鎬у洖閫€锛氫粠纾佺洏鏂囦欢璇诲彇
+        dag_file = record.run_dir / "dag_blueprint.json"
+        if dag_file.exists():
+            try:
+                with open(dag_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        raise HTTPException(status_code=404, detail="DAG 钃濆浘涓嶅瓨鍦?)
+    return record.dag_blueprint
+
+
+# 鈹€鈹€ 4. 瑙﹀彂鎵ц 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+@router.post("/runs/{run_id}/execute", summary="纭 DAG 骞惰Е鍙戞墽琛?)
+async def execute_run(
+        run_id: str,
+        request: ExecuteRequest,
+        background_tasks: BackgroundTasks,
+) -> StatusResponse:
+    record = _get_snapshot_mgr().get_run(run_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Run 涓嶅瓨鍦?)
+    if record.status == "COMPILING":
+        raise HTTPException(status_code=425, detail="DAG 姝ｅ湪缂栬瘧涓?)
+    if record.status not in ("PENDING_REVIEW", "QUEUED"):
+        raise HTTPException(status_code=400, detail=f"褰撳墠鐘舵€?{record.status} 涓嶅厑璁告墽琛?)
+
+    _get_snapshot_mgr().update_status(run_id, "RUNNING")
+
+    try:
+        dag_source = record.dag_blueprint or {}
+        code = _dag_to_python(dag_source, record)
+        _write_audit_trace(run_id, record.user_intent or "", dag_source)
+        _append_approval_hash(run_id, record.user_intent or "", dag_source, request.confirmed)
+    except Exception as e:
+        _get_snapshot_mgr().update_status(run_id, "FAILED")
+        raise HTTPException(status_code=500, detail=f"搴曞眰绠楀瓙缂栬瘧澶辫触: {str(e)}")
+
+    code_path = record.run_dir / "sandbox_code.py"
+    with open(code_path, "w", encoding="utf-8") as f:
+        f.write(code)
+
+    # 鍚屾鍐欏叆鏁版嵁搴擄紝鏂逛究鍓嶇灞曠ず鐪熷疄閿欒
+    _get_snapshot_mgr().update_sandbox_code(run_id, code)
+
+    background_tasks.add_task(
+        _execute_in_sandbox,
+        run_id=run_id,
+        code=code,
+        run_dir=record.run_dir,
+    )
+
+    return StatusResponse(
+        run_id=run_id, status="RUNNING", progress=0,
+        current_step="姝ｅ湪鍚姩 Docker 娌欑...", elapsed_seconds=0.0,
+        retry_count=0, output_files=[],
+    )
+
+
+# 鈹€鈹€ 5. 鏌ヨ鎵ц鐘舵€?鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+@router.get("/runs/{run_id}/status", summary="鏌ヨ鎵ц鐘舵€?)
+async def get_execution_status(run_id: str) -> StatusResponse:
+    record = _get_snapshot_mgr().get_run(run_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Run 涓嶅瓨鍦?)
+
+    output_files = record.output_files or []
+    output_dir = record.run_dir / "outputs"
+    if output_dir.exists():
+        output_files = [str(f.name) for f in output_dir.iterdir() if f.is_file()]
+
+    return StatusResponse(
+        run_id=run_id, status=record.status,
+        progress=50 if record.status == "RUNNING" else (
+            100 if record.status in ("COMPLETED", "FAILED", "SUCCESS") else 0),
+        current_step=record.status, elapsed_seconds=0.0,
+        retry_count=record.retry_count, output_files=output_files,
+    )
+
+
+@router.get("/projects/{project_code}/tree", summary="鑾峰彇鐗堟湰鏍?)
+async def get_version_tree(project_code: str, subject: Optional[str] = None) -> List[Dict]:
+    mgr = _get_snapshot_mgr()
+    if subject:
+        records = mgr.get_version_tree(project_code, subject)
+    else:
+        records = mgr.get_recent_runs(limit=100)
+        records = [r for r in records if r.project_code == project_code]
+    return [r.to_dict() for r in records]
+
+
+@router.get("/runs/{run_id}/download", summary="寮傛鎵撳寘涓嬭浇")
+async def download_run(run_id: str) -> DownloadResponse:
+    record = _get_snapshot_mgr().get_run(run_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Run 涓嶅瓨鍦?)
+
+    task_id = f"dl_{run_id}_{uuid.uuid4().hex[:6]}"
+    output_dir = record.run_dir / "outputs"
+
+    if not output_dir.exists():
+        raise HTTPException(status_code=404, detail="鎴愭灉鐗╀笉瀛樺湪")
+
+    download_dir = Path("data/downloads")
+    download_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = download_dir / f"{task_id}.zip"
+
+    with zipfile.ZipFile(str(zip_path), 'w', zipfile.ZIP_DEFLATED) as zf:
+        for file_path in output_dir.iterdir():
+            if file_path.is_file():
+                zf.write(str(file_path), arcname=file_path.name)
+        dag_path = record.run_dir / "dag_blueprint.json"
+        if dag_path.exists():
+            zf.write(str(dag_path), arcname="dag_blueprint.json")
+        plan_path = record.run_dir / "execution_plan.txt"
+        if plan_path.exists():
+            zf.write(str(plan_path), arcname="execution_plan.txt")
+
+    return DownloadResponse(task_id=task_id, status="COMPLETED", message=f"鎵撳寘瀹屾垚: {zip_path.name}")
+
+
+@router.get("/download/status/{task_id}", summary="鏌ヨ涓嬭浇鐘舵€?)
+async def get_download_status(task_id: str) -> Dict[str, Any]:
+    zip_path = Path("data/downloads") / f"{task_id}.zip"
+    if zip_path.exists():
+        return {
+            "task_id": task_id, "status": "COMPLETED",
+            "download_url": f"/api/v3/download/file/{task_id}.zip",
+            "file_size": zip_path.stat().st_size,
+        }
+    return {"task_id": task_id, "status": "PROCESSING", "message": "鎵撳寘涓?.."}
+
+
+@router.get("/download/file/{filename:path}", summary="涓嬭浇鎴愭灉鐗╂枃浠?)
+async def download_file(filename: str):
+    from fastapi.responses import FileResponse
+    file_path = Path("data/downloads") / filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="鏂囦欢涓嶅瓨鍦?)
+    return FileResponse(str(file_path), media_type="application/zip", filename=filename)
+
+
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?# 鍐呴儴鍑芥暟
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
+# 鈹€鈹€ 涓婁紶瀹夊叏鏍￠獙 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+
+def _validate_upload(file: UploadFile) -> str:
+    """
+    瀹夊叏鏍￠獙涓婁紶鏂囦欢锛岃繑鍥炴竻娲楀悗鐨勫畨鍏ㄦ枃浠跺悕銆?    
+    鏍￠獙瑙勫垯锛?    1. 鍘昏矾寰勯亶鍘嗗瓧绗︼紙浠呬繚鐣欑函鏂囦欢鍚嶏級
+    2. 鎵╁睍鍚嶇櫧鍚嶅崟
+    3. 鏂囦欢澶у皬闄愬埗
+    """
+    # 1. 鏂囦欢鍚嶅幓璺緞閬嶅巻
+    safe_name = Path(file.filename).name if file.filename else ""
+    if not safe_name:
+        raise HTTPException(status_code=400, detail="鏂囦欢鍚嶄负绌?)
+    if safe_name != file.filename:
+        raise HTTPException(status_code=400, detail="鏂囦欢鍚嶅寘鍚潪娉曡矾寰勫瓧绗?)
+
+    # 2. 鎵╁睍鍚嶇櫧鍚嶅崟
+    ext = Path(safe_name).suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400,
+                           detail=f"涓嶆敮鎸佺殑鏂囦欢绫诲瀷: {ext}锛屽厑璁哥殑绫诲瀷: {', '.join(ALLOWED_EXTENSIONS)}")
+
+    # 3. 鍐呭澶у皬鏍￠獙
+    if hasattr(file, "size") and file.size is not None and file.size > MAX_UPLOAD_SIZE:
+        raise HTTPException(status_code=400,
+                           detail=f"鏂囦欢杩囧ぇ锛坽file.size} 瀛楄妭锛夛紝鏈€澶у厑璁?{MAX_UPLOAD_SIZE // 1024 // 1024}MB")
+
+    return safe_name
+
+
+# 鈹€鈹€ 鏍煎紡瑙勮寖鍖?API 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+
+@router.post("/format/normalize", summary="鏍煎紡瑙勮寖鍖栵細鎸夋ā鏉跨粺涓€鎺掔増")
+async def normalize_document_format(
+    files: List[UploadFile] = File(..., description="寰呮帓鐗堟枃浠?+ 鍙€夋ā鏉挎枃浠?),
+    template_index: Optional[int] = Form(None, description="鎸囧畾绗嚑涓枃浠朵负妯℃澘锛?-based锛夛紝涓嶆寚瀹氬垯浣跨敤鍐呴儴榛樿妯℃澘"),
+    output_format: Optional[str] = Form("docx", description="杈撳嚭鏍煎紡: docx / xlsx / auto"),
+) -> Dict[str, Any]:
+    """鏍煎紡瑙勮寖鍖栵細浠ユā鏉夸负鍑嗭紝鎵归噺杞崲鍏朵粬鏂囦欢鐨勬牸寮忥紙鍚墦鍗拌缃級"""
+    if not files:
+        raise HTTPException(status_code=400, detail="璇疯嚦灏戜笂浼?涓枃浠?)
+
+    from core.run_snapshot import TEMP_BASE
+    TEMP_BASE.mkdir(parents=True, exist_ok=True)
+    temp_dir = TEMP_BASE / f"fmt_{uuid.uuid4().hex[:8]}"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_files = []
+    for f in files:
+        safe_name = _validate_upload(f)
+        save_path = temp_dir / safe_name
+        content = await f.read()
+        if len(content) > MAX_UPLOAD_SIZE:
+            raise HTTPException(status_code=400, detail=f"鏂囦欢 {safe_name} 杩囧ぇ")
+        with open(save_path, "wb") as fout:
+            fout.write(content)
+        saved_files.append(str(save_path))
+
+    # 纭畾妯℃澘锛氱敤鎴锋寚瀹?> 鍐呴儴妯℃澘 > 绗竴涓枃浠舵帹娴?    if template_index is not None and 0 <= template_index < len(saved_files):
+        template_path = saved_files[template_index]
+        targets = [p for i, p in enumerate(saved_files) if i != template_index]
+        template_source = f"鐢ㄦ埛涓婁紶锛堢{template_index + 1}涓枃浠讹級"
+    else:
+        # 鐢ㄥ唴閮ㄩ粯璁ゆā鏉?        first_ext = Path(saved_files[0]).suffix.lower()
+        if first_ext in (".xlsx", ".xlsm", ".xls"):
+            internal = list((TEMPLATES_DIR / "excel").glob("*.xlsx"))
+        else:
+            internal = list((TEMPLATES_DIR / "word").glob("*.docx"))
+        if internal:
+            template_path = str(internal[0])
+            targets = saved_files
+            template_source = f"鍐呴儴榛樿妯℃澘锛坽Path(template_path).name}锛?
+        else:
+            # 鍥為€€锛氱敤绗竴涓枃浠跺綋妯℃澘
+            template_path = saved_files[0]
+            targets = saved_files[1:]
+            template_source = "鑷姩锛堢涓€涓枃浠讹級"
+
+    if not targets:
+        return {"status": "error", "message": "娌℃湁闇€瑕佽浆鎹㈢殑鐩爣鏂囦欢锛堣嚦灏戦渶瑕佹ā鏉夸箣澶栫殑1涓枃浠讹級",
+                "template": template_source}
+
+    output_dir = str(temp_dir / "formatted")
+    try:
+        results = normalize_format(template_path, targets, output_dir)
+        # 灏嗙粨鏋滃鍒跺埌 downloads 鐩綍渚涗笅杞?        import shutil
+        dl_dir = Path("data/downloads")
+        dl_dir.mkdir(parents=True, exist_ok=True)
+        dl_name = f"fmt_{uuid.uuid4().hex[:6]}.zip"
+        dl_path = dl_dir / dl_name
+        import zipfile
+        with zipfile.ZipFile(str(dl_path), "w", zipfile.ZIP_DEFLATED) as zf:
+            for r in results:
+                zf.write(r, Path(r).name)
+        return {
+            "status": "success",
+            "template": template_source,
+            "converted_count": len(results),
+            "converted_files": [Path(r).name for r in results],
+            "download_url": f"/api/v3/download/file/{dl_name}",
+        }
+    except Exception as e:
+        return {"status": "error", "message": f"鏍煎紡瑙勮寖鍖栧け璐? {str(e)}"}
+
+
+
+
+# 鈹€鈹€ 浠ｇ爜瀹夊叏娓呮礂 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+
+def _sanitize_code_param(value: str, max_len: int = 200) -> str:
+    """
+    瀹夊叏娓呮礂鎷煎叆娌欑浠ｇ爜鐨勫瓧绗︿覆鍙傛暟鍊笺€?    
+    瑙勫垯锛?    - 杞箟鍙嶆枩鏉犲拰鍗曞紩鍙凤紙闃叉瀛楃涓查€冮€革級
+    - 鎴柇瓒呴暱鍊硷紙闃叉缂撳啿鍖虹被鏀诲嚮锛?    - 杩囨护鎺у埗瀛楃锛堜繚鐣欏父鐢ㄧ┖鐧界 \\t \\n \\r锛?    """
+    if not isinstance(value, str):
+        value = str(value)
+    # 杞箟鍙嶆枩鏉犲繀椤诲厛浜庡崟寮曞彿
+    value = value.replace("\\", "\\\\")
+    value = value.replace("'", "\\'")
+    # 鎴柇
+    if len(value) > max_len:
+        value = value[:max_len]
+    # 杩囨护鎺у埗瀛楃锛堜繚鐣欏父鐢ㄧ殑绌虹櫧绗?0x09=TAB, 0x0A=LF, 0x0D=CR锛?    value = _re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', value)
+    return value
+
+
+# 鈹€鈹€ DAG JSON 澶у皬鏍￠獙 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+
+def _validate_dag_json_size(dag_json: str) -> None:
+    """鏍￠獙 DAG JSON 澶у皬锛岄槻姝㈣秴澶ф暟鎹敞鍏?""
+    if len(dag_json.encode('utf-8')) > MAX_DAG_JSON_SIZE:
+        raise ValueError(f"DAG JSON 杩囧ぇ锛?{MAX_DAG_JSON_SIZE}瀛楄妭锛夛紝鍙兘瀛樺湪娉ㄥ叆椋庨櫓")
+
+
+# 鈹€鈹€ 鍚庡彴缂栬瘧 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+
+async def _call_dify_compiler(catalog: AssetCatalog, user_intent: str, preset_button: Optional[str],
+                              parent_run_id: Optional[str]) -> Any:
+    catalog_text = _format_catalog_for_prompt(catalog)
+
+    # 馃洝锔?闅愮闃茬伀澧欙細鏁版嵁鍑烘湰鍦板墠鑴辨晱
+    fw = get_firewall()
+    catalog_text, _ = fw.sanitize(catalog_text)
+    user_intent, _ = fw.sanitize(user_intent)
+
+    # 馃摎 RAG 鍚堣娉ㄥ叆锛氭绱㈢浉鍏虫硶瑙勭墖娈?    compliance_context = inject_compliance_context(user_intent)
+    if compliance_context:
+        catalog_text = compliance_context + "\n\n" + catalog_text
+
+    # 馃寪 鑱旂綉鎼滅储瑙﹀彂鍣細妫€娴嬫槸鍚﹂渶瑕佹渶鏂版硶瑙?鏀跨瓥淇℃伅锛堝湪宸叉湁浜嬩欢寰幆涓紓姝ユ墽琛岋級
+    try:
+        from core.search_trigger import search_and_inject
+        search_context = await search_and_inject(user_intent)
+        if search_context:
+            catalog_text = search_context + "\n\n" + catalog_text
+            print(f"[缂栬瘧] 宸叉敞鍏ヨ仈缃戞悳绱㈢粨鏋?)
+    except Exception as e:
+        print(f"[缂栬瘧] 鎼滅储瑙﹀彂鍣ㄩ檷绾э紙闈炶嚧鍛斤級: {e}")
+
+    # 馃 棰嗗煙鐭ヨ瘑娉ㄥ叆锛氬璁℃渶浣冲疄璺?    catalog_text = AUDIT_DOMAIN_KNOWLEDGE + "\n\n" + catalog_text
+
+    # 馃摉 Few-shot 绀轰緥娉ㄥ叆锛圔3 鍔ㄦ€佺増锛夛細鎸夋剰鍥惧叧閿瘝閫?top-3 鐩稿叧鑼冧緥锛?    # 鏈懡涓叧閿瘝鏃惰嚜鍔ㄥ洖閫€鍏ㄩ噺 7 鏉★紙琛屼负鍏煎鏃х増锛?    from config.few_shot_examples import build_dynamic_few_shot
+    few_shot_text = build_dynamic_few_shot(user_intent, max_examples=3)
+    catalog_text = few_shot_text + "\n\n" + catalog_text
+
+    # 馃摉 鍚堟垚 Few-shot 娉ㄥ叆锛?0鏉″璐﹀満鏅級锛氫粠 JSONL 姹犻€夊尮閰嶆渚?    try:
+        from config.few_shot_examples import build_synthetic_few_shot
+        synth_text = build_synthetic_few_shot(user_intent or "", max_examples=3)
+        if synth_text:
+            catalog_text = synth_text + "\n\n" + catalog_text
+    except Exception as e:
+        print(f"[缂栬瘧] 鍚堟垚 Few-shot 闄嶇骇锛堥潪鑷村懡锛? {e}")
+
+    # 馃幆 鍦烘櫙鐭ヨ瘑鍖咃細瑙勫垝妫€鏌ュ崟娉ㄥ叆锛圧AG 鐭ヨ瘑 鈫?瑙勫垝绾︽潫锛岃鐩栭€愮瑪/姹囨€?鎻愬彇寮忕瓑鍦烘櫙锛?    try:
+        from config.scenario_packs import detect_scenario as _detect_scn, build_scenario_prompt
+        _scn = _detect_scn(user_intent or "")
+        _scn_prompt = build_scenario_prompt(_scn)
+        if _scn_prompt:
+            catalog_text = _scn_prompt + "\n\n" + catalog_text
+            print(f"[缂栬瘧] 鍦烘櫙鐭ヨ瘑鍖? {_scn}")
+    except Exception as e:
+        print(f"[缂栬瘧] 鍦烘櫙鐭ヨ瘑鍖呴檷绾э紙闈炶嚧鍛斤級: {e}")
+
+    _MAX_CATALOG_CHARS = 35000
+    if len(catalog_text) > _MAX_CATALOG_CHARS:
+        _truncated = catalog_text[:_MAX_CATALOG_CHARS]
+        _last_nl = _truncated.rfind("\n")
+        if _last_nl > _MAX_CATALOG_CHARS * 0.8:
+            _truncated = _truncated[:_last_nl]
+        catalog_text = _truncated + "\n\n[鎻愮ず锛氭暟鎹洰褰曡繃闀垮凡鑷姩鎴柇]"
+        print(f"[缂栬瘧] Token 棰勭畻淇濇姢")
+
+    parent_summary = ""
+    if parent_run_id:
+        parent_data = _get_snapshot_mgr().extract_summary_for_inheritance(parent_run_id)
+        if parent_data:
+            parent_summary = (
+                f"\n## 鍓嶅簭鎿嶄綔鎽樿\n"
+                f"鍓嶅簭鎰忓浘: {parent_data.get('previous_intent', '')}\n"
+                f"鍓嶅簭鐩爣: {parent_data.get('previous_objective', '')}\n"
+                f"鍓嶅簭绠楀瓙: {parent_data.get('previous_operators', '')}\n"
+            )
+
+    # 骞昏鏍￠獙鍩哄噯锛欴ata Catalog 涓殑鐪熷疄鏂囦欢鍚?    _known_files = [f["filename"] for f in catalog.files] if catalog and catalog.files else []
+
+    try:
+        client = _get_http_client()
+        response = await client.post(
+            f"{DIFY_BASE_URL}/v1/workflows/run",
+            headers={"Authorization": f"Bearer {DIFY_API_KEY}"},
+            json={
+                "inputs": {
+                    "catalog_text": catalog_text, "user_intent": user_intent,
+                    "preset_button": preset_button or "", "parent_summary": parent_summary,
+                },
+                "response_mode": "blocking", "user": "audit_platform",
+            },
+        )
+        response.raise_for_status()
+        result = response.json()
+        print(f"DEBUG Dify response keys: {list(result.keys())}")
+        if "data" in result:
+            print(f"DEBUG data keys: {list(result['data'].keys())}")
+            if "outputs" in result["data"]:
+                print(f"DEBUG outputs keys: {list(result['data']['outputs'].keys())}")
+                print(f"DEBUG dag_json value (first 200): {str(result['data']['outputs'].get('dag_json', ''))[:200]}")
+        dag_json_str = result.get("data", {}).get("outputs", {}).get("dag_json", "")
+
+        if dag_json_str:
+            # --- 馃洝锔?闃插尽鎬?Patch锛氳В鏋愬墠寮鸿娉ㄥ叆 source_file ---
+            try:
+                dag_data = json.loads(dag_json_str)
+                # 鑾峰彇绗竴涓枃浠剁殑鍚嶇О浣滀负榛樿鍊硷紙濡傛灉鏈夋枃浠讹級
+                default_file = catalog.files[0]["filename"] if catalog.files else "input.xlsx"
+
+                if "operators" in dag_data:
+                    for op in dag_data["operators"]:
+                        # 瑙勮寖鍖栵細Dify 鏈夋椂鐢?"operator" / "type" 浠ｆ浛 "name"
+                        if "operator" in op and "name" not in op:
+                            op["name"] = op.pop("operator")
+                        if "name" not in op and op.get("type"):
+                            op["name"] = op["type"]
+                        # 瑙勮寖鍖栵細output 鈫?output_alias
+                        if "output" in op and "output_alias" not in op:
+                            op["output_alias"] = op.pop("output")
+                        # 瑙勮寖鍖栵細input_from 瀛楃涓测啋鍒楄〃
+                        if "input_from" in op and isinstance(op["input_from"], str):
+                            op["input_from"] = [op["input_from"]]
+                        # Load 绠楀瓙娉ㄥ叆 source_file
+                        if op.get("name") in ("Load", "load"):
+                            if not op.get("source_file"):
+                                op["source_file"] = op.get("file")
+                            if not op.get("source_file"):
+                                op["source_file"] = catalog.files[0]["filename"] if catalog.files else "input.xlsx"
+                dag_json_str = json.dumps(dag_data)
+
+            except Exception as e:
+                print(f"JSON 棰勫鐞?Patch 澶辫触: {e}")
+            # ---------------------------------------------
+
+            try:
+                dag_for_return = DAGParser.parse(dag_json_str, known_files=_known_files or None)
+            except ValueError:
+                # 骞昏鐔旀柇锛氱‘瀹氭€ц鍒欎慨澶嶏紙difflib 灏辫繎绾犳鏂囦欢鍚嶏級鍚庨噸鏍￠獙锛?                # 浠嶅け璐ュ垯鎶涢敊杩涘叆涓婄骇鐔旀柇閾撅紙DAG 绮句慨 鈫?vLLM 鐩磋繛 鈫?鏈湴鍏滃簳锛?                from core.dag_compiler import rule_fix_dag
+                _fixed = rule_fix_dag(dag_json_str, known_files=_known_files or None)
+                if _fixed:
+                    dag_for_return = DAGParser.parse(_fixed, known_files=_known_files or None)
+                else:
+                    raise
+            return dag_for_return
+
+    except Exception as e:
+        print(f"Dify 涓婚摼璺け璐? {e}")
+        # 灏濊瘯 vLLM 闄嶇骇锛泇LLM 涔熶笉鍙敤鏃惰繑鍥?None锛岀敱涓婂眰 _build_fallback_dag 鎺ョ
+        try:
+            return await _fallback_compiler(catalog_text, user_intent, preset_button)
+        except Exception as e2:
+            print(f"vLLM 闄嶇骇涔熷け璐? {e2}锛屼氦鐢辨湰鍦板厹搴?DAG 鎺ョ")
+            return None
+
+
+def _extract_patterns_from_dag(dag_blueprint: dict) -> str:
+    """浠?DAG 钃濆浘鐨?RegexFilter 绠楀瓙涓彁鍙栫瓫閫夊叧閿瘝"""
+    if not dag_blueprint:
+        return ""
+    ops = dag_blueprint.get("operators", [])
+    for op in ops:
+        name = op.get("name", "").lower()
+        if name in ("regexfilter", "regex_filter", "regex", "filter"):
+            pattern = op.get("params", {}).get("pattern", "")
+            if pattern:
+                return pattern
+    # 鍏滃簳锛氫粠绗竴涓?Load 鐨?source_file 鍜屽父瑙佸叧閿瘝鎺ㄦ柇
+    return ""
+
+
+async def _explain_dag(blueprint: dict, catalog: Any, user_intent: str) -> str:
+    """鐢?vLLM 鐢熸垚鍖归厤閫昏緫鐨勮嚜鐒惰瑷€璇存槑"""
+    ops = blueprint.get("operators", [])
+    if not ops:
+        return ""
+    ops_text = "\n".join(
+        f"{i+1}. {op.get('name')}: params={json.dumps(op.get('params',{}), ensure_ascii=False)[:300]}" 
+        for i, op in enumerate(ops)
+    )
+    # 鎻愬彇瀹為檯鐨勭瓫閫夊叧閿瘝
+    patterns = _extract_patterns_from_dag(blueprint) or "锛堟湭鎸囧畾鍏蜂綋鍏抽敭璇嶏級"
+    prompt = f"""浣犳槸瀹¤鍔╂墜銆傝鐢ㄨ嚜鐒惰瑷€鍚戝璁″笀瑙ｉ噴浠ヤ笅鍖归厤閫昏緫锛?
+鐢ㄦ埛鎰忓浘锛歿user_intent}
+
+鎵ц姝ラ锛堝惈鍙傛暟锛夛細
+{ops_text}
+
+瀹為檯绛涢€夊叧閿瘝锛歿patterns}
+
+璇风敤3-5鍙ヨ缁嗚鏄庯細
+1) 骞冲彴浠庡摢浜涙枃浠跺姞杞芥暟鎹?2) 鐢ㄤ粈涔堝叧閿瘝鎴栬鍒欑瓫閫夛紙鍒楀嚭鍏蜂綋鍏抽敭璇嶏級
+3) 鎸変粈涔堢淮搴︽眹鎬诲拰姣斿
+4) 鍖归厤绛栫暐娴佺▼
+鐩存帴鍥炲璇存槑锛屼笉瑕丣SON銆?""
+    try:
+        client = _get_http_client()
+        response = await client.post(
+            VLLM_TUNNEL_URL,
+            headers={"Authorization": f"Bearer {VLLM_API_KEY}"},
+            json={"model": VLLM_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 2048},
+        )
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"].strip()
+    except Exception:
+        # vLLM 涓嶅彲鐢ㄦ椂鐢ㄦā鏉跨敓鎴愶紙澧炲己鐗堬細閬嶅巻鎵€鏈夌畻瀛愮敓鎴愯缁嗘弿杩帮級
+        names = [op.get("name") for op in ops]
+        files = [op.get("source_file", "") for op in ops if op.get("source_file")]
+        unique_files = list(dict.fromkeys(files))  # 鍘婚噸淇濇寔椤哄簭
+
+        parts = []
+        # 鏂囦欢鍔犺浇
+        if unique_files:
+            file_list = "銆?.join([f"銆寋f}銆? for f in unique_files])
+            parts.append(f"骞冲彴灏嗗姞杞?{len(unique_files)} 涓枃浠讹細{file_list}")
+        else:
+            parts.append(f"骞冲彴灏嗗姞杞?{len(files)} 涓枃浠?)
+
+        # 閬嶅巻姣忕绠楀瓙鐢熸垚鍏蜂綋鎻忚堪
+        for op in ops:
+            name = op.get("name", "")
+            params = op.get("params", {})
+            if name == "NoiseFilter":
+                cols = params.get("columns", params.get("column", []))
+                noises = params.get("noise_patterns", [])
+                col_str = "銆?.join(cols) if isinstance(cols, list) else str(cols)
+                noise_str = "銆?.join(noises) if isinstance(noises, list) else str(noises)
+                parts.append(f"杩囨护銆寋col_str}銆嶅垪涓殑鍣煶锛歿noise_str}")
+            elif name == "ColumnFilter":
+                col = params.get("column", "")
+                op_val = params.get("operator", "=")
+                val = params.get("value", "")
+                parts.append(f"绛涢€夈€寋col}銆峽op_val}銆寋val}銆嶇殑璁板綍")
+            elif name == "RegexFilter":
+                pattern = params.get("pattern", "")
+                parts.append(f"閫氳繃姝ｅ垯銆寋pattern}銆嶇瓫閫夌浉鍏宠褰?)
+            elif name == "Sort":
+                by = params.get("by", [])
+                by_str = "銆?.join(by) if isinstance(by, list) else str(by)
+                parts.append(f"鎸夈€寋by_str}銆嶆帓搴?)
+            elif name == "Merge":
+                how = params.get("how", "outer")
+                left_on = params.get("left_on", [])
+                right_on = params.get("right_on", [])
+                l_str = "+".join(left_on) if isinstance(left_on, list) else str(left_on)
+                r_str = "+".join(right_on) if isinstance(right_on, list) else str(right_on)
+                parts.append(f"浠ャ€寋l_str}銆嶁啍銆寋r_str}銆峽how} 杩炴帴涓よ〃")
+            elif name == "Diff":
+                col_a = params.get("col_a", "")
+                col_b = params.get("col_b", "")
+                tol = params.get("tolerance_abs", params.get("tolerance", 0.01))
+                parts.append(f"姣斿銆寋col_a}銆嶄笌銆寋col_b}銆嶏紝瀹瑰樊 卤{tol}")
+            elif name == "Reconcile":
+                tol = params.get("tolerance_abs", 0.01)
+                window = params.get("date_window_days", "")
+                parts.append(f"閫愮瑪瀵硅处鍖归厤锛屽宸?卤{tol}" + (f"锛屾棩鏈熺獥鍙?卤{window}澶? if window else ""))
+            elif name == "Aggregate":
+                group_by = params.get("group_by", params.get("by", []))
+                gb_str = "銆?.join(group_by) if isinstance(group_by, list) else str(group_by)
+                parts.append(f"鎸夈€寋gb_str}銆嶆眹鎬荤粺璁?)
+            elif name == "GroupBy":
+                by = params.get("by", params.get("columns", []))
+                by_str = "銆?.join(by) if isinstance(by, list) else str(by)
+                agg = params.get("agg", "count")
+                parts.append(f"鎸夈€寋by_str}銆嶅垎缁勶紝鑱氬悎鏂瑰紡锛歿agg}")
+
+        # 瀵煎嚭
+        export_files = [op.get("params", {}).get("filename", "") for op in ops if op.get("name") == "Export"]
+        if export_files:
+            parts.append("鏈€鍚庡鍑恒€? + "銆?.join(export_files) + "銆?)
+        else:
+            parts.append("鏈€鍚庡鍑哄尮閰嶇粨鏋滃拰瀹¤鎶ュ憡")
+
+        return "銆?.join(parts) + "銆?
+
+
+def _generate_fallback_plan(run_dir, user_intent, preset_button, catalog):
+    """Dify 涓嶅彲鐢ㄦ椂浠庡満鏅敞鍐岃〃鐢熸垚鍖归厤璁″垝"""
+    try:
+        from config.scenario_packs import detect_scenario, SCENARIO_PACKS
+        from config.presets import normalize_preset_key
+
+        sid = normalize_preset_key(preset_button) if preset_button else None
+        if not sid:
+            sid = detect_scenario(user_intent or "", ask_user=False)
+        # 鍏煎鏃у満鏅悕锛堜腑鏂団啋鑻辨枃key锛?        _name_map = {"閾惰瀵硅处":"bank_reconcile_detail","鏁版嵁姣斿":"summary_compare",
+                     "鎻愬彇寮忔牳瀵?:"filtered_extraction_match","澶ч浜ゆ槗绛涙煡":"large_txn_screen",
+                     "鏅鸿兘绛涢€?:"single_table_analysis","鏂囨。鐢熸垚":"doc_generation",
+                     "璺ㄦ枃浠跺姣?:"cross_doc_compare"}
+        sid = _name_map.get(sid, sid)
+        print(f"[鍖归厤璁″垝] 鍦烘櫙={sid} 瀛樺湪={sid in SCENARIO_PACKS}")
+        pack = SCENARIO_PACKS.get(sid, {})
+
+        files = [f["filename"] for f in catalog.files] if catalog and catalog.files else []
+        plan = f"## {pack.get('name', '鏁版嵁澶勭悊')}\n\n"
+        plan += f"### 鏁版嵁婧怽n"
+        for fn in files:
+            plan += f"- {fn}\n"
+        plan += f"\n### 妫€鏌ュ崟\n"
+        for c in pack.get("checklist", [])[:5]:
+            plan += f"- {c}\n"
+        plan += f"\n### 瀹瑰樊绾緥\n{pack.get('tolerance_rule', '涓嶉€傜敤')}\n"
+        plan += f"\n### 搴斾氦浠榎n{'銆?.join(pack.get('deliverables', []))}\n"
+        plan += f"\n> 褰撳墠 Dify 缂栬瘧鏈嶅姟涓嶅彲鐢紝浠ヤ笂涓哄満鏅粯璁ゅ尮閰嶉€昏緫锛屾墽琛屾椂灏嗘寜姝ゆ爣鍑嗚繘琛屻€?
+
+        (run_dir / "match_explanation.txt").write_text(plan, encoding="utf-8")
+    except Exception as e:
+        print(f"[鍖归厤璁″垝] 鐢熸垚澶辫触: {e}")
+
+
+async def _fallback_compiler(catalog_text: str, user_intent: str, preset_button: Optional[str]) -> Any:
+    # 棰勮鎸夐挳浼樺厛锛堝埆鍚嶅綊涓€锛夛紝鏈寚瀹氬垯鎸夋剰鍥炬帹鏂満鏅?    scenario = None
+    if preset_button:
+        try:
+            from config.presets import normalize_preset_key
+            scenario = normalize_preset_key(preset_button)
+        except Exception:
+            scenario = None
+    if not scenario:
+        scenario = detect_scenario(user_intent)
+    system_prompt = get_fallback_prompt(scenario)
+    print(f"[闄嶇骇缂栬瘧] 鍦烘櫙: {scenario}锛坧reset_button={preset_button or '鏃?}锛?)
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"## 鏁版嵁鐩綍\n{catalog_text}\n\n## 瀹¤鎰忓浘\n{user_intent}"},
+    ]
+
+    client = _get_http_client()
+    response = await client.post(
+        VLLM_TUNNEL_URL,
+        headers={"Authorization": f"Bearer {VLLM_API_KEY}"},
+        json={
+            "model": VLLM_MODEL, "messages": messages,
+            "temperature": 0.3, "max_tokens": 4096,
+        },
+    )
+    if response.status_code != 200:
+        print(f"[vLLM] 閿欒鍝嶅簲 ({response.status_code}): {response.text[:500]}")
+    response.raise_for_status()
+    raw_content = response.json()["choices"][0]["message"]["content"]
+
+    import re
+    json_match = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', raw_content)
+    if json_match:
+        dag_json = json_match.group(1)
+    else:
+        json_match = re.search(r'(\{[\s\S]*?("operators"|"nodes")[\s\S]*?\})', raw_content)
+        if json_match:
+            dag_json = json_match.group(1)
+        else:
+            raise ValueError("鏃犳硶浠?vLLM 鍝嶅簲涓彁鍙?JSON銆?)
+
+    # 馃敀 瀹夊叏鏍￠獙锛氶檺鍒?DAG JSON 澶у皬
+    _validate_dag_json_size(dag_json)
+
+    # 馃洝锔?闃插尽鎬?Patch锛氫负缂哄皯 source_file 鐨?Load 绠楀瓙鑷姩娉ㄥ叆
+    try:
+        dag_data = json.loads(dag_json)
+        default_file = "input.xlsx"
+        if "operators" in dag_data:
+            for op in dag_data["operators"]:
+                if op.get("name") in ("Load", "load") or op.get("type") in ("Load", "load"):
+                    if not op.get("source_file"):
+                        op["source_file"] = op.get("file") or default_file
+            dag_json = json.dumps(dag_data)
+    except Exception:
+        pass
+
+    # 骞昏鏍￠獙鍩哄噯锛氫粠 catalog_text 杩樺師鐪熷疄鏂囦欢鍚嶏紙"鏂囦欢: xxx" 琛岋級
+    _kf = re.findall(r"^鏂囦欢[:锛歖\s*(.+?)\s*$", catalog_text, flags=re.M)
+    try:
+        return DAGParser.parse(dag_json, known_files=_kf or None)
+    except Exception as e:
+        from core.dag_compiler import rule_fix_dag
+        _fixed = rule_fix_dag(dag_json, known_files=_kf or None)
+        if _fixed:
+            try:
+                return DAGParser.parse(_fixed, known_files=_kf or None)
+            except Exception:
+                pass
+        raise ValueError(f"DAG 瑙ｆ瀽澶辫触: {e}")
+
+
+def _build_fallback_dag(catalog: Any, user_intent: str) -> Any:
+    """鏈€缁堝厹搴曪細浠?catalog 鐢熸垚鏈€灏?DAG锛堜笉渚濊禆浠讳綍 LLM锛?""
+    from core.dag_compiler import DAGBlueprint, Operator
+
+    files = getattr(catalog, "files", [])
+    if not files:
+        return None
+
+    scenario = detect_scenario(user_intent)
+    ops = []
+
+    # 姣忎釜鏂囦欢涓€涓?Load
+    for i, f in enumerate(files):
+        fname = f.get("filename", f"file_{i}")
+        ops.append(Operator(
+            id=f"load_{i}", name="Load", description=f"璇诲彇 {fname}",
+            input_from=[], source_file=fname, params={"file_path": fname},
+            output_alias=f"df_load_{i}",
+        ))
+
+    # 鏍规嵁鍦烘櫙鍔犵畻瀛?    if "鍖归厤" in user_intent or "鏍稿" in user_intent:
+        ops.append(Operator(
+            id="merge_0", name="Merge", description="鏁版嵁鍚堝苟",
+            input_from=[f"load_{i}" for i in range(len(files))],
+            params={"how": "outer"},
+            output_alias="df_merge_0",
+        ))
+        ops.append(Operator(
+            id="export_0", name="Export", description="瀵煎嚭鍖归厤缁撴灉",
+            input_from=["merge_0"],
+            params={"filename": "match_result.xlsx"},
+            output_alias="df_export_0",
+        ))
+    else:
+        ops.append(Operator(
+            id="export_0", name="Export", description="瀵煎嚭缁撴灉",
+            input_from=[f"load_{i}" for i in range(len(files))],
+            params={"filename": "analysis_result.csv"},
+            output_alias="df_export_0",
+        ))
+
+    return DAGBlueprint(
+        blueprint_id="fallback_001",
+        generated_at=datetime.now().isoformat(),
+        operators=ops,
+        objective=f"鍏滃簳缂栬瘧: {user_intent[:50]}",
+        raw_intent=user_intent,
+    )
+
+
+def _format_catalog_for_prompt(catalog: AssetCatalog) -> str:
+    """Data Catalog 鈫?LLM 鎻愮ず鏂囨湰銆?
+    瀵屽寲鍐呭锛堣 LLM 鐪嬬潃鐪熷疄璇箟瑙勫垝锛岃€屼笉鏄収鎶勭ず渚嬪够瑙夛級锛?    - 姣忔枃浠讹細鍒楀悕(dtype) + 璇箟瑙掕壊锛堢‘瀹氭€ц瘑鍒級+ 鏂囨。鏂囨湰棰勮/鍐呭祵琛ㄦ牸鍒?    - 璺ㄨ〃锛氳繛鎺ラ敭寤鸿锛堝凡鎺掗櫎搴忓彿/琛屽彿绛夋棤鎰忎箟閿級
+    - 椤堕儴纭害鏉燂細source_file 涓庡垪鍚嶅繀椤绘潵鑷湰鐩綍
+    """
+    lines = [
+        f"鏂囦欢鎬绘暟: {catalog.total_files}",
+        "銆愮‖绾︽潫銆慙oad 鐨?source_file 鍜岀畻瀛愬紩鐢ㄧ殑鍒楀悕蹇呴』閫愬瓧鏉ヨ嚜涓嬫柟鏂囦欢娓呭崟锛?
+        "涓ョ浣跨敤浠讳綍绀轰緥涓殑鏂囦欢鍚?鍒楀悕锛涗弗绂佹妸'搴忓彿/缂栧彿/琛屽彿'鐢ㄤ綔杩炴帴閿€?,
+        "=== 鏂囦欢娓呭崟 ===",
+    ]
+    # 璇箟瑙掕壊锛堝垪鍚嶉┍鍔紝纭畾鎬э紱涓庡疄闄呬笟鍔″惈涔変笉绗︽椂 LLM 鍙寜闇€淇骞惰鏄庯級
+    try:
+        import pandas as _pd
+        from core.column_semantics import (detect_column_roles,
+                                           is_meaningless_key, suggest_join_keys)
+        _sem_ok = True
+    except Exception:
+        _sem_ok = False
+    frames = {}
+    for f in catalog.files:
+        lines.append(f"\n鏂囦欢: {f['filename']}")
+        if f.get("kind") and f["kind"] != "table":
+            lines.append(f"  绫诲瀷: {f['kind']}")
+        if "columns" in f and f["columns"]:
+            cols = [f"{col['name']}({col['dtype']})" for col in f["columns"]]
+            lines.append(f"  鍒? {', '.join(cols)}")
+            if _sem_ok:
+                try:
+                    _df = _pd.DataFrame(
+                        columns=[str(col["name"]) for col in f["columns"]])
+                    frames[f["filename"]] = _df
+                    roles = detect_column_roles(_df)
+                    if roles:
+                        lines.append("  璇箟瑙掕壊: " + ", ".join(
+                            f"{r}鈫抺c}" for r, c in roles.items()))
+                    mk = [c for c in _df.columns if is_meaningless_key(c)]
+                    if mk:
+                        lines.append(f"  鏃犳剰涔夐敭锛堢姝㈣繛鎺ワ級: {', '.join(mk)}")
+                except Exception:
+                    pass
+        if f.get("text_preview"):
+            lines.append(f"  鏂囨湰棰勮: {str(f['text_preview'])[:200]}")
+        if f.get("tables_columns") and f["tables_columns"]:
+            lines.append(f"  鏂囨。鍐呭祵琛ㄦ牸鍒? {', '.join(str(c) for c in f['tables_columns'][0])}")
+    # 璺ㄨ〃杩炴帴閿缓璁紙涓や袱缁勫悎锛屾渶澶?5 缁勶級
+    if _sem_ok and len(frames) >= 2:
+        try:
+            names = list(frames.keys())
+            hints = []
+            for i in range(len(names)):
+                for j in range(i + 1, len(names)):
+                    keys = suggest_join_keys(frames[names[i]], frames[names[j]])
+                    if keys:
+                        hints.append(f"{names[i]} 脳 {names[j]}: "
+                                     + ", ".join(f"{a}鈫攞b}" for a, b in keys))
+                if len(hints) >= 5:
+                    break
+            if hints:
+                lines.append("\n=== 璺ㄨ〃杩炴帴閿缓璁紙渚涘弬鑰冿級 ===")
+                lines.extend(hints[:5])
+        except Exception:
+            pass
+    # 璺ㄨ〃鍒楀悕鏄犲皠鎻愮ず锛堝簭鏃惰处脳閾惰娴佹按鏃舵敞鍏ユ柟鍚戦暅鍍忚鍒欙級
+    if _sem_ok and len(frames) >= 2:
+        try:
+            from core.column_semantics import detect_column_roles
+            _all_roles = {}
+            for _fname, _fdf in frames.items():
+                _all_roles[_fname] = detect_column_roles(_fdf)
+            # 妫€娴嬫槸鍚︽湁搴忔椂璐?閾惰娴佹按鐨勭粍鍚?            _has_journal = any(
+                ("debit" in r and "credit" in r) for r in _all_roles.values())
+            _has_bank = any(
+                ("debit" in r or "credit" in r) and "balance" in r
+                for r in _all_roles.values())
+            if _has_journal and _has_bank:
+                lines.append("\n=== 鈿狅笍 璺ㄨ〃鍒楀悕鏂瑰悜闀滃儚鏄犲皠锛圡erge/Diff 蹇呴』閬靛畧锛?===")
+                for _fn, _roles in _all_roles.items():
+                    _maps = []
+                    if "debit" in _roles:
+                        _maps.append(f"鍊熸柟閲戦={_roles['debit']}")
+                    if "credit" in _roles:
+                        _maps.append(f"璐锋柟閲戦={_roles['credit']}")
+                    if _maps:
+                        lines.append(f"  {_fn}: {', '.join(_maps)}")
+                lines.append("  瑙勫垯锛氬簭鏃惰处.鍊熸柟閲戦 鈫愨啋 閾惰娴佹按.璐锋柟锛堟敹鍏ワ級  銆愭柟鍚戦暅鍍忋€?)
+                lines.append("       搴忔椂璐?璐锋柟閲戦 鈫愨啋 閾惰娴佹按.鍊熸柟锛堟敮鍙栵級  銆愭柟鍚戦暅鍍忋€?)
+                lines.append("   Merge 鐨?left_on/right_on 蹇呴』鐢ㄤ互涓婃槧灏勶紝绂佹鎸夊悓鍚嶅垪鍚嶇‖鍖归厤锛?)
+        except Exception:
+            pass
+    return "\n".join(lines)
+
+
+# 馃挕 淇鍥涳細褰诲簳瑙ｈ€︿弗鏍奸潰鍚戝璞★紝瀵?dict 鍜?object 鎻愪緵鏋佽嚧鐨勯槻寰″寘瀹?def _dag_to_python(dag: Any, record: RunRecord) -> str:
+    # 1. 瀹夊叏鎻愬彇澶撮儴鍏冩暟鎹?    is_dict = isinstance(dag, dict)
+    objective = (dag.get("objective") if is_dict else getattr(dag, "objective", None)) or "榛樿鍚堝苟瀵硅处"
+    raw_intent = (dag.get("raw_intent") if is_dict else getattr(dag, "raw_intent", None)) or "鏃犻璁炬剰鍥?
+    blueprint_id = (dag.get("blueprint_id") if is_dict else getattr(dag, "blueprint_id",
+                                                                    None)) or f"bp_{uuid.uuid4().hex[:8]}"
+
+    # 2. 瀹夊叏鎻愬彇绠楀瓙鍒楄〃
+    raw_ops = (dag.get("operators", []) if is_dict else getattr(dag, "operators", []))
+
+    # 3. 鏍囧噯鍖栨竻娲楃畻瀛?    normalized_ops = []
+    for op in raw_ops:
+        op_dict = op if isinstance(op, dict) else op.__dict__ if hasattr(op, "__dict__") else {}
+
+        n_op = {
+            "id": op_dict.get("id") or f"op_{uuid.uuid4().hex[:6]}",
+            "name": op_dict.get("name") or op_dict.get("type", "UnknownOperator"),
+            "description": op_dict.get("description", ""),
+            "params": op_dict.get("params") or {},
+            "source_file": op_dict.get("source_file", ""),
+            "output_alias": op_dict.get("output_alias", "df")
+        }
+        # 鍏抽敭淇锛歰p 绾?input_from 娉ㄥ叆 params.depends_on鈥斺€斿惁鍒?Merge/Diff/
+        # Reconcile 鍙兘"鍙栨渶鍚庝袱涓彉閲?鐚滆緭鍏ワ紝鎺ョ嚎椤哄簭涓€涔卞氨寮犲啝鏉庢埓
+        _inp = op_dict.get("input_from") or op_dict.get("depends_on") or []
+        if isinstance(_inp, str):
+            _inp = [_inp]
+        if _inp and isinstance(n_op["params"], dict) \
+                and "depends_on" not in n_op["params"]:
+            n_op["params"]["depends_on"] = _inp
+        normalized_ops.append(n_op)
+
+    # 4. 鎻愬彇鎵ц椤哄簭
+    order = []
+    if not is_dict and hasattr(dag, "get_execution_order") and callable(dag.get_execution_order):
+        try:
+            order = dag.get_execution_order()
+        except Exception:
+            pass
+    if not order:
+        order = [op["id"] for op in normalized_ops]
+
+    op_map = {op["id"]: op for op in normalized_ops}
+
+    # 5. 浠ｇ爜鎷艰锛堝甫鏁版嵁娴佽拷韪級
+    code_lines = [
+        "import pandas as pd", "import json", "import os", "import sys",
+        "try:",
+        "    sys.stdout.reconfigure(encoding='utf-8', errors='replace')",
+        "    sys.stderr.reconfigure(encoding='utf-8', errors='replace')",
+        "except Exception:",
+        "    pass", "",
+        "os.makedirs('outputs', exist_ok=True)",
+        "",
+        "# === 鏂囦欢杩借釜锛氭寜搴忓垎閰?inputs 鐩綍涓殑鏂囦欢 ===",
+        "_inputs_dir = os.path.join(os.path.dirname(__file__), 'inputs')",
+        "_used_files = []",
+        "",
+        "def _load_any_document(path):",
+        "    # 鏂囨。 鈫?DataFrame锛歞ocx/pdf 琛ㄦ牸 鈫?绾枃鏈钀借〃锛堝簱缂哄け鏃舵竻鏅板憡璀︼級",
+        "    import os as _os",
+        "    ext = _os.path.splitext(path)[1].lower()",
+        "    tables, text = [], ''",
+        "    try:",
+        "        if ext == '.docx':",
+        "            from docx import Document as _D",
+        "            _d = _D(path)",
+        "            text = '\\n'.join(p.text for p in _d.paragraphs if p.text.strip())",
+        "            for _t in _d.tables:",
+        "                _rows = [[c.text.strip() for c in r.cells] for r in _t.rows]",
+        "                if len(_rows) > 1:",
+        "                    tables.append(pd.DataFrame(_rows[1:], columns=[h or '鍒?d' % (i+1) for i, h in enumerate(_rows[0])]))",
+        "        elif ext == '.pdf':",
+        "            try:",
+        "                import pdfplumber",
+        "                with pdfplumber.open(path) as _pdf:",
+        "                    for _pg in _pdf.pages:",
+        "                        text += (_pg.extract_text() or '') + '\\n'",
+        "                        for _raw in (_pg.extract_tables() or []):",
+        "                            _rows = [[('' if c is None else str(c).strip()) for c in r] for r in _raw if r]",
+        "                            _rows = [r for r in _rows if any(r)]",
+        "                            if len(_rows) > 1:",
+        "                                tables.append(pd.DataFrame(_rows[1:], columns=[h or '鍒?d' % (i+1) for i, h in enumerate(_rows[0])]))",
+        "            except Exception as _e:",
+        "                print('[Load] PDF 瑙ｆ瀽鍛婅: ' + str(_e))",
+        "        elif ext in ('.md', '.txt'):",
+        "            text = open(path, 'rb').read().decode('utf-8', errors='replace')",
+        "    except Exception as _e:",
+        "        print('[Load] 鏂囨。瑙ｆ瀽鍛婅: ' + str(_e))",
+        "    if tables:",
+        "        print('[Load] 鏂囨。 ' + _os.path.basename(path) + ' 鈫?' + str(len(tables)) + ' 涓〃鏍硷紝鍙栫 1 涓?)",
+        "        return tables[0]",
+        "    if text.strip():",
+        "        print('[Load] 鏂囨。 ' + _os.path.basename(path) + ' 鏃犺〃鏍硷紝杞负娈佃惤琛?)",
+        "        return pd.DataFrame({'娈佃惤': [l for l in text.splitlines() if l.strip()]})",
+        "    print('[Load] 鈿?鏂囨。鏈彁鍙栧埌鍐呭: ' + _os.path.basename(path))",
+        "    return pd.DataFrame()",
+        "",
+        "def _is_meaningless_key(col, df=None):",
+        "    # 搴忓彿/琛屽彿绛夋棤涓氬姟鍚箟鐨勯敭锛岀姝綔涓鸿繛鎺ラ敭锛堥槻姝?鎸夎鍙峰璐?锛?,
+        "    n = str(col).replace(' ', '').lower()",
+        "    if n in ('搴忓彿', '缂栧彿', '琛屽彿', 'no', 'no.', 'id', 'index', 'idx', '#', '椤哄簭鍙?, '鎺掑悕', 'code'):",
+        "        return True",
+        "    if df is not None and col in df.columns:",
+        "        try:",
+        "            v = pd.to_numeric(df[col], errors='coerce').dropna()",
+        "            if len(v) >= 3 and v.nunique() == len(v):",
+        "                d = v.sort_values().diff().dropna().unique()",
+        "                if len(d) == 1 and d[0] == 1:",
+        "                    return True",
+        "        except Exception:",
+        "            pass",
+        "    return False",
+        "",
+        "def _reconcile_lite(dfA, dfB, dw=3, tol=0.01):",
+        "    # 杞婚噺閫愮瑪瀵硅处锛氭柟鍚戞劅鐭ュ噣棰濓紙搴忔椂璐?鍊?璐?/ 娴佹按 鏀跺叆-鏀嚭锛屼簰涓洪暅鍍忥級",
+        "    # L1 閲戦绮剧‘(卤tol)+鍚屾棩 鈫?L2 閲戦绮剧‘+鏃ユ湡绐楀彛卤dw锛涜緭鍑哄榻愮姸鎬?,
+        "    def _pick(df, kws):",
+        "        for c in df.columns:",
+        "            if any(k in str(c) for k in kws): return c",
+        "        return None",
+        "    def _kind(df):",
+        "        cs = ' '.join(str(c) for c in df.columns)",
+        "        if ('鍑瘉' in cs) or ('绉戠洰' in cs): return 'journal'",
+        "        if ('瀵规柟' in cs) or ('璐﹀彿' in cs) or ('浣欓' in cs): return 'bank'",
+        "        return 'journal'",
+        "    def _net(df, kind):",
+        "        if kind == 'journal':",
+        "            inc = _pick(df, ['鍊熸柟閲戦', '鍊熸柟鍙戠敓棰?, '鍊熸柟'])",
+        "            exp = _pick(df, ['璐锋柟閲戦', '璐锋柟鍙戠敓棰?, '璐锋柟'])",
+        "        else:",
+        "            inc = _pick(df, ['鏀跺叆', '璐锋柟锛堟敹鍏ワ級', '璐锋柟(鏀跺叆)', '璐锋柟閲戦'])",
+        "            exp = _pick(df, ['鏀嚭', '鍊熸柟锛堟敮鍙栵級', '鍊熸柟(鏀彇)', '鍊熸柟閲戦'])",
+        "        if inc is not None or exp is not None:",
+        "            a = pd.to_numeric(df[inc], errors='coerce').fillna(0) if inc else 0",
+        "            b = pd.to_numeric(df[exp], errors='coerce').fillna(0) if exp else 0",
+        "            return a - b",
+        "        amt = _pick(df, ['浜ゆ槗閲戦', '閲戦', '鍙戠敓棰?])",
+        "        if amt is not None: return pd.to_numeric(df[amt], errors='coerce').fillna(0)",
+        "        nums = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and not _is_meaningless_key(c, df)]",
+        "        return pd.to_numeric(df[nums[0]], errors='coerce').fillna(0) if nums else pd.Series([0] * len(df))",
+        "    ka, kb = _kind(dfA), _kind(dfB)",
+        "    da = _pick(dfA, ['鏃ユ湡', '浜ゆ槗鏃ユ湡', '璁拌处鏃ユ湡', '涓氬姟鏃ユ湡'])",
+        "    db = _pick(dfB, ['鏃ユ湡', '浜ゆ槗鏃ユ湡', '璁拌处鏃ユ湡', '涓氬姟鏃ユ湡'])",
+        "    A = pd.DataFrame({'d': pd.to_datetime(dfA[da], errors='coerce') if da else pd.NaT, 'c': (_net(dfA, ka) * 100).round().astype('int64')})",
+        "    B = pd.DataFrame({'d': pd.to_datetime(dfB[db], errors='coerce') if db else pd.NaT, 'c': (_net(dfB, kb) * 100).round().astype('int64')})",
+        "    a_match, b_match = {}, {}",
+        "    tol_c = max(1, int(round(tol * 100)))",
+        "    pool = {}",
+        "    for j, r in B.iterrows():",
+        "        key = (r['d'].date().isoformat() if pd.notna(r['d']) else 'NaT', int(r['c']))",
+        "        pool.setdefault(key, []).append(j)",
+        "    for i, r in A.iterrows():",
+        "        key = (r['d'].date().isoformat() if pd.notna(r['d']) else 'NaT', int(r['c']))",
+        "        hit = None",
+        "        for delta in range(-tol_c, tol_c + 1):",
+        "            q = pool.get((key[0], key[1] + delta))",
+        "            if q: hit = q.pop(0); break",
+        "        if hit is not None:",
+        "            a_match[i] = (hit, 0, 'L1'); b_match[hit] = i",
+        "    bc = {}",
+        "    for j, r in B.iterrows():",
+        "        if j not in b_match: bc.setdefault(int(r['c']), []).append(j)",
+        "    for i, r in A.iterrows():",
+        "        if i in a_match: continue",
+        "        best, bd = None, dw + 1",
+        "        for delta in range(-tol_c, tol_c + 1):",
+        "            for j in bc.get(int(r['c']) + delta, []):",
+        "                if j in b_match: continue",
+        "                dd = abs((r['d'] - B.loc[j, 'd']).days) if pd.notna(r['d']) and pd.notna(B.loc[j, 'd']) else dw",
+        "                if dd <= dw and dd < bd: best, bd = j, dd",
+        "        if best is not None:",
+        "            a_match[i] = (best, bd, 'L2'); b_match[best] = i",
+        "    out = dfA.copy()",
+        "    out['瀵硅处鐘舵€?] = ['宸叉牳瀵? if i in a_match else '浠呭乏琛ㄦ湁' for i in range(len(dfA))]",
+        "    out['瀵硅处灞傜骇'] = [a_match[i][2] if i in a_match else '-' for i in range(len(dfA))]",
+        "    out['鏃ユ湡宸?澶?'] = [a_match[i][1] if i in a_match else None for i in range(len(dfA))]",
+        "    out['瀵规柟琛屽彿'] = [int(a_match[i][0]) if i in a_match else None for i in range(len(dfA))]",
+        "    un_b = dfB.loc[[j for j in dfB.index if j not in b_match]].copy()",
+        "    print('[Reconcile] 宸﹁〃绫诲瀷=' + ka + ' 鍙宠〃绫诲瀷=' + kb + '锛堟柟鍚戦暅鍍忓凡褰掍竴锛?)",
+        "    print('[Reconcile] 宸叉牳瀵?' + str(len(a_match)) + ' 浠呭乏=' + str(len(dfA) - len(a_match)) + ' 浠呭彸=' + str(len(un_b)) + '锛堝宸?卤' + str(tol) + ' 鍏冿紝绐楀彛 卤' + str(dw) + ' 澶╋級')",
+        "    if len(un_b) > 0:",
+        "        try:",
+        "            un_b.to_csv(os.path.join('outputs', 'reconcile_浠呭彸琛ㄦ湁.csv'), index=True, encoding='utf-8-sig')",
+        "        except Exception: pass",
+        "    return out",
+        "",
+        "# === DAG 鎵ц浠ｇ爜 ===",
+        f"# 鐩爣: {objective}",
+        f"# 鍘熷鎰忓浘: {raw_intent}",
+        f"# 绠楀瓙鏁? {len(order)}",
+        "", ""
+    ]
+
+    # 鏁版嵁娴佽拷韪細output_alias 鈫?瀵瑰簲鐨?Python 鍙橀噺鍚?    alias_vars = {}
+    last_df_var = None
+
+    for op_id in order:
+        op = op_map.get(op_id)
+        if not op: continue
+        code_lines.append(f"# Step: {op['name']} - {op['description']}")
+
+        op_name = op['name']
+        op_alias = op.get('output_alias', f'df_{op_id}')
+        params = op.get('params', {}) or {}
+        # 鍏煎 Dify 宓屽鏍煎紡: {"parameters": {...}} 鈫?瑙ｅ寘
+        if isinstance(params, dict) and "parameters" in params and isinstance(params["parameters"], dict):
+            params = params["parameters"]
+
+        if op_name == "Load":
+            source = op.get('source_file') or "input.xlsx"
+            var_name = f"df_{op_alias}" if not op_alias.startswith('df_') else op_alias
+            code_lines.extend([
+                f"# 鏅鸿兘鏂囦欢鍖归厤锛堜紭鍏堟寜 DAG 鎸囧畾鐨勭湡瀹炴枃浠跺悕绮剧‘鍖归厤锛岀姝贡搴忓垎閰嶏級",
+                f"_dag_file = '{source}'",
+                f"_all_inputs = os.listdir(_inputs_dir) if os.path.exists(_inputs_dir) else []",
+                f"_LOAD_EXTS = ('.xlsx','.xls','.csv','.docx','.doc','.pdf','.md','.txt')",
+                f"if _dag_file in _all_inputs and _dag_file not in _used_files:",
+                f"    _pick = _dag_file",
+                f"    print('[Load] 鎸夊悕鍖归厤: ' + _pick)",
+                f"else:",
+                f"    _avail = [f for f in _all_inputs if f not in _used_files and f.lower().endswith(_LOAD_EXTS)]",
+                f"    _pick = _avail[0] if _avail else _dag_file",
+                f"    if _avail and _pick != _dag_file:",
+                f"        print('[Load] 鈿?鎸囧畾鏂囦欢 {{}} 涓嶅瓨鍦紝鍥為€€鍒?{{}}'.format(_dag_file, _pick))",
+                f"source_file = os.path.join(_inputs_dir, _pick) if os.path.exists(os.path.join(_inputs_dir, _pick)) else 'data/readonly/' + _dag_file",
+                f"_used_files.append(_pick)",
+                f"if not os.path.exists(source_file):",
+                f"    print('[Load] 璺宠繃: 鏂囦欢涓嶅瓨鍦?' + source_file)",
+                f"    {var_name} = pd.DataFrame()",
+                f"elif source_file.lower().endswith(('.docx','.doc','.pdf','.md','.txt')):",
+                f"    {var_name} = _load_any_document(source_file)",
+                f"else:",
+                f"    # 鑷姩妫€娴嬭〃澶磋",
+                f"    {var_name} = None",
+                f"    _best_score = -1",
+                f"    _best_hr = 0",
+                f"    for _hr in range(6):",
+                f"        try:",
+                f"            _tmp = pd.read_excel(source_file, header=_hr, nrows=0)",
+                f"            _cols = list(_tmp.columns)",
+                f"            _score = 0",
+                f"            for _c in _cols:",
+                f"                _cs = str(_c)",
+                f"                if _cs.startswith('Unnamed'): _score -= 1",
+                f"                elif len(_cs) > 2 and not any('\\u4e00' <= ch <= '\\u9fff' for ch in _cs): _score -= 1",
+                f"                else: _score += 1",
+                f"            # 鍔犲垎锛氬垪鏁板鐨勮鏇村彲鑳芥槸鐪熸鐨勮〃澶?,
+                f"            _score += len(_cols) * 0.5",
+                f"            if _score > _best_score:",
+                f"                _best_score = _score",
+                f"                _best_hr = _hr",
+                f"        except Exception:",
+                f"            continue",
+                f"    if _best_score > 0:",
+                f"        {var_name} = pd.read_excel(source_file, header=_best_hr)",
+                f"        print('[Load] ' + os.path.basename(source_file) + ' -> {var_name}, h=' + str(_best_hr) + ', rows=' + str(len({var_name})) + ', cols=' + str(list({var_name}.columns)))",
+                f"    else:",
+                f"        {var_name} = pd.read_excel(source_file, header=None)",
+                f"        {var_name}.columns = [f'Col_{{i}}' for i in range(len({var_name}.columns))]",
+                f"        print('[Load] ' + os.path.basename(source_file) + ' -> {var_name} (鏃犺〃澶?, rows=' + str(len({var_name})))",
+            ])
+            alias_vars[op_alias] = var_name
+            last_df_var = var_name
+
+        elif op_name == "ColumnFilter":
+            columns = params.get("columns", [])
+            dep_ids = params.get("depends_on", [])
+            src_var = last_df_var
+            for dep_id in dep_ids:
+                dep_op = op_map.get(dep_id)
+                if dep_op:
+                    src_var = alias_vars.get(dep_op.get('output_alias'), last_df_var)
+                    break
+            src_var = src_var or 'df'
+            cols_safe = [_sanitize_code_param(str(c), max_len=200) for c in columns]
+            code_lines.extend([
+                f"if '{src_var}' in dir() and {src_var} is not None:",
+                f"    {op_alias} = {src_var}[{cols_safe}].copy()",
+                f"    print('[ColumnFilter] cols=' + str({cols_safe}) + ', rows=' + str(len({op_alias})))",
+                f"else:",
+                f"    {op_alias} = pd.DataFrame()",
+            ])
+            alias_vars[op_alias] = op_alias
+            last_df_var = op_alias
+
+        elif op_name == "RegexFilter":
+            col_raw = params.get("column", "")
+            pattern_raw = params.get("pattern", "")
+            dep_ids = params.get("depends_on", [])
+            src_var = last_df_var
+            for dep_id in dep_ids:
+                dep_op = op_map.get(dep_id)
+                if dep_op:
+                    src_var = alias_vars.get(dep_op.get('output_alias'), last_df_var)
+                    break
+            src_var = src_var or 'df'
+            col_safe = _sanitize_code_param(col_raw, max_len=200)
+            pattern_safe = _sanitize_code_param(pattern_raw, max_len=1000)
+            code_lines.extend([
+                f"if '{src_var}' in dir() and {src_var} is not None and '{col_safe}' in {src_var}.columns:",
+                f"    {op_alias} = {src_var}[{src_var}['{col_safe}'].astype(str).str.contains('{pattern_safe}', na=False)]",
+                f"    print(f'[RegexFilter] pattern={pattern_safe}, rows={{len({op_alias})}}')",
+                f"else:",
+                f"    {op_alias} = {src_var}.copy() if '{src_var}' in dir() and {src_var} is not None else pd.DataFrame()",
+            ])
+            alias_vars[op_alias] = op_alias
+            last_df_var = op_alias
+
+        elif op_name == "NoiseFilter":
+            # 鍣煶杩囨护鍣細浠庢寚瀹氬垪涓帓闄ゅ尮閰嶅櫔闊冲叧閿瘝鐨勮
+            # params.columns: 瑕佽繃婊ょ殑鍒楀悕鍒楄〃
+            # params.noise_patterns: 鍣煶鍏抽敭璇嶅垪琛紙濡?['鍒╂伅', '鎵嬬画璐?, '鍐叉']锛?            columns = params.get("columns", [])
+            if isinstance(columns, str):
+                columns = [columns]
+            noise_patterns = params.get("noise_patterns", [])
+            if isinstance(noise_patterns, str):
+                noise_patterns = [noise_patterns]
+            dep_ids = params.get("depends_on", [])
+            src_var = last_df_var
+            for dep_id in dep_ids:
+                dep_op = op_map.get(dep_id)
+                if dep_op:
+                    src_var = alias_vars.get(dep_op.get('output_alias'), last_df_var)
+                    break
+            src_var = src_var or 'df'
+            if columns and noise_patterns:
+                cols_safe = [_sanitize_code_param(str(c), max_len=200) for c in columns]
+                patterns_safe = [_sanitize_code_param(str(p), max_len=200) for p in noise_patterns]
+                patterns_repr = repr(noise_patterns)
+                code_lines.extend([
+                    f"if '{src_var}' in dir() and {src_var} is not None and not {src_var}.empty:",
+                    f"    _mask = pd.Series(False, index={src_var}.index)",
+                    f"    _cols_exist = [c for c in {cols_safe} if c in {src_var}.columns]",
+                    f"    if _cols_exist:",
+                    f"        for _col in _cols_exist:",
+                    f"            for _pat in {patterns_safe}:",
+                    f"                _mask = _mask | {src_var}[_col].astype(str).str.contains(_pat, na=False)",
+                    f"    {op_alias} = {src_var}[~_mask].copy()",
+                    f"    _removed = len({src_var}) - len({op_alias})",
+                    f"    print(f'[NoiseFilter] cols={cols_safe}, patterns={patterns_repr}, 杩囨护 {{_removed}} 琛? 淇濈暀 {{len({op_alias})}} 琛?)",
+                    f"else:",
+                    f"    {op_alias} = {src_var}.copy() if '{src_var}' in dir() and {src_var} is not None else pd.DataFrame()",
+                    f"    print('[NoiseFilter] 婧愭暟鎹负绌猴紝鐩撮€?)",
+                ])
+            else:
+                # 鏃犺繃婊ゆ潯浠?鈫?鐩撮€?                code_lines.extend([
+                    f"{op_alias} = {src_var}.copy() if '{src_var}' in dir() and {src_var} is not None else pd.DataFrame()",
+                    f"print('[NoiseFilter] 鏃犺繃婊ゆ潯浠讹紝鏁版嵁鐩撮€? rows=' + str(len({op_alias})))",
+                ])
+            alias_vars[op_alias] = op_alias
+            last_df_var = op_alias
+
+        elif op_name == "GroupBy":
+            by_cols = params.get("by", params.get("columns", params.get("group_by_columns", [])))
+            aggs = params.get("aggregations", {})
+            # 淇濇姢锛氬鏋?aggs 涓虹┖锛岃烦杩囪仛鍚?            if not aggs:
+                code_lines.append(f"# [GroupBy] 璺宠繃锛歛ggregations 涓虹┖")
+                code_lines.append(f"{op_alias} = {last_df_var or 'df'}")
+                alias_vars[op_alias] = op_alias
+                last_df_var = op_alias
+                code_lines.append("")
+                continue
+            # 鍘婚噸锛氬鏋滄煇鍒楀悓鏃跺湪 by 鍜?agg 閲岋紝浠?by 涓Щ闄わ紙閬垮厤 reset_index 鍒楀悕鍐茬獊锛?            agg_keys = set(aggs.keys()) if isinstance(aggs, dict) else set()
+            by_cols = [c for c in by_cols if c not in agg_keys]
+            dep_ids = params.get("depends_on", [])
+            src_var = last_df_var
+            for dep_id in dep_ids:
+                dep_op = op_map.get(dep_id)
+                if dep_op:
+                    src_var = alias_vars.get(dep_op.get('output_alias'), last_df_var)
+                    break
+            src_var = src_var or 'df'
+            if by_cols:
+                by_safe = [_sanitize_code_param(str(c), max_len=200) for c in by_cols]
+                agg_auto = isinstance(aggs, dict) and list(aggs.keys()) == ["auto"]
+                aggs_render = "{c: 'sum' for c in _num_cols[:3]}" if agg_auto else repr(aggs)
+                code_lines.extend([
+                    f"if '{src_var}' in dir() and {src_var} is not None and not {src_var}.empty:",
+                    f"    if {by_safe} == ['auto']:",
+                    f"        _objs = [c for c in {src_var}.columns if {src_var}[c].dtype == object and not _is_meaningless_key(c, {src_var})]",
+                    f"        print('[GroupBy] 鑷姩閫夋嫨鍒嗙粍鍒? ' + str(_objs[:1]))",
+                    f"    _by_valid = _objs[:1] if {by_safe} == ['auto'] else [c for c in {by_safe} if c in {src_var}.columns]",
+                    f"    _num_cols = [c for c in {src_var}.columns if pd.api.types.is_numeric_dtype({src_var}[c]) and not _is_meaningless_key(c, {src_var})]",
+                    f"    _by_missing = [c for c in {by_safe} if c not in {src_var}.columns]",
+                    f"    if _by_missing:",
+                    f"        print('[GroupBy] 璀﹀憡锛氫互涓嬪垪涓嶅瓨鍦紝宸茶嚜鍔ㄨ烦杩? ' + str(_by_missing))",
+                    f"    if _by_valid:",
+                    f"        {op_alias} = {src_var}.groupby(_by_valid).agg({aggs_render}).reset_index()",
+                    f"        print('[GroupBy] by=' + str(_by_valid) + ', rows=' + str(len({op_alias})))",
+                    f"    else:",
+                    f"        print('[GroupBy] 閿欒锛氭病鏈夋湁鏁堢殑鍒嗙粍鍒楋紒鍙敤鍒? ' + str(list({src_var}.columns)))",
+                    f"        {op_alias} = pd.DataFrame()",
+                    f"else:",
+                    f"    {op_alias} = pd.DataFrame()",
+                ])
+            else:
+                # by_cols 鍏ㄩ儴鍦?agg 閲岋紝鐩存帴鑱氬悎
+                code_lines.extend([
+                    f"if '{src_var}' in dir() and {src_var} is not None:",
+                    f"    {op_alias} = pd.DataFrame([{src_var}.agg({aggs})])",
+                    f"    print('[GroupBy] agg-only, rows=' + str(len({op_alias})))",
+                    f"else:",
+                    f"    {op_alias} = pd.DataFrame()",
+                ])
+            alias_vars[op_alias] = op_alias
+            last_df_var = op_alias
+
+        elif op_name == "Merge":
+            on_cols = params.get("on", [])
+            if isinstance(on_cols, str):
+                on_cols = [on_cols]
+            how = params.get("how", "outer")
+            lo = params.get("left_on", []) or []
+            ro = params.get("right_on", []) or []
+            lo_list = lo if isinstance(lo, list) else [lo]
+            ro_list = ro if isinstance(ro, list) else [ro]
+            date_window = params.get("date_window_days")
+            dep_ids = params.get("depends_on", [])
+            src_vars = []
+            for dep_id in dep_ids:
+                dep_op = op_map.get(dep_id)
+                if dep_op:
+                    src_vars.append(alias_vars.get(dep_op.get('output_alias'), f'df_{dep_id}'))
+            if len(src_vars) < 2:
+                all_vars = list(alias_vars.values())
+                src_vars = all_vars[-2:] if len(all_vars) >= 2 else (src_vars + ['df'])
+            left_var, right_var = (src_vars[0], src_vars[1]) if len(src_vars) >= 2 else ('df', 'df')
+            # v3.1: LLM 鍙兘鐢熸垚鐩稿悓涓婃父锛堝 Merge input_from ['op_4','op_4']锛夛紝
+            # 瀵艰嚧涓よ竟鍙橀噺鐩稿悓 鈫?鑷氦銆傛娴嬪苟鍥為€€鍒颁笉鍚屾暟鎹簮銆?            if left_var == right_var:
+                all_aliases = list(alias_vars.values())
+                alt = None
+                for v in all_aliases:
+                    if v != left_var:
+                        alt = v
+                        break
+                if alt:
+                    right_var = alt
+                    print(f"[浠ｇ爜鐢熸垚] Merge 涓よ竟鍚屾簮({left_var})锛岃嚜鍔ㄥ垏鎹㈠埌 {alt} 浣滀负鍙宠〃")
+            how_safe = how if how in ("inner", "left", "right", "outer") else "outer"
+            dw_repr = repr(int(date_window)) if isinstance(date_window, (int, float)) else "None"
+            code_lines.extend([
+                f"if '{left_var}' in dir() and '{right_var}' in dir() and not {left_var}.empty and not {right_var}.empty:",
+                f"    _lo, _ro, _on, _dw = {lo_list}, {ro_list}, {on_cols}, {dw_repr}",
+                f"    _on = [c for c in _on if c != 'auto']",
+                f"    _lo_v = [c for c in _lo if c in {left_var}.columns]",
+                f"    _ro_v = [c for c in _ro if c in {right_var}.columns]",
+                f"    _miss_keys = [c for c in _lo if c not in {left_var}.columns] + [c for c in _ro if c not in {right_var}.columns]",
+                f"    if _miss_keys:",
+                f"        print('[Merge] 鈿?鎸囧畾杩炴帴閿湪鏁版嵁涓笉瀛樺湪: ' + str(_miss_keys))",
+                f"        print('[Merge] 宸﹁〃鍒? ' + str(list({left_var}.columns)) + ' | 鍙宠〃鍒? ' + str(list({right_var}.columns)))",
+                f"    if _lo_v and len(_lo_v) == len(_ro_v) and _dw:",
+                f"        _dpr = [(a, b) for a, b in zip(_lo_v, _ro_v) if ('鏃ユ湡' in str(a) + str(b) or '鏃堕棿' in str(a) + str(b))]",
+                f"        _nd_l = [a for a, b in zip(_lo_v, _ro_v) if (a, b) not in _dpr]",
+                f"        _nd_r = [b for a, b in zip(_lo_v, _ro_v) if (a, b) not in _dpr]",
+                f"        if _nd_l:",
+                f"            _m = pd.merge({left_var}, {right_var}, left_on=_nd_l, right_on=_nd_r, how='inner', suffixes=('_L', '_R'))",
+                f"        else:",
+                f"            _m = {left_var}.assign(_xj=1).merge({right_var}.assign(_xj=1), on='_xj', suffixes=('_L', '_R')).drop(columns=['_xj'])",
+                f"            if len(_m) > 200000:",
+                f"                print('[Merge] 鈿?鏃ユ湡绐楀彛杩炴帴绗涘崱灏旂Н ' + str(len(_m)) + ' 琛岋紝鎴柇鑷?200000锛堣澧炲姞闈炴棩鏈熼敭锛?)",
+                f"                _m = _m.head(200000)",
+                f"        if _dpr:",
+                f"            _dl = _dpr[0][0] if _dpr[0][0] in _m.columns else _dpr[0][0] + '_L'",
+                f"            _dr = _dpr[0][1] if _dpr[0][1] in _m.columns else _dpr[0][1] + '_R'",
+                f"            {op_alias} = _m[(pd.to_datetime(_m[_dl], errors='coerce') - pd.to_datetime(_m[_dr], errors='coerce')).dt.days.abs() <= _dw].reset_index(drop=True)",
+                f"            print('[Merge] 鏃ユ湡绐楀彛卤' + str(_dw) + '澶?' + str(_dl) + ' vs ' + str(_dr) + '), rows=' + str(len({op_alias})))",
+                f"        else:",
+                f"            print('[Merge] 鈿?杩炴帴閿腑鏃犳棩鏈熷垪瀵癸紝date_window_days 琚拷鐣?)",
+                f"            {op_alias} = _m",
+                f"    elif _lo_v and len(_lo_v) == len(_ro_v):",
+                f"        {op_alias} = pd.merge({left_var}, {right_var}, left_on=_lo_v, right_on=_ro_v, how='{how_safe}')",
+                f"        print('[Merge] left_on/right_on=' + str(list(zip(_lo_v, _ro_v))) + ', rows=' + str(len({op_alias})))",
+                f"    else:",
+                f"        _common = [c for c in (_on or list({left_var}.columns)) if c in {left_var}.columns and c in {right_var}.columns and not _is_meaningless_key(c, {left_var})]",
+                f"        if _on and not _common:",
+                f"            print('[Merge] 鈿?鎸囧畾鐨?on 閿湪鍙屾柟涓嶅瓨鍦ㄦ垨鏃犳剰涔? ' + str(_on))",
+                f"        if not _common:",
+                f"            _common = [c for c in list({left_var}.columns) if c in {right_var}.columns and not _is_meaningless_key(c, {left_var})]",
+                f"            print('[Merge] 鍥為€€鍒板叕鍏辨湁鎰忎箟閿紙宸叉帓闄ゅ簭鍙?琛屽彿锛? ' + str(_common))",
+                f"        if _common:",
+                f"            {op_alias} = pd.merge({left_var}, {right_var}, on=_common, how='{how_safe}')",
+                f"            print('[Merge] on=' + str(_common) + ', rows=' + str(len({op_alias})))",
+                f"        else:",
+                f"            print('[Merge] 鉂?鏃犳湁鎰忎箟鍏叡閿紙宸叉帓闄ゅ簭鍙?琛屽彿锛夛紝鎷掔粷鎸夎鍙峰悎骞讹紒宸﹀垪: ' + str(list({left_var}.columns)) + ' | 鍙冲垪: ' + str(list({right_var}.columns)))",
+                f"            {op_alias} = pd.DataFrame()",
+                f"else:",
+                f"    print('[Merge] 杈撳叆鏁版嵁涓虹┖鎴栦笉瀛樺湪')",
+                f"    {op_alias} = pd.DataFrame()",
+            ])
+            alias_vars[op_alias] = op_alias
+            last_df_var = op_alias
+
+        elif op_name == "Sort":
+            by_cols = params.get("by", params.get("columns", []))
+            ascending = params.get("ascending", True)
+            dep_ids = params.get("depends_on", [])
+            src_var = last_df_var
+            for dep_id in dep_ids:
+                dep_op = op_map.get(dep_id)
+                if dep_op:
+                    src_var = alias_vars.get(dep_op.get('output_alias'), last_df_var)
+                    break
+            src_var = src_var or 'df'
+            by_safe = [_sanitize_code_param(str(c), max_len=200) for c in by_cols]
+            code_lines.extend([
+                f"if '{src_var}' in dir() and {src_var} is not None and not {src_var}.empty:",
+                f"    _nums_auto = [c for c in {src_var}.columns if pd.api.types.is_numeric_dtype({src_var}[c]) and not _is_meaningless_key(c, {src_var})]",
+                f"    _sort_valid = (_nums_auto[:1] if {by_safe} == ['auto'] else [c for c in {by_safe} if c in {src_var}.columns])",
+                f"    if {by_safe} == ['auto'] and _sort_valid:",
+                f"        print('[Sort] 鑷姩閫夋嫨鎺掑簭鍒? ' + str(_sort_valid))",
+                f"    _sort_missing = [c for c in {by_safe} if c not in {src_var}.columns]",
+                f"    if _sort_missing:",
+                f"        print('[Sort] 璀﹀憡锛氫互涓嬪垪涓嶅瓨鍦紝宸茶嚜鍔ㄨ烦杩? ' + str(_sort_missing))",
+                f"    if _sort_valid:",
+                f"        {op_alias} = {src_var}.sort_values(by=_sort_valid, ascending={ascending})",
+                f"        print('[Sort] by=' + str(_sort_valid) + ', asc=' + str({ascending}) + ', rows=' + str(len({op_alias})))",
+                f"    else:",
+                f"        print('[Sort] 閿欒锛氭病鏈夋湁鏁堟帓搴忓垪锛佸彲鐢ㄥ垪: ' + str(list({src_var}.columns)))",
+                f"        {op_alias} = {src_var}.copy()",
+                f"else:",
+                f"    {op_alias} = pd.DataFrame()",
+            ])
+            alias_vars[op_alias] = op_alias
+            last_df_var = op_alias
+        elif op_name == "ConditionCheck":
+            col_raw = params.get("column", "")
+            operator_raw = params.get("operator", ">")
+            value_raw = params.get("value", 0)
+            col_safe = _sanitize_code_param(col_raw, max_len=200)
+            operator_safe = operator_raw if operator_raw in _VALID_COMPARISON_OPS else "=="
+            try:
+                value_safe = float(value_raw)
+            except (ValueError, TypeError):
+                value_safe = 0.0
+            dep_ids = params.get("depends_on", [])
+            src_var = last_df_var
+            for dep_id in dep_ids:
+                dep_op = op_map.get(dep_id)
+                if dep_op:
+                    src_var = alias_vars.get(dep_op.get('output_alias'), last_df_var)
+                    break
+            src_var = src_var or 'df'
+            code_lines.extend([
+                f"if '{src_var}' in dir() and {src_var} is not None and '{col_safe}' in {src_var}.columns:",
+                f"    mask = {src_var}['{col_safe}'] {operator_safe} {value_safe}",
+                f"    {op_alias}_passed = {src_var}[mask]",
+                f"    {op_alias}_failed = {src_var}[~mask]",
+            ])
+
+        elif op_name == "Export":
+            output_file = params.get("output_file", params.get("output_file_path", "analysis_result.csv"))
+            dep_ids = params.get("depends_on", [])
+            src_var = last_df_var
+            for dep_id in dep_ids:
+                dep_op = op_map.get(dep_id)
+                if dep_op:
+                    src_var = alias_vars.get(dep_op.get('output_alias'), last_df_var)
+                    break
+            src_var = src_var or 'df'
+            code_lines.extend([
+                f"if '{src_var}' in dir() and {src_var} is not None and not {src_var}.empty:",
+                f"    {src_var}.to_csv(os.path.join('outputs', '{output_file}'), index=False, encoding='utf-8-sig')",
+                f"    print('[Export] ' + '{output_file}' + ', rows=' + str(len({src_var})))",
+                f"else:",
+                f"    print('[Export] 璺宠繃锛氭暟鎹负绌猴紝涓嶅鍑虹┖鏂囦欢')",
+            ])
+
+        elif op_name == "Aggregate":
+            aggs = params.get("aggregations", {})
+            # 鏍煎紡1: {"columns": ["col"], "aggregation": "sum"}锛堟墎骞筹級
+            if not aggs and params.get("columns"):
+                flat_cols = params.get("columns", [])
+                flat_func = params.get("aggregation", "sum")
+                if isinstance(flat_cols, list) and flat_cols:
+                    aggs = {f"{c}_{flat_func}": {"column": c, "agg_func": flat_func} for c in flat_cols}
+            # 鏍煎紡2: {"columns": ["col"], "aggregations": ["sum"]}锛堝垪琛級
+            if isinstance(aggs, list) and params.get("columns"):
+                cols = params.get("columns", [])
+                func = aggs[0] if aggs else "sum"
+                if isinstance(cols, list) and cols:
+                    aggs = {f"{c}_{func}": {"column": c, "agg_func": func} for c in cols}
+            if not aggs:
+                code_lines.append(f"# [Aggregate] 璺宠繃锛歛ggregations 涓虹┖")
+                code_lines.append(f"{op_alias} = {last_df_var or 'df'}")
+                alias_vars[op_alias] = op_alias
+                last_df_var = op_alias
+                code_lines.append("")
+                continue
+            dep_ids = params.get("depends_on", [])
+            src_var = last_df_var
+            for dep_id in dep_ids:
+                dep_op = op_map.get(dep_id)
+                if dep_op:
+                    src_var = alias_vars.get(dep_op.get('output_alias'), last_df_var)
+                    break
+            src_var = src_var or 'df'
+            # 杞崲 LLM 杈撳嚭鐨勫祵濂楁牸寮忎负鍏煎 pandas>=0.25 鐨勮娉?            # 杈撳叆: {"col_sum": {"column": "col", "agg_func": "sum"}}
+            # 杈撳嚭: pd.DataFrame({'col_sum': [df['col'].sum()], ...})
+            agg_items = []
+            for new_name, agg_spec in aggs.items():
+                col = agg_spec.get("column", "") if isinstance(agg_spec, dict) else new_name
+                func = agg_spec.get("agg_func", "sum") if isinstance(agg_spec, dict) else agg_spec
+                safe_col = repr(str(col))
+                safe_name = repr(str(new_name))
+                agg_items.append((new_name, col, func, safe_name, safe_col))
+            if agg_items:
+                group_by = params.get("group_by", [])
+                if group_by:
+                    # 鏈夊垎缁勫垪锛氱敤 groupby + named agg锛堢幇浠?pandas 璇硶锛?                    gp_safe = [_sanitize_code_param(str(c), max_len=200) for c in group_by]
+                    code_lines.extend([
+                        f"if '{src_var}' in dir() and {src_var} is not None and not {src_var}.empty:",
+                        f"    _gp_valid = [c for c in {gp_safe} if c in {src_var}.columns]",
+                        f"    if _gp_valid:",
+                    ])
+                    gp_parts = [f"{repr(n)}: (pd.to_numeric({src_var}[{repr(c)}], errors='coerce'), '{fn}')" for n, c, fn, _, _ in agg_items]
+                    code_lines.append(
+                        f"        {op_alias} = {src_var}.groupby(_gp_valid).agg(**{{{', '.join(gp_parts)}}}).reset_index()"
+                    )
+                    code_lines.extend([
+                        f"    else:",
+                        f"        {op_alias} = pd.DataFrame()",
+                        f"else:",
+                        f"    {op_alias} = pd.DataFrame()",
+                    ])
+                else:
+                    # 鏃犲垎缁勶細鐢?pd.DataFrame 鏋勯€狅紙閬垮厤宓屽 renamer 涓嶅吋瀹癸級
+                    item_lines = [f"            {sn}: [pd.to_numeric({src_var}[{sc}], errors='coerce').{fn}()]" for _, _, fn, sn, sc in agg_items]
+                    code_lines.extend([
+                        f"if '{src_var}' in dir() and {src_var} is not None:",
+                        f"    {op_alias} = pd.DataFrame({{",
+                        ",\n".join(item_lines),
+                        f"    }})",
+                    ])
+            else:
+                code_lines.append(f"{op_alias} = {last_df_var or 'df'}")
+
+        elif op_name == "Diff":
+            dep_ids = params.get("depends_on", [])
+            src_vars = []
+            for dep_id in dep_ids:
+                dep_op = op_map.get(dep_id)
+                if dep_op:
+                    src_vars.append(alias_vars.get(dep_op.get('output_alias'), f'df_{dep_id}'))
+            if len(src_vars) < 2:
+                all_vars = list(alias_vars.values())
+                src_vars = all_vars[-2:] if len(all_vars) >= 2 else (src_vars + ['df', 'df'])
+            left_var, right_var = (src_vars[0], src_vars[1]) if len(src_vars) >= 2 else ('df', 'df')
+            # v3.1: 鍚?Merge锛孌iff 涓よ竟鍚屾簮鏃跺洖閫€鍒颁笉鍚屾暟鎹簮
+            if left_var == right_var:
+                all_aliases = list(alias_vars.values())
+                alt = None
+                for v in all_aliases:
+                    if v != left_var:
+                        alt = v
+                        break
+                if alt:
+                    right_var = alt
+            keys = params.get("keys", params.get("on", [])) or []
+            if isinstance(keys, str):
+                keys = [keys]
+            col_a = str(params.get("col_a", "auto"))
+            col_b = str(params.get("col_b", "auto"))
+            tol_abs = params.get("tolerance_abs")
+            tol_pct = params.get("tolerance_pct")
+            try:
+                tol_repr = repr(float(tol_abs)) if tol_abs is not None else "None"
+            except (ValueError, TypeError):
+                tol_repr = "None"
+            try:
+                pct_repr = repr(float(tol_pct)) if tol_pct is not None else "None"
+            except (ValueError, TypeError):
+                pct_repr = "None"
+            # 鎸変笟鍔￠敭 outer 瀵归綈锛坕ndicator 鏍囪浠呭乏/浠呭彸/鍙屾柟锛夛紝鎷掔粷鎸夎鍙锋瘮瀵?            # 淇锛歬eys 涓虹┖鏃朵篃鑳芥甯稿洖閫€锛沵erge 鍓嶇粺涓€鏃ユ湡绫诲瀷锛岄伩鍏?datetime vs object 鎶ラ敊
+            keys_repr = repr(list(keys))
+            code_lines.extend([
+                f"if '{left_var}' in dir() and '{right_var}' in dir():",
+                f"    _keys = {keys_repr}",
+                f"    _keys = [c for c in _keys if c in {left_var}.columns and c in {right_var}.columns and not _is_meaningless_key(c, {left_var})]",
+                f"    if not _keys:",
+                f"        _keys = [c for c in list({left_var}.columns) if c in {right_var}.columns and not _is_meaningless_key(c, {left_var})]",
+                f"        print('[Diff] 鏈寚瀹氭湁鏁堥敭锛屽洖閫€鍏叡鏈夋剰涔夐敭: ' + str(_keys))",
+                f"    if not _keys:",
+                f"        print('[Diff] 鉂?涓よ〃鏃犲叕鍏辨湁鎰忎箟閿紝鎷掔粷鎸夎鍙锋瘮瀵癸紒宸﹀垪: ' + str(list({left_var}.columns)) + ' | 鍙冲垪: ' + str(list({right_var}.columns)))",
+                f"        {op_alias} = pd.DataFrame()",
+                f"    else:",
+                f"        # 鏃ユ湡绫诲瀷褰掍竴鍖栵紝閬垮厤 merge 鏃?datetime 涓?object 鍐茬獊",
+                f"        _df_left = {left_var}.copy()",
+                f"        _df_right = {right_var}.copy()",
+                f"        for _k in _keys:",
+                f"            try:",
+                f"                _l_is_dt = pd.api.types.is_datetime64_any_dtype(_df_left[_k])",
+                f"                _r_is_dt = pd.api.types.is_datetime64_any_dtype(_df_right[_k])",
+                f"                if _l_is_dt or _r_is_dt:",
+                f"                    _df_left[_k] = pd.to_datetime(_df_left[_k], errors='coerce')",
+                f"                    _df_right[_k] = pd.to_datetime(_df_right[_k], errors='coerce')",
+                f"            except Exception as _e:",
+                f"                pass",
+                f"        try:",
+                f"            _m = pd.merge(_df_left, _df_right, on=_keys, how='outer', indicator=True, suffixes=('_A', '_B'))",
+                f"        except Exception as _e:",
+                f"            print('[Diff] merge 澶辫触锛堝彲鑳藉垪绫诲瀷涓嶄竴鑷达級: ' + str(_e))",
+                f"            {op_alias} = pd.DataFrame()",
+                f"        else:",
+                f"            _ca, _cb = {col_a!r}, {col_b!r}",
+                f"            if _ca == 'auto':",
+                f"                _na = [c for c in {left_var}.columns if pd.api.types.is_numeric_dtype({left_var}[c]) and not _is_meaningless_key(c, {left_var})]",
+                f"                _ca = _na[0] if _na else None",
+                f"            if _cb == 'auto':",
+                f"                _nb = [c for c in {right_var}.columns if pd.api.types.is_numeric_dtype({right_var}[c]) and not _is_meaningless_key(c, {right_var})]",
+                f"                _cb = _nb[0] if _nb else None",
+                f"            _ca2 = _ca if _ca in _m.columns else (str(_ca) + '_A' if str(_ca) + '_A' in _m.columns else None)",
+                f"            _cb2 = _cb if _cb in _m.columns else (str(_cb) + '_B' if str(_cb) + '_B' in _m.columns else None)",
+                f"            if _ca2 and _cb2:",
+                f"                _m['宸紓'] = pd.to_numeric(_m[_ca2], errors='coerce') - pd.to_numeric(_m[_cb2], errors='coerce')",
+                f"                _tol_abs, _tol_pct = {tol_repr}, {pct_repr}",
+                f"                if _tol_abs is not None:",
+                f"                    _m['宸紓瓒呴檺'] = _m['宸紓'].abs() > _tol_abs",
+                f"                    print('[Diff] 瀹瑰樊: 卤' + str(_tol_abs) + ' 鍏冿紙缁濆锛?)",
+                f"                elif _tol_pct is not None:",
+                f"                    _base = pd.to_numeric(_m[_cb2], errors='coerce').abs().clip(lower=0.01)",
+                f"                    _m['宸紓瓒呴檺'] = (_m['宸紓'].abs() / _base * 100) > _tol_pct",
+                f"                    print('[Diff] 瀹瑰樊: ' + str(_tol_pct) + '%锛堜粎姹囨€诲眰闈㈤€傜敤锛岄€愮瑪鏍稿璇风敤 tolerance_abs=0.01锛?)",
+                f"                else:",
+                f"                    _m['宸紓瓒呴檺'] = _m['宸紓'].abs() > 0.01",
+                f"                    print('[Diff] 鏈寚瀹氬宸紝榛樿 卤0.01 鍏冿紙绮剧‘鍒板垎锛?)",
+                f"            else:",
+                f"                print('[Diff] 鈿?鏈壘鍒板彲姣旀暟鍊煎垪: ' + str((_ca, _cb)))",
+                f"            _m['瀵归綈鐘舵€?] = _m['_merge'].map({{'both': '鍙屾柟閮芥湁', 'left_only': '浠呭乏琛ㄦ湁', 'right_only': '浠呭彸琛ㄦ湁'}})",
+                f"            {op_alias} = _m.drop(columns=['_merge'])",
+                f"            print('[Diff] 閿?' + str(_keys) + ', 浠呭乏=' + str(int(({op_alias}['瀵归綈鐘舵€?] == '浠呭乏琛ㄦ湁').sum())) + ', 浠呭彸=' + str(int(({op_alias}['瀵归綈鐘舵€?] == '浠呭彸琛ㄦ湁').sum())) + ', 鍙屾柟=' + str(int(({op_alias}['瀵归綈鐘舵€?] == '鍙屾柟閮芥湁').sum())))",
+                f"else:",
+                f"    {op_alias} = pd.DataFrame()",
+            ])
+            alias_vars[op_alias] = op_alias
+            last_df_var = op_alias
+
+        elif op_name == "Reconcile":
+            # v3.4: DAG Reconcile calls run_bank_reconciliation directly (not _reconcile_lite)
+            dep_ids = params.get("depends_on", [])
+            src_vars = []
+            for dep_id in dep_ids:
+                dep_op = op_map.get(dep_id)
+                if dep_op:
+                    src_vars.append(alias_vars.get(dep_op.get('output_alias'), f'df_{dep_id}'))
+            if len(src_vars) < 2:
+                all_vars = list(alias_vars.values())
+                src_vars = all_vars[-2:] if len(all_vars) >= 2 else (src_vars + ['df', 'df'])
+            left_var, right_var = (src_vars[0], src_vars[1]) if len(src_vars) >= 2 else ('df', 'df')
+            try:
+                rc_tol = float(params.get("tolerance_abs", 0.01))
+            except (ValueError, TypeError):
+                rc_tol = 0.01
+            try:
+                rc_dw = int(params.get("date_window_days", 3))
+            except (ValueError, TypeError):
+                rc_dw = 3
+            _base = str(BASE_DIR)
+            code_lines.extend([
+                f"import sys; sys.path.insert(0, r'{_base}')",
+                "from core.bank_reconcile_engine import run_bank_reconciliation",
+                f"if '{left_var}' in dir() and '{right_var}' in dir() and not {left_var}.empty and not {right_var}.empty:",
+                f"    _rec_res = run_bank_reconciliation({left_var}, {right_var}, {{'amount_tolerance': {rc_tol}, 'date_window_days': {rc_dw}}})",
+                f"    {op_alias} = _rec_res['book_std'].copy()",
+                f"    print('[Reconcile] book_match=' + str(_rec_res['stats']['book_match_rate']) + '% bank_match=' + str(_rec_res['stats']['bank_match_rate']) + '%')",
+                f"    print('[Reconcile] L1=' + str(_rec_res['stats']['matched_L1']) + ' L2=' + str(_rec_res['stats']['matched_L2']) + ' L3=' + str(_rec_res['stats']['matched_L3_groups']) + ' L4=' + str(_rec_res['stats']['review_L4']))",
+                f"    print('[Reconcile] red_flags=' + str(_rec_res['stats']['red_flag_count']) + ' timing=' + str(_rec_res['stats']['timing_categories']))",
+                f"else:",
+                f"    print('[Reconcile] empty input')",
+                f"    {op_alias} = pd.DataFrame()",
+            ])
+            alias_vars[op_alias] = op_alias
+            last_df_var = op_alias
+
+        elif op_name == "AuditAdjustment":
+            # 瀹¤璋冩暣寤鸿锛氬熀浜?Diff 宸紓鍒楃敓鎴愶紙绉戠洰闇€浜哄伐纭锛屽钩鍙颁笉鑷嗛€狅級
+            dep_ids = params.get("depends_on", [])
+            src_var = last_df_var
+            for dep_id in dep_ids:
+                dep_op = op_map.get(dep_id)
+                if dep_op:
+                    src_var = alias_vars.get(dep_op.get('output_alias'), last_df_var)
+                    break
+            src_var = src_var or 'df'
+            code_lines.extend([
+                f"if '{src_var}' in dir() and {src_var} is not None and not {src_var}.empty and '宸紓' in {src_var}.columns:",
+                f"    _adj = {src_var}[pd.to_numeric({src_var}['宸紓'], errors='coerce').abs() > 0.01].copy()",
+                f"    _adj['璋冩暣寤鸿'] = '宸紓 ' + pd.to_numeric(_adj['宸紓'], errors='coerce').round(2).astype(str) + ' 鍏冿紱鍊?璐风鐩緟瀹¤甯堢‘璁?",
+                f"    {op_alias} = _adj",
+                f"    print('[AuditAdjustment] 璋冩暣寤鸿 ' + str(len(_adj)) + ' 鏉★紙绉戠洰闇€浜哄伐纭锛?)",
+                f"else:",
+                f"    print('[AuditAdjustment] 杈撳叆鏃犲樊寮傚垪鎴栦负绌猴紝杈撳嚭绌鸿皟鏁磋〃')",
+                f"    {op_alias} = pd.DataFrame(columns=['璋冩暣寤鸿'])",
+            ])
+            alias_vars[op_alias] = op_alias
+            last_df_var = op_alias
+
+        else:
+            code_lines.append(f"# [璺宠繃] 鏈疄鐜扮畻瀛? {op_name}")
+            print(f"[璀﹀憡] 绠楀瓙 {op_name} 鏈疄鐜帮紝宸茶烦杩団€斺€旇纭杩欐槸棰勬湡琛屼负")
+
+        code_lines.append("")
+
+    # 鏍煎紡鍖栫煭鎽樿锛岄槻姝㈣秺鐣屾垨绌哄€煎穿婧?    safe_explanation = str(objective)[:30].replace('"', "'")
+
+    code_lines.extend([
+        "# 鐢熸垚瀹為檯杈撳嚭鏂囦欢锛堝熀浜庤绠楃粨鏋滐紝闈炵‖缂栫爜锛?,
+        f"_final_df = {last_df_var} if '{last_df_var}' in dir() and {last_df_var} is not None and not {last_df_var}.empty else None",
+        "if _final_df is not None:",
+        "    # 瀵煎嚭 CSV",
+        "    _final_df.to_csv(os.path.join('outputs', 'analysis_result.csv'), index=False, encoding='utf-8-sig')",
+        "    print('[Output] CSV 宸插鍑? analysis_result.csv, rows=' + str(len(_final_df)))",
+        "    # 鍚屾椂瀵煎嚭 Excel锛堜繚鐣欏師琛ㄦ牸寮忥級",
+        "    try:",
+        "        _final_df.to_excel(os.path.join('outputs', 'analysis_result.xlsx'), index=False)",
+        "        print('[Output] Excel 宸插鍑? analysis_result.xlsx')",
+        "    except Exception as _e:",
+        "        print('[Output] Excel 瀵煎嚭澶辫触锛堝彲鑳界己灏?openpyxl锛? ' + str(_e))",
+        "    # 鐢熸垚 JSON 鎽樿",
+        "    _summary = {",
+        "        'total_rows': len(_final_df),",
+        "        'columns': list(_final_df.columns),",
+        "        'dtypes': {str(k): str(v) for k, v in _final_df.dtypes.items()},",
+        "    }",
+        "    # 鏁板€煎垪缁熻",
+        "    _num_cols = _final_df.select_dtypes(include='number').columns.tolist()",
+        "    if _num_cols:",
+        "        _summary['numeric_summary'] = {c: {'sum': float(_final_df[c].sum()), 'mean': float(_final_df[c].mean()), 'max': float(_final_df[c].max()), 'min': float(_final_df[c].min())} for c in _num_cols}",
+        "    with open(os.path.join('outputs', 'journal_entries.json'), 'w', encoding='utf-8') as f:",
+        "        json.dump(_summary, f, ensure_ascii=False, indent=2)",
+        "    print('[Output] JSON 宸插鍑? journal_entries.json')",
+        "else:",
+        "    print('[Output] 璀﹀憡锛氭棤鏈夋晥鏁版嵁鍙鍑?)",
+        "    with open(os.path.join('outputs', 'journal_entries.json'), 'w', encoding='utf-8') as f:",
+        "        json.dump({'error': '鏃犳湁鏁堟暟鎹?, 'columns': [], 'total_rows': 0}, f, ensure_ascii=False, indent=2)",
+    ])
+    code_lines.extend([
+        "",
+        "# === 鏁版嵁璐ㄩ噺灞傦細鍙竻鐞嗗叏绌鸿/鍒楋紱缂哄け鍊间竴寰嬫爣璁版姤鍛婏紝缁濅笉缂栭€?===",
+        "# 锛堝璁＄孩绾匡細鍓嶅悜濉厖浼氭妸涓婁竴琛屽鎴峰悕濉埌缂哄け琛屻€侀噾棰濆～ 0锛屽睘浜庝吉閫犲璁¤瘉鎹級",
+        "_missing_report = {}",
+        "for _name, _v in list(locals().items()):",
+        "    if isinstance(_v, pd.DataFrame) and not _v.empty:",
+        "        _v.dropna(how='all', inplace=True)",
+        "        _v.dropna(axis=1, how='all', inplace=True)",
+        "        _miss = {c: int(_v[c].isna().sum()) for c in _v.columns if int(_v[c].isna().sum()) > 0}",
+        "        if _miss:",
+        "            _missing_report[_name] = _miss",
+        "if _missing_report:",
+        "    with open(os.path.join('outputs', 'data_missing_report.json'), 'w', encoding='utf-8') as _f:",
+        "        json.dump(_missing_report, _f, ensure_ascii=False, indent=2)",
+        "    print('[鏁版嵁璐ㄩ噺] 鈿?妫€娴嬪埌缂哄け鍊硷紝宸茶緭鍑?data_missing_report.json锛堢己澶变笉濉厖銆佷笉缂栭€狅級: ' + str(_missing_report)[:300])",
+        "else:",
+        "    print('[鏁版嵁璐ㄩ噺] 鏃犵己澶卞€?)",
+    ])
+    return "\n".join(code_lines)
+
+
+def _detect_reconcile_scenario(input_dir: Path):
+    """妫€娴?搴忔椂璐γ楅摱琛屾祦姘?缁勫悎锛岃繑鍥?(book_path, bank_path) 鎴?None銆?
+    鍩轰簬鍒楃壒寰佺‘瀹氭€ц瘑鍒紙鍑瘉鍙?绉戠洰 鈫?搴忔椂璐︼紱瀵规柟/璐﹀彿/浣欓 鈫?娴佹按锛夛紝
+    鏀寔 Excel/CSV 涓?docx/pdf/md 鏂囨。涓殑琛ㄦ牸銆?    """
+    try:
+        from core.bank_reconcile_engine import detect_book_type, JOURNAL, BANK_STATEMENT
+        from core.document_loader import load_tables
+        journal = bank = None
+        for f in sorted(input_dir.glob("*")):
+            if f.suffix.lower() not in (".xlsx", ".xls", ".csv", ".docx", ".pdf", ".md"):
+                continue
+            try:
+                tables = load_tables(f)
+                if not tables:
+                    continue
+                t = detect_book_type(tables[0], f.name)
+                if t in (JOURNAL, "generic_ledger") and journal is None:
+                    journal = f  # 搴忔椂璐︽垨閫氱敤鍙拌处鍧囧彲浣滀负璐︽柟
+                elif t == BANK_STATEMENT and bank is None:
+                    bank = f
+            except Exception:
+                continue
+            if journal and bank:
+                break
+        if journal and bank:
+            # 姹囨€荤骇鍙拌处锛堟寜骞?鍒嗙被姹囨€伙級涓嶈蛋閫愮瑪蹇溅閬?鈫?浜?LLM 鎸?summary_compare 瑙勫垝
+            try:
+                from config.scenario_packs import is_detail_level
+                if not is_detail_level(load_tables(journal)[0]):
+                    print(f"[瀵硅处蹇溅閬揮 {journal.name} 涓烘眹鎬荤骇鏁版嵁锛屼氦 LLM 姹囨€诲嬀绋借矾寰?)
+                    return None
+            except Exception:
+                pass
+            return (journal, bank)
+        return None
+    except Exception as e:
+        print(f"[瀵硅处蹇溅閬揮 鍦烘櫙妫€娴嬪け璐ワ紙鎸夋櫘閫氶摼璺鐞嗭級: {e}")
+        return None
+
+
+def _account_from_intent(intent: str) -> str:
+    """浠庣敤鎴锋剰鍥炬彁鍙栭摱琛岃处鍙风嚎绱紙濡?'鍐滆5927' / 绾暟瀛楄处鍙凤級"""
+    m = re.search(r"(?:璐﹀彿|璐︽埛|鍐滆|宸ヨ|寤鸿|涓|鎷涜|浜よ|寰藉晢|閭偍|鍐滃晢)(\D{0,4}?\d{3,})", intent)
+    if m:
+        return m.group(1)
+    m2 = re.search(r"\b(\d{4,})\b", intent)
+    return m2.group(1) if m2 else ""
+
+
+async def _execute_in_sandbox(run_id: str, code: str, run_dir: Path) -> None:
+    """鍦ㄦ矙绠变腑鎵ц瀹¤浠ｇ爜锛堝紓姝ラ潪闃诲 + 骞跺彂淇″彿閲忔帶鍒讹級銆?    绛栫暐锛氫紭鍏?Docker 瀹瑰櫒锛坰andbox_v3锛夛紝澶辫触/涓嶅彲鐢ㄦ椂闄嶇骇涓烘湰鍦?subprocess銆?    """
+    import subprocess
+    from time import time as _now
+    _t0 = _now()
+    output_dir = run_dir / "outputs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    input_dir = run_dir / "inputs"
+
+    # 鈺愨晲鈺?涓撲笟瀵硅处蹇溅閬擄細搴忔椂璐γ楅摱琛屾祦姘?鈫?bank_reconcile_engine锛堝钩鍙板眰鎵ц锛?鈺愨晲鈺?    _rec0 = _get_snapshot_mgr().get_run(run_id)
+    _intent0 = (_rec0.user_intent or "") if _rec0 else ""
+    _preset0 = (_rec0.preset_button or "") if _rec0 else ""
+    # 蹇溅閬撹Е鍙戞潯浠讹細鎰忓浘鍚璐﹀叧閿瘝 OR 鐢ㄦ埛鐐逛簡閾惰瀵硅处棰勮鎸夐挳
+    _is_reconcile_intent = any(k in _intent0 for k in ("瀵硅处", "鏍稿", "鏍歌处", "鐩哥", "瀵逛竴涓?))
+    _is_reconcile_preset = False
+    if _preset0:
+        try:
+            from config.presets import normalize_preset_key
+            _is_reconcile_preset = (normalize_preset_key(_preset0) == "閾惰瀵硅处")
+        except Exception:
+            pass
+    if _is_reconcile_intent or _is_reconcile_preset:
+        _pair = _detect_reconcile_scenario(input_dir)
+        if _pair:
+            try:
+                from core.bank_reconcile_engine import reconcile_files
+                _cfg = {}
+                _acc = _account_from_intent(_intent0)
+                if _acc:
+                    _cfg["account"] = _acc
+
+                # 鈹€鈹€ v3.4 璧勬簮鎶ゆ爮锛氬揩杞﹂亾鍙湪瀹夊叏鏁版嵁瑙勬ā涓嬪惎鐢?鈹€鈹€
+                _FASTLANE_MAX_ROWS = 50000
+                _FASTLANE_TIMEOUT = 1800  # 30鍒嗛挓
+                _skip_fastlane = False
+                try:
+                    import pandas as _pd
+                    for _fp, _label in [(_pair[0], "璐?), (_pair[1], "閾?)]:
+                        _sz_mb = _fp.stat().st_size / (1024 * 1024)
+                        # 鏂囦欢澶у皬瓒?50MB 鈫?鐤戜技瓒呭ぇ鏁版嵁锛岃浆娌欑
+                        if _sz_mb > 50:
+                            print(f"[瀵硅处蹇溅閬揮 {_label}鏂规枃浠?{_sz_mb:.0f}MB > 50MB锛岃浆娌欑璺緞")
+                            _skip_fastlane = True
+                            break
+                        # 鐢?openpyxl 璇诲伐浣滆〃缁村害锛堜笉鍔犺浇鏁版嵁锛岀绾э級
+                        _df = _pd.read_excel(_fp, nrows=0)
+                        _est_rows = 0
+                        try:
+                            import openpyxl
+                            _wb = openpyxl.load_workbook(_fp, read_only=True)
+                            _est_rows = _wb.active.max_row or 0
+                            _wb.close()
+                        except Exception:
+                            _est_rows = int(_sz_mb * 500)  # 闄嶇骇锛氱矖鐣ヤ及绠?~500琛?MB
+                        print(f"[瀵硅处蹇溅閬揮 {_label}鏂? {_fp.name} ({_sz_mb:.1f}MB, 浼扮畻 ~{_est_rows} 琛?")
+                        if _est_rows > _FASTLANE_MAX_ROWS:
+                            print(f"[瀵硅处蹇溅閬揮 浼扮畻琛屾暟 {_est_rows} > {_FASTLANE_MAX_ROWS}锛岃浆娌欑璺緞")
+                            _skip_fastlane = True
+                            break
+                except Exception as _sz_e:
+                    print(f"[瀵硅处蹇溅閬揮 鏂囦欢澶у皬鎺㈡祴澶辫触: {_sz_e}锛岀户缁揩杞﹂亾")
+
+                if _skip_fastlane:
+                    raise RuntimeError("鏁版嵁瑙勬ā瓒呭揩杞﹂亾闃堝€硷紝杞矙绠辨墽琛?)
+
+                print(f"[瀵硅处蹇溅閬揮 搴忔椂璐?{_pair[0].name} 脳 娴佹按={_pair[1].name}, cfg={_cfg}")
+                # 杩涘害鍥炶皟锛氬啓鍏?execution_logs锛屽墠绔疆璇㈠彲瑙?                def _reconcile_progress(pct, step):
+                    _save_logs(run_id, [f"[瀵硅处杩涘害] {pct}% {step}"], append=True)
+                _cfg["progress_callback"] = _reconcile_progress
+
+                # 鈹€鈹€ 鍖归厤閫昏緫璇存槑锛堜粠鍦烘櫙娉ㄥ唽琛ㄨ鍙栵級 鈹€鈹€
+                try:
+                    from config.scenario_packs import get_report_meta
+                    _meta = get_report_meta("bank_reconcile_detail")
+                    _plan = f"""## {_meta['name']}
+
+### 鏁版嵁婧?- 璐︽柟锛歿_pair[0].name}
+- 閾舵柟锛歿_pair[1].name}
+
+### 鍖归厤绛栫暐锛堜簲灞傞€掕繘锛?1. L1 閲戦绮剧‘(卤0.01鍏?+鍚屾棩 鈫?鑷姩纭
+2. L2 閲戦绮剧‘+鏃ユ湡绐楀彛(卤3澶? 鈫?鑷姩纭锛堣法鏈?鍦ㄩ€旓級
+3. L3 n:m 鎷嗗垎鍚堝苟 鈫?宸叉牳瀵癸紙鏍囨敞"鎷嗗垎/鍚堝苟鍏ヨ处"锛?4. L3_fee 鎵嬬画璐瑰樊棰?鈮?0鍏?鎽樿鍚?鎵嬬画璐?) 鈫?鑷姩鎴愮粍
+4+. L3_fee_month 鎵嬬画璐规湀搴﹁仛鍚?涓や晶鏈堝害鎬婚绮剧‘鐩哥瓑) 鈫?鑷姩鎴愮粍
+5. L4 鎽樿+瀵规柟鎴峰悕妯＄硦鍖归厤 鈫?寰呬汉宸ュ鏍?
+### 鏈尮閰嶅垎绫?- 鍥涘垎绫伙細閾舵敹浼佹湭鏀?/ 閾朵粯浼佹湭浠?/ 浼佹敹閾舵湭鏀?/ 浼佷粯閾舵湭浠?- 鍒╂伅/鎵嬬画璐?鍐叉 鈫?涓撻」鏍囪锛屼笉鍒犻櫎
+- 鍏朵綑 鈫?寰呬汉宸ユ牳鏌ワ紙绂佹榛樿娲楃櫧涓烘湭杈撅級
+
+### 绾㈡棗妫€娴?涓€鏀朵竴浠樺悓棰濄€佹暣鏁板ぇ棰濄€佹湡鏈礋浣欓銆佸垎娆¤浆鍏ヨ浆鍑恒€佸ぇ棰濈幇閲戙€佷綑棰濅笉杩炶疮(P5)
+
+### 浜や粯鐗?閫愮瑪瀵硅处鏄庣粏搴曠銆侀摱琛屽瓨娆句綑棰濊皟鑺傝〃銆佹湭杈捐处椤规竻鍗曘€佸紓甯歌祫閲戜氦鏄撴竻鍗曘€佹憳瑕丣SON
+"""
+                    (_plan_path := run_dir / "match_explanation.txt").write_text(_plan, encoding="utf-8")
+                    _save_logs(run_id, ["[鍖归厤閫昏緫] 宸茬敓鎴愯缁嗗尮閰嶆柟妗堬紙浜斿眰閫掕繘+鍥涘垎绫?绾㈡棗锛?], append=True)
+                except Exception:
+                    pass
+                _res = await asyncio.wait_for(
+                    asyncio.to_thread(reconcile_files, _pair[0], _pair[1], _cfg, output_dir),
+                    timeout=_FASTLANE_TIMEOUT
+                )
+                _st = _res["stats"]
+                _get_snapshot_mgr().update_status(run_id, "COMPLETED")
+                _update_outputs(run_id, output_dir)
+                _save_logs(run_id, [
+                    f"[瀵硅处蹇溅閬揮 鍖归厤鐜?璐?{_st['book_match_rate']}% 閾?{_st['bank_match_rate']}% "
+                    f"(L1={_st['matched_L1']}, L2={_st['matched_L2']}, L3缁?{_st['matched_L3_groups']}, L4寰呭鏍?{_st['review_L4']})",
+                    f"[瀵硅处蹇溅閬揮 鏈揪鍥涘垎绫? {_st['timing_categories']}",
+                    f"[瀵硅处蹇溅閬揮 浜や粯鐗? {_res.get('output_files')}",
+                ])
+                try:
+                    _generate_report_if_needed(run_id, output_dir, [])
+                except Exception as _rg_e:
+                    print(f"[瀵硅处蹇溅閬揮 鎶ュ憡鐢熸垚澶辫触锛堜笉褰卞搷瀵硅处缁撴灉锛? {type(_rg_e).__name__}: {_rg_e}")
+                    _save_logs(run_id, [f"[鎶ュ憡鐢熸垚] 澶辫触浣嗗尮閰嶅凡瀹屾垚: {_rg_e}"], append=True)
+                return
+            except Exception as _e:
+                # 鐘舵€佹姢鏍忥細宸?COMPLETED 鐨?run 绂佹鍥為€€瑕嗙洊
+                _cur = _get_snapshot_mgr().get_run(run_id)
+                if _cur and _cur.status == "COMPLETED":
+                    print(f"[瀵硅处蹇溅閬揮 寮傚父鍙戠敓鍦ㄥ畬鎴愪箣鍚庯紝淇濇寔 COMPLETED: {_e}")
+                    return
+                print(f"[瀵硅处蹇溅閬揮 鎵ц澶辫触锛屽洖閫€甯歌閾捐矾: {type(_e).__name__}: {_e}")
+
+    # 鈺愨晲鈺?浼樺厛锛欴ocker 娌欑锛坰andbox_v3 瀹屾暣瀹瑰櫒鐢熺伃锛?鈺愨晲鈺?    # 鍙屼繚闄╋細浠讳綍璺緞涓嬶紝宸插畬鎴愮殑 run 涓嶅啀杩涙矙绠?    _rec_chk = _get_snapshot_mgr().get_run(run_id)
+    if _rec_chk and _rec_chk.status == "COMPLETED":
+        return
+    async with _SANDBOX_SEMAPHORE:  # 骞跺彂鎺у埗锛氭渶澶?3 涓悓鏃惰繍琛?        try:
+            from engine.sandbox_v3 import EphemeralSandbox
+            sandbox = EphemeralSandbox(timeout=120)
+            # asyncio.to_thread() 閬垮厤闃诲浜嬩欢寰幆
+            result = await asyncio.to_thread(
+                sandbox.execute_with_retry, run_id, code, run_dir, 3
+            )
+            status = "COMPLETED" if result.status == "COMPLETED" else "FAILED"
+            logs = [result.stdout[-2000:]] if result.stdout else []
+            if result.stderr:
+                logs.append("STDERR: " + result.stderr[-2000:])
+            _get_snapshot_mgr().update_status(run_id, status)
+            _save_logs(run_id, logs)
+            if status == "COMPLETED":
+                _update_outputs(run_id, output_dir)
+                _generate_report_if_needed(run_id, output_dir, logs)
+                _run_constraint_check(run_id, output_dir, logs)
+            trace_record(run_id, "sandbox_run",
+                         "OK" if status == "COMPLETED" else "FAIL",
+                         (_now() - _t0) * 1000, f"retry={result.retry_count}")
+            if result.retry_count:
+                trace_record(run_id, "self_correct", "OK", 0,
+                             f"鑷籂閿?{result.retry_count} 杞?)
+            print(f"[Sandbox] Docker 鎵ц瀹屾垚 Run {run_id}: {status}")
+            return
+        except Exception as e:
+            trace_record(run_id, "sandbox_fallback", "WARN",
+                         (_now() - _t0) * 1000,
+                         f"{type(e).__name__}: 闄嶇骇鏈湴subprocess")
+            print(f"[Sandbox] Docker 鎵ц澶辫触 ({type(e).__name__})锛岄檷绾т负鏈湴 subprocess")
+
+    # 鈺愨晲鈺?闄嶇骇锛氭湰鍦?subprocess锛圵indows 鏃?Docker 鏃剁殑鍏滃簳锛?鈺愨晲鈺?    await _execute_in_sandbox_legacy(run_id, code, run_dir)
+
+
+def _save_logs(run_id: str, logs: list, append: bool = False) -> None:
+    try:
+        import sqlite3, json
+        from core.run_snapshot import DB_PATH
+        with sqlite3.connect(str(DB_PATH)) as conn:
+            if append:
+                existing = conn.execute(
+                    "SELECT execution_logs FROM runs WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                if existing and existing[0]:
+                    old_logs = json.loads(existing[0]) if isinstance(existing[0], str) else existing[0]
+                    logs = (old_logs or []) + logs
+            conn.execute("UPDATE runs SET execution_logs = ? WHERE run_id = ?",
+                         (json.dumps(logs, ensure_ascii=False), run_id))
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _update_outputs(run_id: str, output_dir: Path) -> None:
+    output_files = [f.name for f in output_dir.iterdir() if f.is_file()]
+    if output_files:
+        _get_snapshot_mgr().update_outputs(
+            run_id=run_id, output_files=output_files,
+            validation_results=[{"check": "execution", "passed": True}],
+            all_passed=True)
+
+
+def _generate_report_if_needed(run_id: str, output_dir: Path, logs: list) -> None:
+    try:
+        record = _get_snapshot_mgr().get_run(run_id)
+        if not record:
+            return
+        input_dir = record.run_dir / "inputs"
+        input_names = [f.name for f in input_dir.iterdir() if f.is_file()] if input_dir.exists() else []
+        dag_ops = (record.dag_blueprint or {}).get("operators", [])
+        from core.report_generator import generate_audit_report
+        rp = generate_audit_report(
+            run_id=run_id, user_intent=record.user_intent or "",
+            dag_operators=dag_ops, output_dir=output_dir,
+            input_files=input_names, execution_logs=logs)
+        print(f"[鎶ュ憡] Word 瀹¤鎶ュ憡宸茬敓鎴? {rp.name}")
+    except Exception as e:
+        print(f"[鎶ュ憡] 鐢熸垚澶辫触锛堥潪鑷村懡锛? {e}")
+
+
+async def _call_dify_single_table(catalog_text, user_intent):
+    if not DIFY_SINGLE_TABLE_KEY: return ""
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
+            resp = await client.post(
+                f"{DIFY_BASE_URL}/v1/workflows/run",
+                headers={"Authorization": f"Bearer {DIFY_SINGLE_TABLE_KEY}"},
+                json={"inputs": {"catalog_text": catalog_text, "user_intent": user_intent}, "response_mode": "blocking", "user": "audit_platform"},
+            )
+            resp.raise_for_status()
+            return resp.json().get("data", {}).get("outputs", {}).get("result", "")
+    except: return ""
+
+
+def _parse_single_table_result(result, catalog):
+    from core.dag_compiler import DAGBlueprint, Operator
+    import json as _j
+    ops = []
+    files = getattr(catalog, "files", [])
+    fname = files[0].get("filename", "input.xlsx") if files else "input.xlsx"
+    ops.append(Operator(id="load_0", name="Load", input_from=[], source_file=fname, output_alias="df_raw"))
+    try:
+        if result.strip().startswith("{"):
+            data = _j.loads(result)
+            if "operators" in data:
+                return DAGBlueprint(blueprint_id="single_001", generated_at=datetime.now().isoformat(),
+                    operators=[Operator(**o) if isinstance(o, dict) else o for o in data["operators"]],
+                    objective=data.get("objective", "鍗曡〃绛涢€?))
+    except: pass
+    ops.append(Operator(id="filter_0", name="ColumnFilter", input_from=["load_0"], output_alias="df_filtered",
+        params={"column": "閲戦", "operator": ">", "value": 0}))
+    ops.append(Operator(id="export_0", name="Export", input_from=["filter_0"], params={"filename": "绛涢€夌粨鏋?xlsx"}))
+    return DAGBlueprint(blueprint_id="single_fb", generated_at=datetime.now().isoformat(), operators=ops,
+        objective="鍗曡〃绛涢€?, raw_intent="浠庡崟琛ㄧ瓫閫夋暟鎹苟瀵煎嚭")
+DIFY_REFINE_API_KEY = os.environ.get("DIFY_REFINE_API_KEY", "")
+DIFY_SINGLE_TABLE_KEY = os.environ.get("DIFY_SINGLE_TABLE_KEY", "")
+DIFY_REPORT_GEN_KEY = os.environ.get("DIFY_REPORT_GEN_KEY", "")
+DIFY_REPORT_REVIEW_KEY = os.environ.get("DIFY_REPORT_REVIEW_KEY", "")
+DIFY_KNOWLEDGE_QA_KEY = os.environ.get("DIFY_KNOWLEDGE_QA_KEY", "")
+
+def _run_constraint_check(run_id, output_dir, logs):
+    try:
+        record = _get_snapshot_mgr().get_run(run_id)
+        if not record or not record.user_intent: return
+        from core.constraint_engine import parse_constraints, format_constraint_report
+        constraints = parse_constraints(record.user_intent)
+        if not constraints: return
+        excel_files = list(output_dir.glob("*.xlsx"))
+        import pandas as pd
+        all_passed = True
+        for xf in excel_files:
+            try:
+                df = pd.read_excel(xf)
+                for c in constraints:
+                    if c.field == "宸紓閲戦" and "宸紓閲戦" in df.columns:
+                        max_diff = df["宸紓閲戦"].abs().max()
+                        c.actual_value = max_diff
+                        c.satisfied = max_diff < c.value
+                        if not c.satisfied: all_passed = False
+            except: continue
+        report = format_constraint_report(constraints)
+        logs.append(f"[绾︽潫鏍￠獙] {'PASS' if all_passed else 'FAIL'}: {report}")
+        if not all_passed:
+            _get_snapshot_mgr().update_status(run_id, "FAILED")
+            _run_constraint_retry(run_id, record.user_intent, logs)
+    except Exception as e:
+        print(f"[绾︽潫鏍￠獙] 鏍￠獙澶辫触(闈炶嚧鍛?: {e}")
+
+
+def _write_audit_trace(run_id, user_intent, dag_blueprint):
+    import json as _j
+    p = Path(os.environ.get("AUDIT_TRACE_DIR", str(Path(__file__).resolve().parent.parent / "data" / "audit_traces")))
+    p.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(p / "v5_audit_traces.jsonl", "a", encoding="utf-8") as f:
+            f.write(_j.dumps({"run_id": run_id, "timestamp": datetime.now().isoformat(), "instruction": user_intent or "", "output": _j.dumps(dag_blueprint or {}, ensure_ascii=False)}, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[瀹¤閲囬泦] 鍐欏叆澶辫触(闈炶嚧鍛?: {e}")
+
+
+def _append_approval_hash(run_id, user_intent, dag_blueprint, confirmed):
+    import hashlib, sqlite3, json as _j
+    try:
+        from core.run_snapshot import DB_PATH
+        chain_data = _j.dumps({"run_id": run_id, "timestamp": datetime.now().isoformat(), "intent": user_intent[:200], "confirmed": confirmed}, ensure_ascii=False, sort_keys=True)
+        current_hash = hashlib.sha256(chain_data.encode()).hexdigest()
+        with sqlite3.connect(str(DB_PATH)) as conn:
+            prev = conn.execute("SELECT approval_hash FROM approval_chain ORDER BY id DESC LIMIT 1").fetchone()
+            conn.execute("CREATE TABLE IF NOT EXISTS approval_chain (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, hash TEXT, prev_hash TEXT, data TEXT, created_at TEXT)")
+            conn.execute("INSERT INTO approval_chain (run_id, hash, prev_hash, data, created_at) VALUES (?,?,?,?,?)", (run_id, current_hash, prev[0] if prev else "GENESIS", chain_data, datetime.now().isoformat()))
+            conn.commit()
+    except Exception as e:
+        print(f"[鍝堝笇閾綸 璁板綍澶辫触(闈炶嚧鍛?: {e}")
+
+
+def _run_constraint_retry(run_id, user_intent, logs):
+    try:
+        from core.constraint_engine import parse_constraints
+        constraints = parse_constraints(user_intent)
+        failed = [c for c in constraints if hasattr(c, "satisfied") and not c.satisfied]
+        if not failed: return False
+        hint = "绾︽潫鏈弧瓒筹細"
+        for c in failed: hint += f" {c.field} 瀹為檯={c.actual_value} vs 瑕佹眰<={c.value};"
+        logs.append(f"[绾︽潫閲嶈瘯] {hint}")
+        return True
+    except: return False
+
+
+def _ensure_essential_operators(blueprint_dict, user_intent):
+    ops = list(blueprint_dict.get("operators", []))
+    existing = {op.get("name", "") for op in ops}
+    max_id = max((int(op.get("id", "").replace("op_", "0")) for op in ops if op.get("id", "").replace("op_", "").isdigit()), default=0)
+    last = [ops[-1]["id"]] if ops else []
+    changed = False
+    # load_count 蹇呴』鍏堣绠楋紝鍚庣画瑙勫垯閮借鐢?    load_count = sum(1 for op in ops if op.get("name") in ("Load", "load"))
+    try:
+        from config.scenario_packs import detect_scenario as _ds2, required_ops_for
+        _scn_req = required_ops_for(_ds2(user_intent or ""))
+    except Exception:
+        _scn_req = []
+    if "Reconcile" in _scn_req and "Reconcile" not in existing and load_count >= 2:
+        max_id += 1; load_ids2 = [op["id"] for op in ops if op.get("name") in ("Load", "load")]
+        ops.append({"id": f"op_{max_id}", "name": "Reconcile", "input_from": load_ids2[:2],
+                    "params": {"tolerance_abs": 0.01, "date_window_days": 3},
+                    "output_alias": f"df_reconciled_{max_id}"})
+        existing.add("Reconcile"); changed = True
+    need_merge = any(k in user_intent for k in ["鏍稿", "瀵硅处", "鍖归厤", "姣斿", "涓よ〃"])
+    need_diff = any(k in user_intent for k in ["宸紓", "瀵规瘮", "姣旇緝", "宸"])
+    need_group = any(k in user_intent for k in ["姹囨€?, "鍒嗙粍", "鎸夋湀"])
+    need_sort = any(k in user_intent for k in ["鎺掑簭", "浠庡ぇ鍒板皬", "浠庡皬鍒板ぇ"])
+    need_save = any(k in user_intent for k in ["瀵煎嚭", "淇濆瓨", "涓嬭浇"])
+    if need_merge and "Merge" not in existing and load_count >= 2:
+        max_id += 1; load_ids = [op["id"] for op in ops if op.get("name") in ("Load", "load")]
+        ops.append({"id": f"op_{max_id}", "name": "Merge", "input_from": load_ids, "params": {"how": "outer", "on": "auto"}, "output_alias": f"df_merged_{max_id}"}); last = [f"op_{max_id}"]; existing.add("Merge"); changed = True
+    if need_group and "GroupBy" not in existing:
+        max_id += 1
+        ops.append({"id": f"op_{max_id}", "name": "GroupBy", "input_from": last, "params": {"by": ["auto"], "aggregations": {"auto": "sum"}}, "output_alias": f"df_grouped_{max_id}"}); last = [f"op_{max_id}"]; existing.add("GroupBy"); changed = True
+    # 鑻?DAG 閲屽凡鏈?Reconcile锛堜笓涓氬璐︼級锛屼笉鍐嶅洜鈥滄瘮杈冣€濈瓑鍏抽敭瀛楄拷鍔?Diff锛岄伩鍏嶅璐?Diff 閲嶅/鍐茬獊
+    if need_diff and "Diff" not in existing and "Reconcile" not in existing and ("Merge" in existing or load_count >= 2):
+        max_id += 1
+        ops.append({"id": f"op_{max_id}", "name": "Diff", "input_from": last, "params": {"col_a": "auto", "col_b": "auto", "tolerance_abs": 0.01}, "output_alias": f"df_diff_{max_id}"}); last = [f"op_{max_id}"]; existing.add("Diff"); changed = True
+    if need_sort and "Sort" not in existing:
+        max_id += 1; sc = "auto"
+        ops.append({"id": f"op_{max_id}", "name": "Sort", "input_from": last, "params": {"by": [sc], "ascending": False}, "output_alias": f"df_sorted_{max_id}"}); last = [f"op_{max_id}"]; existing.add("Sort"); changed = True
+    if need_save and "Export" not in existing:
+        max_id += 1
+        ops.append({"id": f"op_{max_id}", "name": "Export", "input_from": last, "params": {"filename": "瀹¤缁撴灉.xlsx"}, "output_alias": f"df_output_{max_id}"}); changed = True
+    if changed: blueprint_dict["operators"] = ops
+    return blueprint_dict
+
+
+async def _execute_in_sandbox_legacy(run_id: str, code: str, run_dir: Path) -> None:
+    try:
+        output_dir = run_dir / "outputs"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        input_dir = run_dir / "inputs"
+
+        # 馃敟 鍖归厤寮曟搸浼樺厛锛氬鏋滄娴嬪埌鍙屾枃浠跺尮閰嶅満鏅紝璋冪敤鍖归厤寮曟搸
+        record = _get_snapshot_mgr().get_run(run_id)
+        intent = (record.user_intent or "") if record else ""
+        input_files = list(input_dir.iterdir()) if input_dir.exists() else []
+        excel_files = [f for f in input_files if f.suffix.lower()
+                       in (".xlsx", ".xls", ".csv", ".docx", ".doc", ".pdf", ".md", ".txt")]
+
+        # 鈺愨晲鈺?涓撲笟瀵硅处蹇溅閬擄紙legacy 璺緞锛夛細搴忔椂璐γ楁祦姘?鈫?bank_reconcile_engine 鈺愨晲鈺?        if any(k in intent for k in ("瀵硅处", "鏍稿", "鏍歌处", "鐩哥", "瀵逛竴涓?)):
+            _pair = _detect_reconcile_scenario(input_dir)
+            if _pair:
+                try:
+                    from core.bank_reconcile_engine import reconcile_files
+                    _cfg = {}
+                    _acc = _account_from_intent(intent)
+                    if _acc:
+                        _cfg["account"] = _acc
+                    print(f"[瀵硅处蹇溅閬揮 搴忔椂璐?{_pair[0].name} 脳 娴佹按={_pair[1].name}, cfg={_cfg}")
+                    _res = reconcile_files(_pair[0], _pair[1], _cfg, output_dir)
+                    _st = _res["stats"]
+                    output_files_final = [f.name for f in output_dir.iterdir() if f.is_file()]
+                    _get_snapshot_mgr().update_outputs(
+                        run_id=run_id, output_files=output_files_final,
+                        validation_results=[{"check": "bank_reconcile_engine", "passed": True}],
+                        all_passed=True)
+                    _get_snapshot_mgr().update_status(run_id, "COMPLETED")
+                    _save_logs(run_id, [
+                        f"[瀵硅处蹇溅閬揮 鍖归厤鐜?璐?{_st['book_match_rate']}% 閾?{_st['bank_match_rate']}%",
+                        f"[瀵硅处蹇溅閬揮 鏈揪鍥涘垎绫? {_st['timing_categories']}",
+                        f"[瀵硅处蹇溅閬揮 浜や粯鐗? {_res.get('output_files')}"])
+                    if record:
+                        _generate_report_if_needed(run_id, output_dir, [])
+                    return
+                except Exception as _e:
+                    print(f"[瀵硅处蹇溅閬揮 鎵ц澶辫触锛屽洖閫€甯歌閾捐矾: {_e}")
+
+        if len(excel_files) >= 2 and ("鍖归厤" in intent or "鏍稿" in intent or "瀵硅处" in intent or "姣斿" in intent):
+            print(f"[Sandbox] 妫€娴嬪埌鍖归厤鍦烘櫙锛坽len(excel_files)}涓枃浠讹級锛岃皟鐢ㄥ尮閰嶅紩鎿?..")
+            logs = []
+            status = "COMPLETED"
+            try:
+                # 鍘嗗彶鏂囦欢淇濇姢锛氶獙璇?dag_blueprint 涓殑鏂囦欢寮曠敤涓庡綋鍓嶈緭鍏ョ洰褰曚竴鑷?                # 鑻ヤ笉涓€鑷达紙鍙兘鏄巻鍙茬紦瀛橈級锛屽垯浠呬娇鐢ㄥ綋鍓嶈緭鍏ョ洰褰曠殑瀹為檯鏂囦欢
+                if record and record.dag_blueprint:
+                    dag_bp = record.dag_blueprint
+                    if isinstance(dag_bp, dict):
+                        ops = dag_bp.get("operators", [])
+                        actual_input_names = {f.name for f in input_files if f.is_file()}
+                        for op in ops:
+                            sf = op.get("source_file", "")
+                            if sf and sf not in actual_input_names:
+                                print(f"[Sandbox] 娉ㄦ剰: dag_blueprint 涓紩鐢ㄦ枃浠?'{sf}' 涓嶅湪褰撳墠杈撳叆鐩綍锛屽皢浠呬娇鐢ㄥ綋鍓嶄笂浼犳枃浠惰繘琛屽垎鏋?)
+                                break
+
+                from core.matching_engine import run_matching_pipeline
+                # 鈹€鈹€ 涓夌骇鍏抽敭璇嶄緵缁欓摼锛堢粺涓€鍏ュ彛锛歝ore.keyword_resolver锛夆攢鈹€鈹€
+                # 鈶?DAG 钃濆浘宸叉湁 pattern 鈫?鐩存帴鐢紙LLM 缂栬瘧闃舵纭畾鐨勶級
+                dag_patterns = _extract_patterns_from_dag(record.dag_blueprint) if record else ""
+                kw_source = "dag" if dag_patterns else ""
+                kw_version = ""
+                kw_preview = None
+
+                if not dag_patterns and record and record.user_intent:
+                    # 鈶?璇嶅吀鍛戒腑 / 鎻愭鍒嗘祦
+                    from core.keyword_resolver import (
+                        resolve_patterns_full as _kw_resolve,
+                        backtest_patterns as _kw_backtest,
+                        propose_via_search as _kw_propose,
+                        save_proposal as _kw_save_proposal,
+                    )
+                    kw_res = _kw_resolve(record.user_intent)
+                    if kw_res["status"] == "hit":
+                        # 璇嶅吀鍛戒腑 鈫?鐩撮€氾紙鍏嶇‘璁わ級
+                        dag_patterns = kw_res["patterns"]
+                        kw_source = f"dictionary_{kw_res['version']}"
+                        kw_version = kw_res["version"]
+                        print(f"[鍏抽敭璇峕 璇嶅吀鍛戒腑: {kw_res['category']} 鈫?{dag_patterns[:60]}")
+                    else:
+                        # 鈶?鎻愭璺緞锛氭悳绱?鈫?LLM璧疯崏 鈫?棰勮 鈫?鎸傝捣绛夌敤鎴风‘璁?                        print(f"[鍏抽敭璇峕 璇嶅吀鏈懡涓紝瑙﹀彂鎷撹崚鎻愭: {record.user_intent[:60]}")
+                        try:
+                            proposal = _kw_propose(record.user_intent)
+                        except Exception as _pe:
+                            print(f"[鍏抽敭璇峕 鎻愭澶辫触: {_pe}锛屽洖閫€ LLM 鎻愬彇")
+                            from core.matching_engine import _extract_patterns_via_llm
+                            proposal = {"patterns": _extract_patterns_via_llm(record.user_intent),
+                                        "渚濇嵁鎽樿": "LLM 鐩存帴鎻愬彇锛堟悳绱笉鍙敤锛?,
+                                        "sources": []}
+
+                        # LLM 鎻愭璺緞锛氱敓鎴愬懡涓巼棰勮锛堝啓鍏ユ棩蹇椾緵瀹¤杩芥函锛?                        if dag_patterns:
+                            try:
+                                from config.extraction_dictionary import preview_patterns
+                                # 鍔犺浇娴佹按鏂囦欢鍋氶瑙?                                bank_files = [f for f in input_files if f.is_file()
+                                              and f.suffix.lower() in (".xlsx", ".xls", ".csv")]
+                                if bank_files:
+                                    import pandas as _pd2
+                                    _sample = _pd2.read_excel(bank_files[0], nrows=5000) \
+                                        if bank_files[0].suffix.lower() != ".csv" \
+                                        else _pd2.read_csv(bank_files[0], nrows=5000,
+                                                           encoding="utf-8-sig")
+                                    kw_preview = preview_patterns(
+                                        dag_patterns,
+                                        ["鎽樿", "瀵规柟瀹㈡埛鍚嶇О", "闄勮█", "鐢ㄩ€?],
+                                        _sample,
+                                    )
+                                    print(f"[鍏抽敭璇嶉瑙圿 鍛戒腑 {kw_preview['hit_count']} 琛?"
+                                          f"({kw_preview['hit_rate']:.1%})锛?
+                                          f"鎺掗櫎TOP: {list(kw_preview.get('excluded_top', {}).keys())[:3]}")
+                            except Exception as _pv:
+                                print(f"[鍏抽敭璇嶉瑙圿 鐢熸垚澶辫触锛堥潪鑷村懡锛? {_pv}")
+
+                if not dag_patterns:
+                    dag_patterns = ""  # 鏃犲叧閿瘝鍒欏叏閲忓尮閰?                    kw_source = "fallback"
+                print(f"[鍖归厤寮曟搸] pattern: '{dag_patterns[:80] if dag_patterns else '(鍏ㄩ噺)'}' "
+                      f"(鏉ユ簮: {kw_source})")
+
+                # 浠庣敤鎴锋剰鍥句腑鎻愬彇瀹瑰樊闃堝€硷紙榛樿1%锛岀敤鎴峰彲鑷劧璇█鎸囧畾锛?                from core.constraint_engine import extract_tolerance
+                tolerance_pct = extract_tolerance(record.user_intent or "", default_pct=1.0)
+                print(f"[Sandbox] 瀹瑰樊闃堝€? {tolerance_pct}%")
+
+                match_result = run_matching_pipeline(input_dir, output_dir, patterns=dag_patterns)
+                logs.append("[鍖归厤寮曟搸] 鍖归厤娴佹按绾挎墽琛屽畬鎴?)
+
+                # 濡傛灉鎴愬姛锛屾洿鏂拌緭鍑烘枃浠跺垪琛?                output_files_final = [f.name for f in output_dir.iterdir() if f.is_file()]
+                if output_files_final:
+                    _get_snapshot_mgr().update_outputs(
+                        run_id=run_id, output_files=output_files_final,
+                        validation_results=[{"check": "matching_engine", "passed": True}],
+                        all_passed=True,
+                    )
+
+                # 鐢熸垚鎶ュ憡
+                if record:
+                    dag_ops = (record.dag_blueprint or {}).get("operators", [])
+                    input_names = [f.name for f in input_files if f.is_file()]
+                    from core.report_generator import generate_audit_report
+                    # 鏀堕泦鍖归厤閫昏緫淇℃伅锛堝惈鐢ㄦ埛纭鐨勮嚜鐒惰瑷€璇存槑 + 鍖归厤寮曟搸瀹為檯鎵ц缁撴灉锛?                    dag_bp = record.dag_blueprint or {}
+                    explanation = dag_bp.get("match_explanation", "") if isinstance(dag_bp, dict) else ""
+                    engine_match_logic = match_result.get("match_logic", {}) if match_result else {}
+                    engine_stats = match_result.get("match_stats", {}) if match_result else {}
+                    match_info = {
+                        "patterns": dag_patterns or engine_match_logic.get("绛涢€夋ā寮?, "鏈寚瀹?),
+                        "columns": engine_match_logic.get("绛涢€夊垪", []),
+                        "amount_column": engine_match_logic.get("閲戦鍒?, ""),
+                        "institution_columns": engine_match_logic.get("鏈烘瀯璇嗗埆鍒?, []),
+                        "method": match_result.get("strategy_name", "澶氬垪鑱斿悎鍖归厤") if match_result else "澶氬垪鑱斿悎鍖归厤",
+                        "explanation": explanation,
+                        "strategy_comparison": match_result.get("all_strategies", []) if match_result else [],
+                        # 鍏抽敭璇嶆潵婧?+ 棰勮锛堝璁¤拷婧敤锛?                        "kw_source": kw_source,
+                        "kw_preview": kw_preview or {},
+                        # 鍙嶅悜鏍￠獙锛氭湭鍖归厤琛屾憳瑕佽仛绫?                        "reverse_validation": _reverse_validation_for_report(
+                            match_result, input_dir) if match_result else {},
+                    }
+                    rp = generate_audit_report(
+                        run_id=run_id, user_intent=record.user_intent or "",
+                        dag_operators=dag_ops, output_dir=output_dir,
+                        input_files=input_names, execution_logs=logs,
+                        match_logic=match_info,
+                    )
+                    output_files_final.append(rp.name)
+                    print(f"[鎶ュ憡] Word 瀹¤鎶ュ憡宸茬敓鎴? {rp.name}")
+
+                if output_files_final:
+                    _get_snapshot_mgr().update_outputs(
+                        run_id=run_id, output_files=output_files_final,
+                        validation_results=[{"check": "matching_engine", "passed": True}],
+                        all_passed=True,
+                    )
+                _get_snapshot_mgr().update_status(run_id, "COMPLETED")
+                print(f"[Sandbox] Run {run_id} 鍖归厤瀹屾垚")
+                return
+
+            except Exception as e:
+                print(f"[Sandbox] 鍖归厤寮曟搸澶辫触: {e}锛屽洖閫€鍒?DAG 鎵ц")
+                logs.append(f"[鍖归厤寮曟搸] 澶辫触: {e}锛屽洖閫€鍒?DAG")
+                # 涓嶅洖閫€锛岀户缁蛋 DAG 鏂瑰紡
+                pass
+
+        # DAG 鏂瑰紡鎵ц锛堝甫 OpenClaw 鑷籂閿欓棴鐜紝鐧界毊涔?搂5.2锛氳鍒欎紭鍏堛€丩LM鍏滃簳锛?        from engine.code_corrector import correct_code
+        max_attempts = 3
+        logs = []
+        proc = None
+        current_code = code
+        for attempt in range(1, max_attempts + 1):
+            suffix = "" if attempt == 1 else f"_retry{attempt}"
+            script_path = run_dir / f"_run_script{suffix}.py"
+            script_path.write_text(current_code, encoding="utf-8")
+            proc = subprocess.run(
+                [sys.executable, str(script_path)],
+                cwd=str(run_dir),
+                capture_output=True, text=True, timeout=120
+            )
+            if proc.returncode == 0:
+                if attempt > 1:
+                    logs.append(f"[鑷籂閿橾 绗?{attempt} 娆℃墽琛屾垚鍔燂紙缁?{attempt - 1} 杞唬鐮佷慨姝ｏ級")
+                break
+            logs.append(f"[鑷籂閿橾 绗?{attempt} 娆℃墽琛屽け璐? {(proc.stderr or '')[-500:]}")
+            if attempt < max_attempts:
+                intent_ctx = (record.user_intent or "") if record else ""
+                input_files = list(input_dir.iterdir()) if input_dir.exists() else []
+                col_info = []
+                for f in input_files[:5]:
+                    try:
+                        import pandas as pd
+                        df = pd.read_excel(f, nrows=0) if f.suffix in ('.xlsx','.xls') else pd.read_csv(f, nrows=0)
+                        col_info.append(f"{f.name}: {list(df.columns)}")
+                    except: pass
+                if col_info:
+                    intent_ctx += f"\n鏁版嵁鍒楀悕: {'; '.join(col_info)}"
+                fixed = correct_code(current_code, proc.stderr or "", attempt=attempt, context=intent_ctx)
+                if not fixed:
+                    logs.append("[鑷籂閿橾 鏃犲彲鐢ㄤ慨姝ｆ柟妗堬紝鍋滄閲嶈瘯")
+                    break
+                current_code = fixed
+        status = "COMPLETED" if proc and proc.returncode == 0 else "FAILED"
+        if proc and proc.stdout:
+            logs.append(proc.stdout[-2000:])
+        if proc and proc.stderr and proc.returncode != 0:
+            logs.append("STDERR: " + proc.stderr[-2000:])
+        _get_snapshot_mgr().update_status(run_id, status)
+        # 淇濆瓨鏃ュ織鍒版暟鎹簱
+        try:
+            from core.run_snapshot import DB_PATH
+            with sqlite3.connect(str(DB_PATH)) as conn:
+                conn.execute(
+                    "UPDATE runs SET execution_logs = ? WHERE run_id = ?",
+                    (json.dumps(logs, ensure_ascii=False), run_id)
+                )
+                conn.commit()
+        except Exception:
+            pass
+        # 濡傛灉鎴愬姛锛屾洿鏂拌緭鍑烘枃浠跺垪琛?        if status == "COMPLETED":
+            output_files = [f.name for f in output_dir.iterdir() if f.is_file()]
+            if output_files:
+                validations = [{"check": "local_execution", "passed": True}]
+                _get_snapshot_mgr().update_outputs(
+                    run_id=run_id,
+                    output_files=output_files,
+                    validation_results=validations,
+                    all_passed=True,
+                )
+            # 鐢熸垚 Word 瀹¤鎶ュ憡
+            try:
+                record = _get_snapshot_mgr().get_run(run_id)
+                if record:
+                    input_names = [f.name for f in record.input_dir.iterdir() if f.is_file()] if record.input_dir.exists() else []
+                    dag_ops = (record.dag_blueprint or {}).get("operators", [])
+                    from core.report_generator import generate_audit_report
+                    rp = generate_audit_report(
+                        run_id=run_id,
+                        user_intent=record.user_intent or "",
+                        dag_operators=dag_ops,
+                        output_dir=output_dir,
+                        input_files=input_names,
+                        execution_logs=logs,
+                    )
+                    output_files.append(rp.name)
+                    print(f"[鎶ュ憡] Word 瀹¤鎶ュ憡宸茬敓鎴? {rp.name}")
+            except Exception as e:
+                print(f"[鎶ュ憡] 鐢熸垚澶辫触锛堥潪鑷村懡锛? {e}")
+            # 鏇存柊杈撳嚭鍒楄〃锛堝寘鍚姤鍛婏級
+            if output_files:
+                _get_snapshot_mgr().update_outputs(
+                    run_id=run_id,
+                    output_files=output_files,
+                    validation_results=[{"check": "local_execution", "passed": True}],
+                    all_passed=True,
+                )
+        print(f"[Sandbox] Run {run_id} 瀹屾垚: status={status}, outputs={list(output_dir.iterdir()) if output_dir.exists() else []}")
+    except Exception as e:
+        print(f"[Sandbox] Run {run_id} 鎵ц寮傚父: {e}")
+        _get_snapshot_mgr().update_status(run_id, "FAILED")
+
+
+@router.get("/runs/{run_id}/quality", summary="鏁版嵁璐ㄩ噺鎶ュ憡锛圔4锛?)
+async def get_quality_report(run_id: str):
+    """杩斿洖 Run 鐨勬暟鎹川閲忔姤鍛婂崱"""
+    record = _get_snapshot_mgr().get_run(run_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Run 涓嶅瓨鍦?)
+    qp = record.run_dir / "quality_report.json"
+    if qp.exists():
+        return {"run_id": run_id,
+                "report": json.loads(qp.read_text(encoding="utf-8"))}
+    return {"run_id": run_id, "report": [], "message": "璐ㄩ噺鎶ュ憡鏈敓鎴愶紙鏂囦欢鍙兘宸插垹闄わ級"}
+
+
+# 鈹€鈹€ B5 鎰忓浘婢勬竻鍥炶矾 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+
+_STANDARD_INTENTS = {
+    "瀵硅处": ["鏍稿", "瀵硅处", "鍖归厤", "姣斿", "鏍稿疄", "鏍稿"],
+    "鍑借瘉": ["鍑借瘉", "璇㈣瘉", "纭鍑?],
+    "鎶芥牱": ["鎶芥牱", "鎶藉嚟", "鎶介€?],
+    "鎶ュ憡": ["鎶ュ憡", "搴曠", "鐢熸垚鎶ュ憡", "鍑哄叿"],
+    "鍒嗘瀽": ["鍒嗘瀽", "娉㈠姩", "瓒嬪娍", "寮傚父"],
+}
+
+_SLOT_REQUIRED = {
+    "鏍稿": ["鏁版嵁閿?],
+    "瀵硅处": ["閾惰璐︽埛", "瀵硅处鏈熼棿", "鏁版嵁閿?],
+    "鍖归厤": ["鍖归厤缁村害锛堥噾棰?鏃ユ湡/瀵规墜鏂癸級"],
+    "鍑借瘉": ["闃堝€?, "妯℃澘绫诲瀷"],
+    "鎶芥牱": ["鎶芥牱鏂规硶", "鏍锋湰閲?],
+    "鎶ュ憡": ["搴曠鏉ユ簮"],
+    "鍒嗘瀽": ["鎸囨爣", "鏈熼棿"],
+}
+
+
+@router.post("/runs/{run_id}/clarify", summary="鎰忓浘婢勬竻妫€鏌?)
+async def clarify_intent(run_id: str):
+    """妫€鏌ュ璁″笀鎸囦护鏄惁鏈夌己澶辨Ы浣嶏紝杩斿洖寰呰拷闂」銆?
+    缂栬瘧鍓嶈皟鐢ㄦ绔偣锛岃嫢杩斿洖 missing_slots 闈炵┖锛屽簲寮圭獥杩介棶锛?    鍏ㄩ儴婢勬竻鍚庡啀瑙﹀彂缂栬瘧銆?    """
+    record = _get_snapshot_mgr().get_run(run_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Run 涓嶅瓨鍦?)
+    intent = (record.user_intent or "").strip()
+    if not intent:
+        return {"run_id": run_id, "intent": "", "complete": False,
+                "missing_slots": ["璇锋弿杩板璁′换鍔?]}
+
+    # 鍏抽敭璇嶅尮閰?    matched_scene = None
+    for scene, keywords in _STANDARD_INTENTS.items():
+        if any(k in intent for k in keywords):
+            matched_scene = scene
+            break
+
+    if not matched_scene:
+        return {"run_id": run_id, "intent": intent, "complete": True,
+                "scene": "閫氱敤浠诲姟", "missing_slots": []}
+
+    # 妫€鏌ュ繀瑕佹Ы浣?    missing = []
+    for kw, slots in _SLOT_REQUIRED.items():
+        if kw in intent:
+            # 瀹瑰樊妫€鏌ワ細鏈夋暟瀛?鍗曚綅璇嶏紙涓?鍏?%/浠ュ唴/涓嶈秴杩囷級鍒欒涓哄凡濉?            if "瀹瑰樊" in slots and not re.search(r"\d+\s*(涓噟鍏億%|浠ュ唴|涓嶈秴杩噟浠ュ唴)", intent):
+                missing.append("瀹瑰樊闃堝€硷紙濡?5涓囦互鍐?鎴?10%'锛涢€愮瑪閾惰鏍稿榛樿 卤0.01 鍏冩棤闇€鎸囧畾锛?)
+            if "鏁版嵁閿? in slots and not re.search(r"鎸塡s*\S+|鏍规嵁\s*\S+|鐢╘s*\S+", intent):
+                missing.append("瀵硅处渚濇嵁锛堝'鎸夐噾棰?鏃ユ湡'鎴?鎸夊嚟璇佸彿'锛屼笉鎸囧畾鍒欒嚜鍔ㄨ瘑鍒級")
+            if "閾惰璐︽埛" in slots and not re.search(r"(璐﹀彿|璐︽埛|\d{6,})", intent):
+                missing.append("瀵硅处閾惰璐︽埛/璐﹀彿锛堝'鍐滆5927'锛涙祦姘村惈澶氳处鎴锋椂寮虹儓寤鸿鎸囧畾锛?)
+            if "瀵硅处鏈熼棿" in slots and not re.search(r"(\d{4}\s*骞磡\d+\s*涓?鏈坾瀛ｅ害|鏈熼棿|骞村害|\d{4}[-/]\d+)", intent):
+                missing.append("瀵硅处鏈熼棿锛堝'2026骞?-3鏈?锛?)
+            if "鎶芥牱鏂规硶" in slots and not re.search(r"(MUS|璐у竵鍗曚綅|闅忔満|鍒嗗眰|绯荤粺閫夋牱|PPS)", intent, re.I):
+                missing.append("鎶芥牱鏂规硶锛圡US璐у竵鍗曚綅/绠€鍗曢殢鏈?鍒嗗眰锛岄粯璁?MUS锛?)
+            if "闃堝€? in slots and not re.search(r"\d+\s*(涓噟鍏億浠ヤ笂|瓒呰繃|澶т簬)", intent):
+                missing.append("绛涢€夐槇鍊硷紙濡?瓒呰繃50涓?锛?)
+            if "鏍锋湰閲? in slots and not re.search(r"\d+\s*绗攟鎶絓s*\d+|鍙朶s*\d+", intent):
+                missing.append("鏍锋湰閲忥紙濡?鎶?0绗?锛?)
+            break
+
+    return {
+        "run_id": run_id,
+        "intent": intent,
+        "scene": matched_scene,
+        "complete": len(missing) == 0,
+        "missing_slots": missing,
+        "hint": f"寤鸿琛ュ厖锛歿'锛?.join(missing)}" if missing else "鎸囦护瀹屾暣"
+    }
+
+
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?# 閾捐矾鍙娴嬫€?API锛堣鍒?B2锛?# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
+@router.get("/runs/{run_id}/trace", summary="鍗?Run 閾捐矾鐎戝竷")
+async def get_run_trace(run_id: str):
+    from core.pipeline_trace import get_trace, waterfall
+    return {"run_id": run_id, "events": get_trace(run_id),
+            "waterfall": waterfall(run_id)}
+
+
+@router.get("/pipeline/stats", summary="閾捐矾鑱氬悎缁熻锛堣繎N涓猂un锛?)
+async def get_pipeline_stats(last_n: int = 50):
+    from core.pipeline_trace import stats
+    return stats(last_n)
+
+
+@router.get("/presets", summary="棰勮鎸夐挳缁熶竴娉ㄥ唽琛?)
+async def list_presets():
+    """鍓嶇棰勮鎸夐挳鍒楄〃锛堝崟涓€浜嬪疄鏉ユ簮 config/presets.py锛涘墠绔姩鎬佹覆鏌撶敤锛?""
+    try:
+        from config.presets import public_list
+        return {"success": True, "presets": public_list()}
+    except Exception as e:
+        return {"success": False, "error": str(e), "presets": []}
+
+
+@router.get("/internal-kb/summary", summary="浜嬪姟鎵€鍐呴儴鐭ヨ瘑搴撴瑙?)
+async def internal_kb_summary():
+    """鍐呴儴鏂囦欢锛圫OP/搴曠妯℃澘/璇㈣瘉鍑借寖鏈級鏂囦欢鍚嶇储寮曟瑙堬紙涓嶈鏂囦欢鍐呭锛?""
+    try:
+        from core.internal_kb_registry import build_index, completion_checklist, summary
+        idx = build_index()
+        return {"success": True, "summary_text": summary(),
+                "categories": idx.get("categories", {}),
+                "templates_count": len(idx.get("templates", [])),
+                "confirmation_forms": [t["rel"] for t in idx.get("confirmation_forms", [])],
+                "completion_required": completion_checklist()}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?# RAG 鐭ヨ瘑搴撶鐞?API
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
+@router.get("/rag/status")
+async def rag_status():
+    """鑾峰彇 RAG 鐭ヨ瘑搴撳畬鏁寸姸鎬侊紙绱㈠紩缁熻 + 鐩綍鎵弿 + 鏂伴矞搴︽鏌ワ級"""
+    try:
+        from core.rag_admin import get_rag_status
+        return {"success": True, "data": get_rag_status()}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@router.post("/rag/search")
+async def rag_search(query: str = Form(...), top_k: int = Form(5)):
+    """RAG 鐭ヨ瘑搴撴绱紙渚涘墠绔煡璇嗛棶绛斾娇鐢級"""
+    try:
+        results = await asyncio.to_thread(_rag_retrieve_best, query, top_k)
+        return {"success": True, "data": results}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@router.post("/rag/rebuild")
+async def rag_rebuild(force: bool = True):
+    """寮哄埗閲嶅缓 RAG 绱㈠紩锛堝綋瀹¤甯堜笅杞芥柊娉曡鍚庤皟鐢級"""
+    try:
+        from core.rag_admin import rebuild_index
+        result = rebuild_index(force=force)
+        return {"success": True, "data": result}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+
+def _rag_retrieve_best(query: str, top_k: int) -> list:
+    """妫€绱㈣川閲忎紭鍏堢骇锛氭贩鍚堟绱紙鍚戦噺+鍏抽敭璇?RRF 铻嶅悎锛夆啋 绾?TF-IDF"""
+    from core.rag_engine import hybrid_retrieve, retrieve
+    try:
+        results = hybrid_retrieve(query, top_k=top_k)
+        if results:
+            return results
+    except Exception as e:
+        print(f"[RAG] 娣峰悎妫€绱笉鍙敤锛岄檷绾?TF-IDF: {e}")
+    return retrieve(query, top_k=top_k)
+
+
+@router.post("/rag/qa")
+async def rag_qa(
+    query: str = Form(...),
+    history: str = Form("[]"),
+    top_k: int = Form(5),
+):
+    """鐭ヨ瘑闂瓟锛圧AG 妫€绱?+ LLM 鐢熸垚寮忓洖绛旓紝鏀寔澶氳疆杩介棶锛?
+    鐧界毊涔?搂4.1 鐭ヨ瘑妫€绱㈡ā寮忕殑瀹屾暣瀹炵幇锛氭绱㈠寮?鐢熸垚"锛岃€岄潪瑁告绱€?    闄嶇骇閾撅細vLLM 鍚堟垚鍥炵瓟 鈫?绾绱㈢墖娈碉紙AI 绂荤嚎鏃跺墠绔粛鍙敤锛夈€?    """
+    # 1) 妫€绱紙绾跨▼姹犳墽琛岋紝閬垮厤闃诲浜嬩欢寰幆锛?    try:
+        chunks = await asyncio.to_thread(_rag_retrieve_best, query, top_k)
+    except Exception as e:
+        print(f"[RAG-QA] 妫€绱㈠け璐? {e}")
+        chunks = []
+
+    # 2) 瑙ｆ瀽澶氳疆瀵硅瘽鍘嗗彶锛堜粎淇濈暀鏈€杩?6 鏉″悎娉曟秷鎭級
+    try:
+        hist_raw = json.loads(history or "[]")
+    except Exception:
+        hist_raw = []
+    hist = [
+        {"role": m["role"], "content": str(m["content"])[:2000]}
+        for m in (hist_raw if isinstance(hist_raw, list) else [])
+        if isinstance(m, dict) and m.get("role") in ("user", "assistant") and m.get("content")
+    ][-6:]
+
+    # 3) 缁勮鐢熸垚涓婁笅鏂囷紙鐗囨 + 鏉ユ簮鏍囨敞锛?    context_blocks = [
+        f"銆愮墖娈祘i} | 鏉ユ簮: {c.get('source', '鏈煡')}銆慭n{(c.get('text') or '')[:800]}"
+        for i, c in enumerate(chunks, 1)
+    ]
+    context_text = "\n\n".join(context_blocks) if context_blocks else "锛堢煡璇嗗簱鏈绱㈠埌鐩存帴鐩稿叧鍐呭锛?
+
+    system_prompt = (
+        "浣犳槸浼氳甯堜簨鍔℃墍鐨勫璁℃櫤鑳藉姪鎵嬶紝鍐呭祵浜庢湰鍦板璁″钩鍙般€傚洖绛旇鍒欙細\n"
+        "1. 鍏堢洿鎺ュ洖绛旈棶棰橈紙鍒嗘楠?鍒嗚鐐广€佸彲鎵ц锛夛紝涓嶈鍙綏鍒楁硶鏉″師鏂囷紱\n"
+        "2. 寮曠敤鐭ヨ瘑搴撶墖娈垫椂鏍囨敞锛堜緷鎹細鏂囦欢鍚嶏級锛涚煡璇嗗簱瑕嗙洊涓嶅埌鏃剁敤瀹¤閫氱敤瀹炲姟鍥炵瓟锛?
+        "骞舵敞鏄庯紙閫氱敤瀹炲姟缁忛獙锛岃浠ュ噯鍒欏師鏂囦负鍑嗭級锛沑n"
+        "3. 鑻ラ棶棰樻秹鍙婂钩鍙板彲浠ｅ姙鐨勪换鍔★紙瀵硅处/鍑借瘉/搴曠/鎶ュ憡鐢熸垚/鏍煎紡瑙勮寖鍖栵級锛?
+        "琛ュ厖璇存槑鎿嶄綔璺緞锛氬湪宸ヤ綔鍙颁笂浼犳暟鎹?鈫?鐢ㄤ竴鍙ヨ瘽涓嬭揪鎸囦护锛堝'鏍规嵁搴曠鐢熸垚鎶ュ憡姝ｆ枃'锛夆啋 瀹℃壒鍚庤嚜鍔ㄦ墽琛岋紱\n"
+        "4. 鐢ㄤ腑鏂囧洖绛旓紝400 瀛椾互鍐呫€?
+    )
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(hist)
+    messages.append({"role": "user", "content": f"銆愮煡璇嗗簱鐗囨銆慭n{context_text}\n\n銆愰棶棰樸€慭n{query}"})
+
+    # 4) LLM 鍚堟垚鍥炵瓟锛堝け璐ヨ嚜鍔ㄩ檷绾т负绾绱級
+    answer, engine = "", "retrieval_only"
+    try:
+        client = _get_http_client()
+        resp = await client.post(
+            VLLM_TUNNEL_URL,
+            headers={"Authorization": f"Bearer {VLLM_API_KEY}"},
+            json={"model": VLLM_MODEL, "messages": messages,
+                  "temperature": 0.3, "max_tokens": 1024},
+        )
+        resp.raise_for_status()
+        answer = resp.json()["choices"][0]["message"]["content"].strip()
+        answer = _re.sub(r"<think>[\s\S]*?</think>", "", answer).strip()
+        engine = "vllm_rag" if chunks else "vllm_general"
+    except Exception as e:
+        print(f"[RAG-QA] vLLM 涓嶅彲鐢紝闄嶇骇绾绱? {e}")
+
+    return {"success": True, "data": {
+        "answer": answer,
+        "engine": engine,
+        "sources": [
+            {"source": c.get("source", ""), "category": c.get("category", ""),
+             "score": c.get("score", 0), "text": (c.get("text") or "")[:300]}
+            for c in chunks
+        ],
+    }}
+
+
+@router.get("/rag/freshness")
+async def rag_freshness():
+    """妫€鏌ョ储寮曟柊椴滃害锛堟槸鍚︽湁鏂版枃浠堕渶瑕侀噸寤猴級"""
+    try:
+        from core.rag_admin import check_index_freshness
+        return {"success": True, "data": check_index_freshness()}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+
+
+
+
+
+
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?# Tool-Use Agent API锛堜竴涓鐐瑰鐞嗕竴鍒囨枃妗ｆ搷浣滐級
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
+@router.post("/agent/run")
+async def agent_run_endpoint(
+    message: str = Form(...),
+    files: List[UploadFile] = File([]),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+):
+    """
+    Tool-Use Agent锛氫笂浼犱换鎰忔枃妗?+ 鑷劧璇█鎸囦护 鈫?LLM 鑷閫夋嫨宸ュ叿澶勭悊銆?
+    鏀寔鐨勬枃浠舵牸寮忥細md / docx / xlsx / xls / txt / csv
+    鏀寔鐨勬寚浠わ細瑙ｆ瀽銆佹彁鍙栥€佸～鍏呫€佹敼鍐欍€佸悎骞躲€佸姣斻€佹牸寮忚浆鎹€佹壒閲忔牸寮忓寲銆佺敓鎴愭姤鍛娿€佺煡璇嗘绱?
+    渚嬶細
+      "甯垜鎶婄涓夌珷鎻愬彇鍑烘潵" + 涓婁紶鎶ュ憡.md
+      "鐢ㄨ繖浠芥ā鏉跨粺涓€杩欎簲浠紼xcel鐨勬牸寮? + 涓婁紶妯℃澘.xlsx + 浜斾唤鏂囦欢
+      "瀵规瘮杩欎袱浠芥姤鍛婏紝鎵惧嚭鏁板瓧涓嶄竴鏍风殑鍦版柟" + 涓婁紶涓や唤.docx
+    """
+    try:
+        import time, shutil
+
+        # 淇濆瓨涓婁紶鏂囦欢鍒版矙绠?        upload_dir = Path("data/uploads")
+        upload_dir.mkdir(parents=True, exist_ok=True)
+
+        file_infos = []
+        for f in (files or []):
+            if not f.filename: continue
+            safe_name = f"{int(time.time())}_{f.filename}"
+            dest = upload_dir / safe_name
+            with open(dest, "wb") as df:
+                df.write(await f.read())
+            file_infos.append({
+                "name": f.filename,
+                "path": str(dest.relative_to("data")),
+                "format": Path(f.filename).suffix.lower(),
+            })
+
+        # 璋冪敤 Agent锛堝紓姝ラ潪闃诲锛?        from core.agent import agent_run
+        result = await agent_run(message, file_infos)
+
+        return {"success": True, "reply": result, "files_processed": len(file_infos)}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+# 澶欰gent鍗忎綔绠＄嚎 API
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+
+AGENT_PIPELINE_EXTENSIONS = {".md", ".txt", ".xlsx", ".xls", ".csv", ".docx", ".doc"}
+
+@router.post("/agent/pipeline")
+async def agent_pipeline(
+    message: str = Form(...),
+    stages: str = Form(""),
+    files: List[UploadFile] = File([]),
+):
+    """澶欰gent鍗忎綔绠＄嚎锛氶棶棰樻娊鍙?鈫?閫昏緫鎺ㄧ悊 鈫?娉曡妫€绱?鈫?鎶ュ憡鎾板啓銆?
+    澶嶆潅闂鑷姩鎷嗚В锛氬洓涓笓涓?Agent 涓茶鍗忎綔锛屽墠搴忚緭鍑烘敞鍏ュ悗搴忎笂涓嬫枃銆?    stages: 閫楀彿鍒嗛殧闃舵锛坕ssue_extractor,logic_reasoner,regulation_searcher,report_writer锛夛紝
+            鐣欑┖ = 鍏ㄩ儴 4 涓樁娈点€?    """
+    import time as _time
+    t0 = _time.time()
+    try:
+        upload_dir = Path("data/uploads")
+        upload_dir.mkdir(parents=True, exist_ok=True)
+
+        file_infos = []
+        for f in (files or []):
+            if not f or not f.filename:
+                continue
+            safe_name = Path(f.filename).name
+            ext = Path(safe_name).suffix.lower()
+            if safe_name != f.filename:
+                raise HTTPException(status_code=400, detail=f"鏂囦欢鍚嶅寘鍚潪娉曡矾寰勫瓧绗? {f.filename}")
+            if ext not in AGENT_PIPELINE_EXTENSIONS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"涓嶆敮鎸佺殑鏂囦欢绫诲瀷 {ext}锛堝厑璁? {', '.join(sorted(AGENT_PIPELINE_EXTENSIONS))}锛?)
+            content = await f.read()
+            if len(content) > MAX_UPLOAD_SIZE:
+                raise HTTPException(status_code=400, detail=f"鏂囦欢杩囧ぇ: {safe_name}")
+            stored = f"{int(_time.time())}_{safe_name}"
+            (upload_dir / stored).write_bytes(content)
+            # toolbox 娌欑鏍逛负 data/锛孉gent 璋冪敤 read_file 鏃朵娇鐢ㄧ浉瀵?data/ 鐨勮矾寰?            file_infos.append({"name": safe_name, "path": f"uploads/{stored}", "format": ext})
+
+        valid = {"issue_extractor", "logic_reasoner", "regulation_searcher", "report_writer"}
+        stage_list = [s.strip() for s in (stages or "").split(",") if s.strip() in valid] or None
+
+        from core.multi_agent import run_audit_pipeline
+        result = await run_audit_pipeline(message, file_infos, stage_list)
+        return {
+            "success": True,
+            "data": result,
+            "files_processed": len(file_infos),
+            "elapsed_seconds": round(_time.time() - t0, 1),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {"success": False, "error": str(e),
+                "elapsed_seconds": round(_time.time() - t0, 1)}
+
+
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?# 妯℃澘寮曟搸 API
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
+@router.get("/templates/list")
+async def template_list():
+    """鍒楀嚭鎵€鏈夊彲鐢ㄦā鏉匡紙鍙繑鍥炴枃浠跺悕鍜岀洰褰曪紝涓嶈繑鍥炲唴瀹癸級"""
+    try:
+        from core.template_engine import list_templates
+        templates = [{"name": t.name, "format": t.format,
+                      "category": t.category, "size_mb": t.size_mb}
+                     for t in list_templates()]
+        return {"success": True, "data": templates}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@router.post("/templates/match")
+async def template_match(intent: str = Form(...)):
+    """鏍规嵁鐢ㄦ埛鎰忓浘鑷姩鍖归厤鍚堥€傜殑妯℃澘"""
+    try:
+        from core.template_engine import match_template
+        result = match_template(intent)
+        return {"success": True, "template": result}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@router.post("/templates/fill")
+async def template_fill(
+    template_path: str = Form(""),
+    data_json: str = Form("{}"),
+    user_intent: str = Form(""),
+):
+    """濉厖妯℃澘骞跺彟瀛橈紝淇濈暀鍏ㄩ儴鏍煎紡"""
+    try:
+        data = json.loads(data_json) if data_json else {}
+        from core.template_engine import fill_template
+        out = fill_template(template_path=template_path, data=data, user_intent=user_intent)
+        return {"success": True, "file": out, "message": f"宸茬敓鎴? {Path(out).name}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@router.post("/templates/batch-format")
+async def template_batch_format(
+    template: UploadFile = File(...),
+    targets: List[UploadFile] = File(...),
+    format_type: str = Form("auto"),
+):
+    """
+    鎵归噺鏍煎紡瑙勮寖鍖栵細浠ョ涓€涓枃浠朵负妯℃澘锛岀粺涓€鎵€鏈夊叾浠栨枃浠剁殑鏍煎紡銆?
+    - template: 鏍煎紡妯℃澘鏂囦欢锛圗xcel鎴朩ord锛?    - targets: 闇€瑕佽皟鏁存牸寮忕殑涓€鎵规枃浠?    - format_type: "excel"/"word"/"auto"锛堣嚜鍔ㄨ瘑鍒級
+
+    鍙敼鏍煎紡锛屼笉鏀规暟鎹€?    """
+    try:
+        import tempfile, shutil, time
+
+        out_dir = str(Path("data/outputs").resolve())
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+
+        # 淇濆瓨妯℃澘
+        tmpl_ext = Path(template.filename).suffix.lower()
+        tmpl_path = str(Path(out_dir) / f"_tmpl_{int(time.time())}{tmpl_ext}")
+        with open(tmpl_path, "wb") as f:
+            f.write(await template.read())
+
+        # 淇濆瓨鐩爣鏂囦欢
+        target_paths = []
+        for t in targets:
+            tp = str(Path(out_dir) / f"_tgt_{int(time.time())}_{t.filename}")
+            with open(tp, "wb") as f:
+                f.write(await t.read())
+            target_paths.append(tp)
+
+        # 鎵ц鎵归噺瑙勮寖鍖?        if format_type == "auto":
+            format_type = "excel" if tmpl_ext in (".xlsx", ".xls") else "word"
+
+        if format_type == "excel":
+            from core.format_engine import batch_normalize_excel
+            results = batch_normalize_excel(tmpl_path, target_paths, out_dir)
+        else:
+            from core.format_engine import batch_normalize_word
+            results = batch_normalize_word(tmpl_path, target_paths, out_dir)
+
+        # 娓呯悊涓存椂鏂囦欢
+        try: os.unlink(tmpl_path)
+        except: pass
+        for tp in target_paths:
+            try: os.unlink(tp)
+            except: pass
+
+        return {
+            "success": True,
+            "total": len(results),
+            "ok": sum(1 for r in results if r["status"] == "ok"),
+            "failed": sum(1 for r in results if r["status"] != "ok"),
+            "results": results,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@router.post("/templates/generate")
+async def template_generate(
+    data_json: str = Form("{}"),
+    user_instruction: str = Form(...),
+    template_path: str = Form(""),
+    style_guides_json: str = Form("[]"),
+):
+    """
+    瑙勮寖椹卞姩鐨勬姤鍛婄敓鎴愩€?
+    - 鏈夋ā鏉挎椂浠ユā鏉夸负楠ㄦ灦濉厖锛屼繚鐣欏叏閮ㄦ牸寮?    - 鏈夋帓鐗堣鑼冩椂LLM涓ユ牸閬佃鍒欑敓鎴?    - 涓よ€呭彲鍚屾椂浣跨敤锛氭ā鏉挎彁渚涚粨鏋勶紝瑙勮寖绾︽潫鏍煎紡
+    """
+    try:
+        data = json.loads(data_json) if data_json else {}
+        style_guides = json.loads(style_guides_json) if style_guides_json else []
+
+        from core.template_engine import generate_formatted_report
+        out = generate_formatted_report(
+            data=data,
+            user_instruction=user_instruction,
+            template_path=template_path,
+            style_guides=style_guides,
+        )
+        return {"success": True, "file": out, "message": f"宸茬敓鎴? {Path(out).name}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?# Markdown 鏂囨。寮曟搸 API
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
+@router.post("/md/parse")
+async def md_parse(file: UploadFile = File(...)):
+    """涓婁紶 md 鏂囦欢 鈫?瑙ｆ瀽涓虹粨鏋勫寲 JSON锛堟爣棰樻爲/娈佃惤/琛ㄦ牸/鍒楄〃锛?""
+    try:
+        text = (await file.read()).decode("utf-8")
+        from core.md_engine import parse_md_text
+        doc = parse_md_text(text, file.filename)
+        return {"success": True, "data": {
+            "title": doc.title,
+            "toc": [{"level": lv, "title": t} for lv, t in doc.toc],
+            "headings": [{"level": n.level, "text": n.text} for n in doc.headings()],
+            "tables": len(doc.tables()),
+            "nodes": [{"type": n.type, "text": n.text[:200], "level": n.level} for n in doc.nodes[:50]],
+            "front_matter": doc.front_matter,
+        }}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@router.post("/md/fill")
+async def md_fill(
+    template: UploadFile = File(...),
+    variables: str = Form("{}"),
+):
+    """涓婁紶妯℃澘 + JSON鍙橀噺 鈫?{{ }} 鍗犱綅绗︽浛鎹㈠～鍏?""
+    try:
+        tmpl = (await template.read()).decode("utf-8")
+        vars_dict = json.loads(variables)
+        from core.md_engine import fill_template_text
+        result = fill_template_text(tmpl, vars_dict)
+        return {"success": True, "data": result}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@router.post("/md/intelligent-fill")
+async def md_intelligent_fill(
+    template: UploadFile = File(...),
+    instruction: str = Form(...),
+    data_json: str = Form("{}"),
+    out_format: str = Form("md"),
+):
+    """
+    鏅鸿兘濉厖锛氫笂浼犱换鎰?md 鏂囨。 + 鑷劧璇█鎸囦护 + 鏁版嵁 鈫?LLM 鑷姩濉厖骞跺彟瀛樸€?
+    渚嬶細
+      涓婁紶"瀹¤鎶ュ憡妯℃澘.md"
+      instruction="璇风敤涓嬮潰鐨勫樊寮傛槑缁嗗～鍐欑涓夌珷鐨勫璁＄粨璁哄拰绗洓绔犵殑宸紓鏄庣粏琛?
+      data_json='{"宸紓鏄庣粏": [...], "缁撹": "..."}'
+      out_format="docx"
+      鈫?杩斿洖濉厖鍚庣殑 docx 鏂囦欢璺緞
+    """
+    try:
+        tmpl = (await template.read()).decode("utf-8")
+        data = json.loads(data_json) if data_json else {}
+        from core.md_engine import intelligent_fill_text
+
+        # 鐢熸垚杈撳嚭璺緞
+        import time
+        out_name = f"filled_{int(time.time())}.{out_format}"
+        out_path = str(Path("data/downloads") / out_name)
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+
+        result = intelligent_fill_text(tmpl, instruction, data, out=out_path, out_format=out_format)
+        return {
+            "success": True,
+            "file": out_path,
+            "format": out_format,
+            "data": result if out_format == "md" else None,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@router.post("/md/generate")
+async def md_generate(
+    description: str = Form(...),
+    data_json: str = Form("{}"),
+    template_name: str = Form(""),
+):
+    """鑷劧璇█鎻忚堪 + 鏁版嵁 鈫?LLM 鍔ㄦ€佺敓鎴?md 鎶ュ憡"""
+    try:
+        data = json.loads(data_json)
+        from core.md_engine import generate_report
+        result = generate_report(description, data, template=template_name)
+        return {"success": True, "data": result}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@router.post("/md/rewrite")
+async def md_rewrite(
+    file: UploadFile = File(...),
+    instruction: str = Form("浼樺寲鎺緸锛屼娇鍏舵洿涓撲笟"),
+):
+    """涓婁紶 md 鏂囦欢 鈫?LLM 鏀瑰啓 鈫?杩斿洖鏀瑰啓鍚庣殑 md"""
+    try:
+        text = (await file.read()).decode("utf-8")
+        from core.md_engine import rewrite_text
+        result = rewrite_text(text, instruction)
+        return {"success": True, "data": result}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@router.post("/md/convert")
+async def md_convert(
+    file: UploadFile = File(...),
+    target_format: str = Form("docx"),
+):
+    """涓婁紶 md 鏂囦欢 鈫?杞负 docx/html"""
+    try:
+        import tempfile, os
+        text = (await file.read()).decode("utf-8")
+        # 鍐欏叆涓存椂鏂囦欢
+        with tempfile.NamedTemporaryFile(suffix=".md", delete=False, mode="w", encoding="utf-8") as tmp:
+            tmp.write(text)
+            tmp_path = tmp.name
+
+        if target_format == "html":
+            from core.md_engine import md_to_html
+            result = md_to_html(tmp_path)
+            os.unlink(tmp_path)
+            return {"success": True, "data": result, "format": "html"}
+        else:
+            from core.md_engine import md_to_docx
+            out = tmp_path.replace(".md", ".docx")
+            md_to_docx(tmp_path, out)
+            os.unlink(tmp_path)
+            return {"success": True, "file": out, "format": "docx",
+                    "message": "docx 宸茬敓鎴愬埌鏈嶅姟鍣ㄦ湰鍦帮紝璇烽€氳繃涓嬭浇鎺ュ彛鑾峰彇"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?# 搴旂敤鍏ュ彛
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
+def create_app() -> FastAPI:
+    app = FastAPI(title="鏅鸿兘瀹¤澶ц剳 v3.0", version="3.0.0")
+    app.include_router(router)
+
+    # 鈹€鈹€ 鍚姩鏃跺悗鍙板紓姝ラ寤?RAG 绱㈠紩锛堜笉闃诲鏈嶅姟鍚姩锛夆攢鈹€
+    @app.on_event("startup")
+    async def startup_prebuild_rag():
+        import asyncio
+        loop = asyncio.get_event_loop()
+        print("[Startup] 鍚庡彴棰勫缓 RAG 鐭ヨ瘑搴撶储寮曪紙鏈嶅姟宸插氨缁紝鏃犻渶绛夊緟锛?..")
+
+        def _build():
+            from core.rag_engine import build_index
+            try:
+                count = build_index(False)
+                print(f"[Startup] RAG 绱㈠紩灏辩华: {count} 涓枃鏈潡")
+            except Exception as e:
+                print(f"[Startup] RAG 绱㈠紩棰勫缓澶辫触锛堥潪鑷村懡锛? {e}")
+
+        # fire-and-forget锛氫笉闃诲鍚姩
+        loop.run_in_executor(None, _build)
+
+    return app
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    app = create_app()
+    uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -1,0 +1,52 @@
+        elif op_name == "Reconcile":
+            # 轻量逐笔对账（方向镜像 + ±0.01 精确 + 日期窗口），详细专业版见对账快车道
+            dep_ids = params.get("depends_on", [])
+            src_vars = []
+            for dep_id in dep_ids:
+                dep_op = op_map.get(dep_id)
+                if dep_op:
+                    src_vars.append(alias_vars.get(dep_op.get('output_alias'), f'df_{dep_id}'))
+            if len(src_vars) < 2:
+                all_vars = list(alias_vars.values())
+                src_vars = all_vars[-2:] if len(all_vars) >= 2 else (src_vars + ['df', 'df'])
+            left_var, right_var = (src_vars[0], src_vars[1]) if len(src_vars) >= 2 else ('df', 'df')
+            try:
+                rc_tol = float(params.get("tolerance_abs", 0.01))
+            except (ValueError, TypeError):
+                rc_tol = 0.01
+            try:
+                rc_dw = int(params.get("date_window_days", 3))
+            except (ValueError, TypeError):
+                rc_dw = 3
+            code_lines.extend([
+                f"if '{left_var}' in dir() and '{right_var}' in dir() and not {left_var}.empty and not {right_var}.empty:",
+                f"    {op_alias} = _reconcile_lite({left_var}, {right_var}, dw={rc_dw}, tol={rc_tol})",
+                f"else:",
+                f"    print('[Reconcile] 输入为空，无法对账')",
+                f"    {op_alias} = pd.DataFrame()",
+            ])
+            alias_vars[op_alias] = op_alias
+            last_df_var = op_alias
+
+        elif op_name == "AuditAdjustment":
+            # 审计调整建议：基于 Diff 差异列生成（科目需人工确认，平台不臆造）
+            dep_ids = params.get("depends_on", [])
+            src_var = last_df_var
+            for dep_id in dep_ids:
+                dep_op = op_map.get(dep_id)
+                if dep_op:
+                    src_var = alias_vars.get(dep_op.get('output_alias'), last_df_var)
+                    break
+            src_var = src_var or 'df'
+            code_lines.extend([
+                f"if '{src_var}' in dir() and {src_var} is not None and not {src_var}.empty and '差异' in {src_var}.columns:",
+                f"    _adj = {src_var}[pd.to_numeric({src_var}['差异'], errors='coerce').abs() > 0.01].copy()",
+                f"    _adj['调整建议'] = '差异 ' + pd.to_numeric(_adj['差异'], errors='coerce').round(2).astype(str) + ' 元；借/贷科目待审计师确认'",
+                f"    {op_alias} = _adj",
+                f"    print('[AuditAdjustment] 调整建议 ' + str(len(_adj)) + ' 条（科目需人工确认）')",
+                f"else:",
+                f"    print('[AuditAdjustment] 输入无差异列或为空，输出空调整表')",
+                f"    {op_alias} = pd.DataFrame(columns=['调整建议'])",
+            ])
+            alias_vars[op_alias] = op_alias
+            last_df_var = op_alias
