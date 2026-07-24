@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-一键扫雷引擎 (risk_scanner.py)
-扔一堆文件 → 自动识别 → 配对/降级 → 双边/单侧红旗 → 任务卡归并。
+多文件风险筛查引擎 (risk_scanner.py)
+扔一堆文件 → 自动识别 → 配对/降级 → 双边/单侧异常交易特征 → 重点核查事项归并。
 三条纪律：①聚合输出 ②降级优雅 ③单侧打折标注
 """
 
@@ -26,7 +26,7 @@ def scan_files(file_paths: List[str], out_dir: str = None) -> Dict[str, Any]:
     for u in unknowns:
         degrade_notes.append(f"{u['name']}: 无法识别类型，仅做基础体检")
     for s in singles:
-        degrade_notes.append(f"{s['name']}: 单文件({s['type']})，仅做单侧红旗初筛")
+        degrade_notes.append(f"{s['name']}: 单文件({s['type']})，仅做单侧异常特征初筛")
 
     results = {"task_cards": [], "red_flags": [], "degrade_notes": degrade_notes,
                "stats": {"total_files": len(files), "paired": len(pairs) * 2,
@@ -81,7 +81,7 @@ def scan_files(file_paths: List[str], out_dir: str = None) -> Dict[str, Any]:
 
     # 阶段四：导出
     if out_dir:
-        out_path = Path(out_dir) / "扫雷结果_任务卡看板.xlsx"
+        out_path = Path(out_dir) / "多文件风险筛查结果_重点核查事项.xlsx"
         _export_scan_report(out_path, results)
         results["output_file"] = str(out_path)
 
@@ -177,8 +177,8 @@ def _export_scan_report(path: Path, results):
     from openpyxl.styles import Font
     from openpyxl.utils import get_column_letter
     wb = Workbook()
-    ws = wb.active; ws.title = "任务卡看板"
-    hdrs = ["对手方", "旗型", "笔数", "涉及金额", "证明力", "来源文件"]
+    ws = wb.active; ws.title = "重点核查事项"
+    hdrs = ["对手方", "特征类型", "笔数", "涉及金额", "证据充分性", "来源文件"]
     for i, h in enumerate(hdrs, 1):
         ws.cell(row=1, column=i, value=h).font = Font(bold=True)
     for ri, card in enumerate(results.get("task_cards", []), 2):
@@ -193,16 +193,16 @@ def _export_scan_report(path: Path, results):
     for ci, w in {1: 26, 2: 18, 3: 8, 4: 16, 5: 30, 6: 30}.items():
         ws.column_dimensions[get_column_letter(ci)].width = w
 
-    ws2 = wb.create_sheet("降级说明")
-    ws2.cell(row=1, column=1, value="降级说明").font = Font(bold=True, size=14)
+    ws2 = wb.create_sheet("扫描范围与局限")
+    ws2.cell(row=1, column=1, value="扫描范围与局限").font = Font(bold=True, size=14)
     st = results.get("stats", {})
     items = [
         f"总文件: {st.get('total_files', 0)}",
         f"对账配对: {st.get('matched_pairs', 0)} 对",
         f"单侧扫描: {st.get('single', 0)} 个",
         f"无法识别: {st.get('unknown', 0)} 个",
-        f"任务卡: {st.get('task_card_count', 0)} 张",
-        f"红旗总数: {st.get('total_flags', 0)}",
+        f"重点核查事项: {st.get('task_card_count', 0)} 项",
+        f"异常特征总数: {st.get('total_flags', 0)}",
     ]
     for i, item in enumerate(items, 3):
         ws2.cell(row=i, column=1, value=item)
@@ -211,8 +211,8 @@ def _export_scan_report(path: Path, results):
         ws2.cell(row=i, column=1, value=note)
     ws2.column_dimensions["A"].width = 80
 
-    ws3 = wb.create_sheet("红旗明细")
-    for i, h in enumerate(["类型", "金额", "证明力", "来源", "详情"], 1):
+    ws3 = wb.create_sheet("异常交易特征明细")
+    for i, h in enumerate(["类型", "金额", "证据充分性", "来源", "详情"], 1):
         ws3.cell(row=1, column=i, value=h).font = Font(bold=True)
     for ri, f in enumerate(results.get("red_flags", []), 2):
         ws3.cell(row=ri, column=1, value=f.get("type", ""))
@@ -223,7 +223,7 @@ def _export_scan_report(path: Path, results):
 
     path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(str(path))
-    print(f"[扫雷] 已导出: {path}")
+    print(f"[多文件风险筛查] 已导出: {path}")
 
 
 

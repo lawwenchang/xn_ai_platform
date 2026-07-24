@@ -129,7 +129,7 @@ def generate_audit_report(
 ) -> Path:
     """生成 Word 审计报告。Returns: 报告文件路径
     reconcile_stats: bank_reconcile_engine 返回的 stats 字典
-    workpaper_files: 关联底稿文件列表（分桶看板、核查底稿等）
+    workpaper_files: 关联底稿文件列表（风险分级归类看板、核查底稿等）
     """
     from docx import Document
     from docx.shared import Pt
@@ -331,7 +331,7 @@ def generate_audit_report(
         doc.add_paragraph(
             f"容忍度：{rs.get('tolerance','?')}  |  "
             f"日期窗口：{rs.get('date_window_days','?')}天  |  "
-            f"红旗数：{rs.get('red_flag_count',0)}"
+            f"异常特征数：{rs.get('red_flag_count',0)}"
         )
         # 匹配分层表
         tbl = doc.add_table(rows=7, cols=2, style="Light Grid Accent 1")
@@ -557,7 +557,7 @@ def _render_llm_conclusion(doc, summary: dict, reconcile_stats: dict = None,
         if tc:
             parts = [f"{k}={v}" for k, v in tc.items()]
             facts.append(f"未达四分类：{', '.join(parts)}")
-        facts.append(f"红旗数量：{rs.get('red_flag_count', 0)}")
+        facts.append(f"异常交易特征数量：{rs.get('red_flag_count', 0)}")
         facts.append(f"账方行数：{rs.get('book_rows', 0)}，银方行数：{rs.get('bank_rows', 0)}")
     # 匹配结果
     if ms:
@@ -580,7 +580,7 @@ def _render_llm_conclusion(doc, summary: dict, reconcile_stats: dict = None,
 
     prompt = (
         "你是审计报告撰写专家。根据以下平台已确认的结构化数据，用 3-5 句中文撰写一段审计结论。"
-        "要求：引用具体数字、指出关键风险、语言简洁专业、不编造未提供的数据。\n\n"
+        "要求：引用具体数字、指出关键风险、用审计专业用语，避免技术术语、语言简洁专业、不编造未提供的数据。\n\n"
         f"数据事实：\n{facts_text}\n\n"
         "审计结论："
     )
@@ -873,7 +873,7 @@ def _add_audit_recommendations(doc, reconcile_stats: dict = None, workpaper_file
         ],
     }
     RISK_TEMPLATES = {
-        "high_flags": "⚠ 红旗数量较多（>10项），建议优先处置《异常资金交易清单》中的红旗项",
+        "high_flags": "⚠ 异常交易特征较多（>10项），建议优先处置《异常资金交易清单》中的异常特征项",
         "high_l4": "⚠ L4模糊匹配占比偏高，可能遗漏大量真实匹配，考虑缩小日期窗口或增加对手方名称模糊匹配",
         "large_diff": "⚠ 差额较大，需重点关注未达四分类中金额聚类的对手方，排查资金体外循环风险",
     }
@@ -892,7 +892,7 @@ def _add_audit_recommendations(doc, reconcile_stats: dict = None, workpaper_file
         for wf in workpaper_files:
             fn = Path(wf).name if isinstance(wf, str) else wf
             doc.add_paragraph(f"📎 {fn}", style="List Bullet")
-        doc.add_paragraph("以上文件包含未匹配项的六桶分桶核查清单和按对手方分组的核查底稿，请逐项复核。")
+        doc.add_paragraph("以上文件包含未匹配项的六类风险分级归类核查清单和按对手方分组的核查底稿，请逐项复核。")
 
 
 # ═══════════════════════════════════════════════════════════════
