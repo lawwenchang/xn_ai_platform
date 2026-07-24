@@ -124,8 +124,13 @@ def generate_audit_report(
     output_dir: Path, input_files: List[str],
     execution_logs: List[str] = None,
     match_logic: dict = None,
+    reconcile_stats: dict = None,
+    workpaper_files: List[str] = None,
 ) -> Path:
-    """生成 Word 审计报告。Returns: 报告文件路径"""
+    """生成 Word 审计报告。Returns: 报告文件路径
+    reconcile_stats: bank_reconcile_engine 返回的 stats 字典
+    workpaper_files: 关联底稿文件列表（分桶看板、核查底稿等）
+    """
     from docx import Document
     from docx.shared import Pt
     from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -302,6 +307,52 @@ def generate_audit_report(
             _apply_table_borders(rv_tbl)
             _format_table_cells_fonts(rv_tbl)
 
+    # ===== 对账结果（注入 reconciliation stats）=====
+    if reconcile_stats:
+        doc.add_heading("对账结果摘要", level=1)
+        rs = reconcile_stats
+        doc.add_paragraph(
+            f"匹配率：账方 {rs.get('book_match_rate', 0):.1f}%  |  "
+            f"银方 {rs.get('bank_match_rate', 0):.1f}%"
+        )
+        doc.add_paragraph(
+            f"分层命中：L1={rs.get('matched_L1',0)} L2={rs.get('matched_L2',0)} "
+            f"L3组={rs.get('matched_L3_groups',0)} L4={rs.get('review_L4',0)}"
+        )
+        tc = rs.get("timing_categories", {})
+        if tc:
+            doc.add_paragraph(
+                f"未达四分类：银收企未收={tc.get('银收企未收',0)} "
+                f"银付企未付={tc.get('银付企未付',0)} "
+                f"企收银未收={tc.get('企收银未收',0)} "
+                f"企付银未付={tc.get('企付银未付',0)} "
+                f"待人工核查={tc.get('待人工核查',0)}"
+            )
+        doc.add_paragraph(
+            f"容忍度：{rs.get('tolerance','?')}  |  "
+            f"日期窗口：{rs.get('date_window_days','?')}天  |  "
+            f"红旗数：{rs.get('red_flag_count',0)}"
+        )
+        # 匹配分层表
+        tbl = doc.add_table(rows=7, cols=2, style="Light Grid Accent 1")
+        layers = [
+            ("L1 同额同日", rs.get("matched_L1", 0)),
+            ("L2 同额±3天", rs.get("matched_L2", 0)),
+            ("L3 n:m合计相等", rs.get("matched_L3_groups", 0)),
+            ("L3_fee 手续费差额", rs.get("matched_L3_fee", 0)),
+            ("L3_month 月末汇总", rs.get("matched_L3_month", 0)),
+            ("L4 模糊匹配（待复核）", rs.get("review_L4", 0)),
+        ]
+        tbl.rows[0].cells[0].text = "匹配层级"; tbl.rows[0].cells[1].text = "笔数"
+        for i, (name, cnt) in enumerate(layers):
+            tbl.rows[i+1].cells[0].text = name
+            tbl.rows[i+1].cells[1].text = str(cnt)
+        _apply_table_borders(tbl); _format_table_cells_fonts(tbl)
+
+        # 注入 match_stats 供后续章节用
+        for k, v in rs.items():
+            summary.setdefault("match_stats", {})[k] = v
+
     # ===== 三、执行结果 =====
     doc.add_heading("三、执行结果与数据", level=1)
 
@@ -359,7 +410,7 @@ def generate_audit_report(
 
     # ===== 五、审计建议 =====
     doc.add_heading("五、审计建议与风险提示", level=1)
-    _add_audit_recommendations(doc, scenario)
+    _add_audit_recommendations(doc, scenario, reconcile_stats, workpaper_files)
 
     # ===== 六、执行日志 =====
     if execution_logs:
@@ -686,33 +737,74 @@ def _add_quality_judgment(doc, match_stats: dict):
         doc.add_paragraph("判定结果：匹配效果很差，差额超过30%。当前匹配逻辑可能不正确，建议重新检查数据源、调整筛选关键词、确认回款表的统计口径与银行流水一致。")
 
 
-def _add_audit_recommendations(doc, scenario: str):
-    """根据场景提供专业审计建议"""
-    if scenario in ("medical_match", "medical"):
-        recs = [
-            "核对银行流水中医保回款的摘要描述是否完整覆盖所有医保机构",
-            "关注大额回款的时间分布，确认是否符合医保回款周期（如按季度/月度回款）",
-            "对差额较大的机构进行穿透测试，抽取原始银行回单核实",
-            "根据《社会保险法》及医保回款规定，确认回款比例和时效是否符合政策要求",
-            "关注负值金额（退费/扣款），确认是否有正常审批流程",
-        ]
-    elif scenario in ("match", "balance_match"):
-        recs = [
-            "对未匹配成功的记录逐笔核实，查明差异原因",
-            "关注时间性差异（跨期入账）导致的匹配失败",
-            "检查大额未匹配项是否存在记账错误",
-            "验证匹配关键字（日期、金额、摘要）的准确性",
-        ]
-    elif scenario == "screening":
-        recs = [
-            "对大额交易进行穿透测试，获取原始凭证",
-            "检查大额交易的审批流程是否完整",
-            "关注频繁大额交易对手方，排查关联交易",
-        ]
+def _add_audit_recommendations(doc, scenario: str, reconcile_stats: dict = None, workpaper_files: list = None):
+    """模板化审计建议：根据匹配质量指标选择模板，不复用硬编码分支。"""
+    # 从 reconcile_stats 提取质量指标
+    rs = reconcile_stats or {}
+    match_rate = max(rs.get("book_match_rate", 0), rs.get("bank_match_rate", 0))
+    diff_pct = abs(rs.get("diff_percentage", rs.get("差额比例", 15)))
+    red_flags = rs.get("red_flag_count", 0)
+    unmatched = rs.get("unmatched_book", 0) + rs.get("unmatched_bank", 0)
+    l4_review = rs.get("review_L4", 0)
+
+    # 质量分档
+    if match_rate > 95 and diff_pct < 3:
+        quality = "excellent"
+    elif match_rate > 85 and diff_pct < 10:
+        quality = "good"
+    elif match_rate > 70:
+        quality = "fair"
     else:
-        recs = ["请审计师根据专业判断对处理结果进行复核确认。"]
+        quality = "poor"
+
+    # 风险叠加
+    risks = []
+    if red_flags > 10: risks.append("high_flags")
+    if l4_review > unmatched * 0.3: risks.append("high_l4")
+    if diff_pct > 15: risks.append("large_diff")
+
+    # 模板库
+    QUALITY_TEMPLATES = {
+        "excellent": [
+            "匹配效果良好，差额在可接受范围内（<3%），可采信当前结果作为审计工作底稿",
+            "建议对少量未匹配项进行抽凭确认，排除系统性遗漏后即可归档",
+        ],
+        "good": [
+            "匹配效果较好，差额在合理范围内（<10%），建议对差异较大的对手方逐笔核实",
+            "关注时间性差异导致的未达（期后验证），对L4模糊匹配结果进行人工复核",
+        ],
+        "fair": [
+            "匹配效果一般，差额在10%-30%之间，需要重点分析未达原因",
+            "检查是否存在数据口径不一致（如费用账户流水是否完整提供）",
+            "对大额未匹配项进行穿透测试，获取原始凭证核实用途",
+        ],
+        "poor": [
+            "⚠ 匹配效果不佳，差额超过30%，当前匹配逻辑可能存在问题",
+            "建议重新检查数据源完整性，确认双方数据覆盖同一期间",
+            "检查是否存在未提供的银行账户流水，补全数据后重新执行对账",
+        ],
+    }
+    RISK_TEMPLATES = {
+        "high_flags": "⚠ 红旗数量较多（>10项），建议优先处置《异常资金交易清单》中的红旗项",
+        "high_l4": "⚠ L4模糊匹配占比偏高，可能遗漏大量真实匹配，考虑缩小日期窗口或增加对手方名称模糊匹配",
+        "large_diff": "⚠ 差额较大，需重点关注未达四分类中金额聚类的对手方，排查资金体外循环风险",
+    }
+
+    recs = list(QUALITY_TEMPLATES.get(quality, QUALITY_TEMPLATES["fair"]))
+    for risk in risks:
+        if risk in RISK_TEMPLATES:
+            recs.append(RISK_TEMPLATES[risk])
+
     for r in recs:
         doc.add_paragraph(f"  - {r}", style="List Bullet")
+
+    # 底稿联动：列出关联的核查文件
+    if workpaper_files:
+        doc.add_heading("关联核查底稿", level=2)
+        for wf in workpaper_files:
+            fn = Path(wf).name if isinstance(wf, str) else wf
+            doc.add_paragraph(f"📎 {fn}", style="List Bullet")
+        doc.add_paragraph("以上文件包含未匹配项的六桶分桶核查清单和按对手方分组的核查底稿，请逐项复核。")
 
 
 # ═══════════════════════════════════════════════════════════════
