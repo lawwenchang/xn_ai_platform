@@ -37,3 +37,14 @@ outputs/*/
 
 # Docker
 .docker/
+
+# Model files
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.gguf
+*.onnx
+*.ckpt
+phase2_v3/data/models/
+

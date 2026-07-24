@@ -340,3 +340,20 @@ udf3["_cp"] = udf3["counterpart"].map(normalize_counterpart_name)
 print("\n对手方归集前10:")
 print(udf3.groupby("_cp")["net_amount"].agg(["size", "sum"]).sort_values("size", ascending=False).head(10).round(0).to_string())
 print(f"\n无户名行数: {(udf3['_cp'].str.strip().str.len() < 2).sum()} / {len(udf3)}")
+
+# ═══════════ 6. 六桶分桶 + 核查底稿 ═══════════
+print("\n═══════════ 六桶分桶 ═══════════")
+from core.matching_engine import triage_records, export_triage_board
+from pathlib import Path
+
+if res.get("unmatched_bank"):
+    tb = triage_records(res["unmatched_bank"], side="银端未匹配")
+    export_triage_board(tb, Path(OUT), filename="分桶看板_银端.xlsx")
+    print(f"银端分桶: {tb['summary']['total']}笔 → {tb['summary']['remaining']}笔待人工核查")
+
+if res.get("unmatched_book"):
+    tl = triage_records(res["unmatched_book"], side="账端未匹配")
+    export_triage_board(tl, Path(OUT), filename="分桶看板_账端.xlsx")
+    print(f"账端分桶: {tl['summary']['total']}笔 → {tl['summary']['remaining']}笔待人工核查")
+
+print(f"\n分桶看板+核查底稿已导出至: {OUT}")
