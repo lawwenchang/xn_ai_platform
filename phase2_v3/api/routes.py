@@ -2187,6 +2187,8 @@ def _dag_to_python(dag: Any, record: RunRecord) -> str:
 
     # 数据流追踪：output_alias → 对应的 Python 变量名
     alias_vars = {}
+    alias_formulas = {}
+    alias_formula_file = {}
     last_df_var = None
 
     for op_id in order:
@@ -2547,6 +2549,83 @@ def _dag_to_python(dag: Any, record: RunRecord) -> str:
                 f"    {op_alias}_failed = {src_var}[~mask]",
             ])
 
+        elif op_name == "Transform":
+            operation = params.get("operation", "")
+            dep_ids = params.get("depends_on", [])
+            src_var = last_df_var
+            for dep_id in dep_ids:
+                dep_op = op_map.get(dep_id)
+                if dep_op:
+                    src_var = alias_vars.get(dep_op.get('output_alias'), last_df_var)
+                    break
+            src_var = src_var or 'df'
+
+            if operation == "compute_columns":
+                formulas = params.get("formulas", {})
+                output_as_formula = params.get("output_as_formula", False)
+
+                if output_as_formula:
+                    # 公式模式：不计算，只记录公式→Export 阶段用 openpyxl 写
+                    code_lines.append(f"if '{src_var}' in dir() and {src_var} is not None:")
+                    code_lines.append(f"    {op_alias} = {src_var}.copy()")
+                    formula_dict = {}
+                    for col, formula in formulas.items():
+                        safe_col = _sanitize_code_param(str(col), max_len=100)
+                        safe_f = _sanitize_code_param(str(formula), max_len=500)
+                        # 公式里引用源列名（如 D 列→第4列，B 列→第2列）
+                        formula_dict[safe_col] = safe_f
+                    alias_formulas[op_alias] = formula_dict
+                    alias_formula_file[op_alias] = params.get("source_file", "")
+                    code_lines.append(f"    print('[Transform] formula mode: ' + str(list({op_alias}.columns)) + ' + formulas={len(formula_dict)} cols')")
+                else:
+                    # 值模式：pandas 直接计算
+                    code_lines.append(f"if '{src_var}' in dir() and {src_var} is not None:")
+                    code_lines.append(f"    {op_alias} = {src_var}.copy()")
+                    for col, formula in formulas.items():
+                        safe_formula = str(formula).replace("df", src_var)
+                        safe_col = _sanitize_code_param(str(col), max_len=100)
+                        code_lines.append(f"    try:")
+                        code_lines.append(f"        {op_alias}['{safe_col}'] = {safe_formula}")
+                        code_lines.append(f"    except Exception as _e:")
+                        code_lines.append(f"        print('[Transform] 计算列 {safe_col} 失败: ' + str(_e))")
+                        code_lines.append(f"        {op_alias}['{safe_col}'] = None")
+                    code_lines.append(f"    print('[Transform] compute_columns: ' + str(list({op_alias}.columns)))")
+
+            elif operation == "extract_date_part":
+                columns = params.get("columns", [])
+                date_part = params.get("date_part", "year")
+                new_col = params.get("new_column", f"日期_{date_part}")
+                cols_safe = [_sanitize_code_param(str(c), max_len=100) for c in (columns if isinstance(columns, list) else [columns])]
+                date_col = cols_safe[0] if cols_safe else "'date'"
+                code_lines.append(f"if '{src_var}' in dir() and {src_var} is not None and {date_col} in {src_var}.columns:")
+                code_lines.append(f"    {op_alias} = {src_var}.copy()")
+                code_lines.append(f"    {op_alias}['{new_col}'] = pd.to_datetime({op_alias}[{date_col}], errors='coerce').dt.{date_part}")
+                code_lines.append(f"    print('[Transform] extract_date_part: {new_col} from {date_col}')")
+
+            elif operation == "standardize_name":
+                columns = params.get("columns", [])
+                cols_safe = [_sanitize_code_param(str(c), max_len=100) for c in (columns if isinstance(columns, list) else [columns])]
+                code_lines.append(f"if '{src_var}' in dir() and {src_var} is not None:")
+                code_lines.append(f"    {op_alias} = {src_var}.copy()")
+                for col in cols_safe or []:
+                    code_lines.append(f"    if '{col}' in {op_alias}.columns:")
+                    code_lines.append(f"        {op_alias}['{col}'] = {op_alias}['{col}'].astype(str).str.replace(r'[（(].*?[）)]', '', regex=True)")
+                    code_lines.append(f"        {op_alias}['{col}'] = {op_alias}['{col}'].str.replace(r'[有限公司|有限责任公司|股份有限公司]$', '', regex=True)")
+                    code_lines.append(f"        {op_alias}['{col}'] = {op_alias}['{col}'].str.strip()")
+                code_lines.append(f"    print('[Transform] standardize_name: ' + str({cols_safe}))")
+
+            else:
+                # Generic fallback: copy through
+                code_lines.append(f"if '{src_var}' in dir() and {src_var} is not None:")
+                code_lines.append(f"    {op_alias} = {src_var}.copy()")
+                code_lines.append(f"else:")
+                code_lines.append(f"    {op_alias} = pd.DataFrame()")
+
+            alias_vars[op_alias] = op_alias
+            last_df_var = op_alias
+
+
+
         elif op_name == "Export":
             output_file = params.get("output_file", params.get("output_file_path", "analysis_result.csv"))
             dep_ids = params.get("depends_on", [])
@@ -2557,13 +2636,41 @@ def _dag_to_python(dag: Any, record: RunRecord) -> str:
                     src_var = alias_vars.get(dep_op.get('output_alias'), last_df_var)
                     break
             src_var = src_var or 'df'
-            code_lines.extend([
-                f"if '{src_var}' in dir() and {src_var} is not None and not {src_var}.empty:",
-                f"    {src_var}.to_csv(os.path.join('outputs', '{output_file}'), index=False, encoding='utf-8-sig')",
-                f"    print('[Export] ' + '{output_file}' + ', rows=' + str(len({src_var})))",
-                f"else:",
-                f"    print('[Export] 跳过：数据为空，不导出空文件')",
-            ])
+            _has_fmts = src_var in str(alias_formulas)
+            if _has_fmts:
+                code_lines.extend([
+                    f"if '{src_var}' in dir() and {src_var} is not None and not {src_var}.empty:",
+                    f"    _out = os.path.join('outputs', '{output_file}')",
+                    f"    from openpyxl import Workbook",
+                    f"    _wb = Workbook(); _ws = _wb.active",
+                    f"    for _ci, _cn in enumerate({src_var}.columns, 1):",
+                    f"        _ws.cell(row=1, column=_ci, value=str(_cn))",
+                    f"    _fmts = _FORMULA_MAP.get('{src_var}', {{}})",
+                    f"    for _ri, (_, _row) in enumerate({src_var}.iterrows(), 2):",
+                    f"        for _ci, _cn in enumerate({src_var}.columns, 1):",
+                    f"            if _cn in _fmts:",
+                    f"                _f = _fmts[_cn].replace('{{row}}', str(_ri))",
+                    f"                _ws.cell(row=_ri, column=_ci, value=_f)",
+                    f"            else:",
+                    f"                _v = _row[_cn]",
+                    f"                if pd.isna(_v): _v = ''",
+                    f"                _ws.cell(row=_ri, column=_ci, value=_v)",
+                    f"    _wb.save(_out)",
+                    f"    print('[Export] ' + '{output_file}' + ' (openpyxl+formulas)')",
+                    f"else:",
+                    f"    print('[Export] \xe8\xb7\xb3\xe8\xbf\x87\xef\xbc\x9a\xe6\x95\xb0\xe6\x8d\xae\xe4\xb8\xba\xe7\xa9\xba')",
+                ])
+                fmts_repr = repr(alias_formulas.get(src_var, {}))
+                code_lines.insert(-14, f"    _FORMULA_MAP = {{}}")
+                code_lines.insert(-13, f"    _FORMULA_MAP['{src_var}'] = {fmts_repr}")
+            else:
+                code_lines.extend([
+                    f"if '{src_var}' in dir() and {src_var} is not None and not {src_var}.empty:",
+                    f"    {src_var}.to_csv(os.path.join('outputs', '{output_file}'), index=False, encoding='utf-8-sig')",
+                    f"    print('[Export] ' + '{output_file}' + ', rows=' + str(len({src_var})))",
+                    f"else:",
+                    f"    print('[Export] \xe8\xb7\xb3\xe8\xbf\x87\xef\xbc\x9a\xe6\x95\xb0\xe6\x8d\xae\xe4\xb8\xba\xe7\xa9\xba\xef\xbc\x8c\xe4\xb8\x8d\xe5\xaf\xbc\xe5\x87\xba\xe7\xa9\xba\xe6\x96\x87\xe4\xbb\xb6')",
+                ])
 
         elif op_name == "Aggregate":
             aggs = params.get("aggregations", {})
