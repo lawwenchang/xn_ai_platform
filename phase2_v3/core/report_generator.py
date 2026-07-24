@@ -483,9 +483,10 @@ def generate_audit_report(
     except Exception as e:
         doc.add_paragraph(f"勾稽验证异常（非致命）: {e}")
 
-    # ===== 五、审计结论（模板化句式，LLM无参与） =====
+    # ===== 五、审计结论 =====
     try:
         match_stats = summary.get("match_stats", {})
+        _render_llm_conclusion(doc, summary, reconcile_stats, match_logic)
         _render_scene_conclusion(doc, scenario, summary, match_stats)
     except Exception as e:
         doc.add_paragraph(f"结论生成异常（非致命）: {e}")
@@ -527,6 +528,92 @@ def _add_scenario_analysis(doc, scenario: str, summary: dict, total_rows: int):
             doc.add_paragraph("未发现明显合规问题。")
     else:
         _assess_general_processing(doc, summary, total_rows)
+
+
+# ═══════════════════════════════════════════════════════════════
+# LLM 结论生成（事实锚定：只给数字，不让编造）
+# ═══════════════════════════════════════════════════════════════
+
+def _render_llm_conclusion(doc, summary: dict, reconcile_stats: dict = None,
+                            match_logic: dict = None):
+    """用 vLLM 将结构化数据串成审计语言。LLM 只做措辞，事实由代码锚定。"""
+    import requests, os as _os
+
+    rs = reconcile_stats or {}
+    ms = summary.get("match_stats", {})
+    ml = match_logic or {}
+
+    # 收集事实（LLM 只能引用这些）
+    facts = []
+    # 对账结果
+    if rs:
+        br = rs.get("book_match_rate", 0)
+        ba = rs.get("bank_match_rate", 0)
+        facts.append(f"账方匹配率 {br:.1f}%，银方匹配率 {ba:.1f}%")
+        l1 = rs.get("matched_L1", 0); l2 = rs.get("matched_L2", 0)
+        l3 = rs.get("matched_L3_groups", 0); l4 = rs.get("review_L4", 0)
+        facts.append(f"分层命中：L1={l1} L2={l2} L3组={l3} L4待复核={l4}")
+        tc = rs.get("timing_categories", {})
+        if tc:
+            parts = [f"{k}={v}" for k, v in tc.items()]
+            facts.append(f"未达四分类：{', '.join(parts)}")
+        facts.append(f"红旗数量：{rs.get('red_flag_count', 0)}")
+        facts.append(f"账方行数：{rs.get('book_rows', 0)}，银方行数：{rs.get('bank_rows', 0)}")
+    # 匹配结果
+    if ms:
+        mr = ms.get("match_rate", ms.get("匹配率", 0))
+        dp = ms.get("diff_percentage", ms.get("差额比例", 0))
+        if mr: facts.append(f"匹配率 {mr:.1f}%，差额比例 {dp:.1f}%")
+    # 关键词来源
+    kw_src = ml.get("kw_source", "")
+    if kw_src:
+        facts.append(f"筛选口径：{kw_src}")
+    pat = ml.get("patterns", "")
+    if pat:
+        facts.append(f"关键词：{pat}")
+
+    if not facts:
+        doc.add_paragraph("（无可用于生成结论的结构化数据）")
+        return
+
+    facts_text = "\n".join(f"- {f}" for f in facts)
+
+    prompt = (
+        "你是审计报告撰写专家。根据以下平台已确认的结构化数据，用 3-5 句中文撰写一段审计结论。"
+        "要求：引用具体数字、指出关键风险、语言简洁专业、不编造未提供的数据。\n\n"
+        f"数据事实：\n{facts_text}\n\n"
+        "审计结论："
+    )
+
+    vllm_url = _os.environ.get("VLLM_TUNNEL_URL",
+                                "http://localhost:18000/v1/chat/completions")
+    try:
+        r = requests.post(
+            vllm_url,
+            json={"model": "qwen3-235b",
+                  "messages": [{"role": "user", "content": prompt}],
+                  "temperature": 0.3, "max_tokens": 300},
+            headers={"Authorization": "Bearer EMPTY"},
+            timeout=20,
+        )
+        if r.status_code == 200:
+            text = r.json()["choices"][0]["message"]["content"].strip()
+            if text:
+                doc.add_heading("LLM 审计结论", level=2)
+                doc.add_paragraph(text)
+                doc.add_paragraph('(以上结论由LLM基于结构化数据生成，具体数字以报告数据章节为准。)')
+            return
+    except Exception as e:
+        print(f"[LLM结论] 生成失败（非致命）: {e}")
+
+    # 兜底：模板结论
+    doc.add_paragraph(
+        f"经平台自动化处理，共分析 {rs.get('book_rows', 0) + rs.get('bank_rows', 0)} 条记录，"
+        f"匹配率 {max(rs.get('book_match_rate', 0), rs.get('bank_match_rate', 0)):.1f}%。"
+        f"详细数据见上方各表。"
+    )
+
+
 
 
 def _assess_general_processing(doc, summary: dict, total_rows: int):
