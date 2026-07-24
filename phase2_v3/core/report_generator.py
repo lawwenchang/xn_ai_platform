@@ -485,6 +485,7 @@ def generate_audit_report(
 
     # ===== 五、审计结论（模板化句式，LLM无参与） =====
     try:
+        match_stats = summary.get("match_stats", {})
         _render_scene_conclusion(doc, scenario, summary, match_stats)
     except Exception as e:
         doc.add_paragraph(f"结论生成异常（非致命）: {e}")
