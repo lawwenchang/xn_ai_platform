@@ -127,6 +127,35 @@ FORMULA_TEMPLATES = {
         '=IFS({amt_cell}>={tier1},"HIGH",{amt_cell}>={tier2},"MEDIUM",'
         '{amt_cell}>0,"LOW",TRUE,"")'
     ),
+    "index_match": (
+        '=IFERROR(INDEX({return_range},MATCH({lookup_cell},{lookup_range},0)),'
+        '"未找到")'
+    ),
+    "subtotal_sum": "=SUBTOTAL(109,{range})",
+    "subtotal_count": "=SUBTOTAL(103,{range})",
+    "textjoin_cp": (
+        '=TEXTJOIN("、",TRUE,IF({cp_range}={cp_cell},{desc_range},""))'
+    ),
+    "left_extract": '=LEFT({cell},{n})',
+    "right_extract": '=RIGHT({cell},{n})',
+    "mid_extract": '=MID({cell},{start},{n})',
+    "aggregate_sum": "=AGGREGATE(9,3,{range})",
+    "aggregate_count": "=AGGREGATE(2,3,{range})",
+    "indirect_sheet_sum": "=SUM(INDIRECT(\"'\"&{sheet_cell}&\"'!\"&{range_str}))",
+    "indirect_cell": "=INDIRECT(\"'\"&{sheet_cell}&\"'!\"&{cell_str})",
+    "offset_dynamic": (
+        "=SUM(OFFSET({start_cell},0,0,"
+        "COUNTA({count_col}),1))"
+    ),
+    "round_check": '=IF(ROUND({cell},{digits})<>{cell},"⚠需关注","")',
+    "mround_check": (
+        '=IF(AND({cell}>={threshold},MROUND({cell},{base})<>{cell}),'
+        '"⚠非整{base}倍数","")'
+    ),
+    "networkdays_age": (
+        "=IF(AND({start_cell}<>\"\",{end_cell}<>\"\"),"
+        "NETWORKDAYS({start_cell},{end_cell}),\"\")"
+    ),
 }
 
 
@@ -173,6 +202,60 @@ def build_risk_tier(tr: AnchorTracker, amt_col: str,
                      tier1: float, tier2: float, row: int) -> str:
     return build_formula(FORMULA_TEMPLATES["ifs_risk_tier"],
         amt_cell=tr.cell_ref(amt_col, row), tier1=tier1, tier2=tier2)
+
+
+
+def build_index_match(tr: AnchorTracker, return_col: str, lookup_col: str,
+                       lookup_val: str, row: int,
+                       target_tr: AnchorTracker = None,
+                       target_return_col: str = None,
+                       target_lookup_col: str = None) -> str:
+    """INDEX/MATCH：向左查找（兼容 WPS 旧版）。可跨 sheet。"""
+    rtr = target_tr or tr
+    rcol = target_return_col or return_col
+    lcol = target_lookup_col or lookup_col
+    return build_formula(FORMULA_TEMPLATES["index_match"],
+        return_range=rtr.col_range(rcol, absolute=True),
+        lookup_cell=tr.cell_ref(lookup_col, row) if target_tr is None
+                     else lookup_val,
+        lookup_range=rtr.col_range(lcol, absolute=True))
+
+def build_subtotal_sum(tr: AnchorTracker, col: str) -> str:
+    return build_formula(FORMULA_TEMPLATES["subtotal_sum"],
+        range=tr.col_range(col))
+
+def build_textjoin_cp(tr: AnchorTracker, cp_col: str, desc_col: str, row: int) -> str:
+    return build_formula(FORMULA_TEMPLATES["textjoin_cp"],
+        cp_range=tr.col_range(cp_col, absolute=True),
+        cp_cell=tr.cell_ref(cp_col, row),
+        desc_range=tr.col_range(desc_col, absolute=True))
+
+def build_left(tr: AnchorTracker, col: str, n: int, row: int) -> str:
+    return build_formula(FORMULA_TEMPLATES["left_extract"],
+        cell=tr.cell_ref(col, row), n=n)
+
+def build_right(tr: AnchorTracker, col: str, n: int, row: int) -> str:
+    return build_formula(FORMULA_TEMPLATES["right_extract"],
+        cell=tr.cell_ref(col, row), n=n)
+
+def build_mid(tr: AnchorTracker, col: str, start: int, n: int, row: int) -> str:
+    return build_formula(FORMULA_TEMPLATES["mid_extract"],
+        cell=tr.cell_ref(col, row), start=start, n=n)
+
+def build_round_check(tr: AnchorTracker, col: str, digits: int, row: int) -> str:
+    return build_formula(FORMULA_TEMPLATES["round_check"],
+        cell=tr.cell_ref(col, row), digits=digits)
+
+def build_mround_check(tr: AnchorTracker, col: str, threshold: float,
+                        base: int, row: int) -> str:
+    return build_formula(FORMULA_TEMPLATES["mround_check"],
+        cell=tr.cell_ref(col, row), threshold=threshold, base=base)
+
+def build_networkdays(tr: AnchorTracker, start_col: str, end_col: str, row: int) -> str:
+    return build_formula(FORMULA_TEMPLATES["networkdays_age"],
+        start_cell=tr.cell_ref(start_col, row),
+        end_cell=tr.cell_ref(end_col, row))
+
 
 
 def verify_formulas(filepath: Path, checks: Dict[str, Any]) -> Dict[str, Any]:

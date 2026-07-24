@@ -1015,17 +1015,9 @@ def export_triage_board(triage_result: dict, output_dir: Path,
     output_dir.mkdir(parents=True, exist_ok=True)
     board_path = output_dir / filename
     with pd.ExcelWriter(board_path, engine="openpyxl") as writer:
-        # 汇总 sheet
-        summary_rows = []
-        for b in triage_result.get("buckets", []):
-            summary_rows.append({"桶名": b["name"], "笔数": b["count"],
-                                  "金额合计": b["amount"], "建议程序": b["procedure"]})
-        rem = triage_result.get("remaining", [])
-        if rem:
-            rem_amt = sum(abs(float(r.get("金额", r.get("amount", 0)) or 0)) for r in rem)
-            summary_rows.append({"桶名": "待人工核查（剩余）", "笔数": len(rem),
-                                  "金额合计": rem_amt, "建议程序": "逐笔核查，无可自动化归类"})
-        pd.DataFrame(summary_rows).to_excel(writer, sheet_name="分桶汇总", index=False)
+        # 汇总 sheet - 锚点+活公式
+        from core.formula_writer import export_triage_summary_with_formulas
+        export_triage_summary_with_formulas(writer.book, triage_result)
         # 每桶一个 sheet
         for i, b in enumerate(triage_result.get("buckets", [])):
             df = pd.DataFrame(b["rows"])
