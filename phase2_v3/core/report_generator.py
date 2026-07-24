@@ -492,7 +492,7 @@ def generate_audit_report(
 
     # ===== 六、业务合理性勾稽 =====
     try:
-        _add_business_crossref_rules(doc, scenario, summary, match_stats)
+        _add_business_crossref_rules(doc, scenario, match_stats)
     except Exception as e:
         doc.add_paragraph(f"业务勾稽异常（非致命）: {e}")
 
@@ -508,17 +508,17 @@ def _add_scenario_analysis(doc, scenario: str, summary: dict, total_rows: int):
     match_stats = summary.get("match_stats", {})
 
     if scenario == "medical_match":
-        _assess_medical_match(doc, summary, match_stats)
+        _assess_medical_match(doc, match_stats)
     elif scenario in ("match", "balance_match"):
-        _assess_general_match(doc, summary, match_stats)
+        _assess_general_match(doc, match_stats)
     elif scenario == "medical":
-        _assess_medical_screening(doc, summary, total_rows)
+        _assess_medical_screening(doc, total_rows)
     elif scenario == "screening":
         doc.add_paragraph(f"筛查出 {total_rows} 条记录。风险分级：HIGH>=500万 / MEDIUM>=100万 / LOW>=10万")
     elif scenario == "aggregate":
         doc.add_paragraph(f"汇总得 {total_rows} 条记录，请核实数据完整性。")
     elif scenario in ("balance", "diff"):
-        _assess_balance_diff(doc, scenario, summary, match_stats)
+        _assess_balance_diff(doc, scenario, match_stats)
     elif scenario == "compliance":
         violations = summary.get("violations", [])
         if violations:
@@ -626,7 +626,7 @@ def _assess_general_processing(doc, summary: dict, total_rows: int):
     doc.add_paragraph("5.【审计红线】平台未对原始数据做任何修改（删行/填0/前向填充），所有缺失保留原样")
 
 
-def _assess_medical_match(doc, summary: dict, match_stats: dict):
+def _assess_medical_match(doc, match_stats: dict):
     """医保回款匹配专项评估"""
     doc.add_paragraph("本场景目标：从银行流水中筛选医保回款明细，与医保回款汇总表跨表核对，验证金额一致性。")
     total_bank = match_stats.get("total_bank_rows", 0)
@@ -648,7 +648,7 @@ def _assess_medical_match(doc, summary: dict, match_stats: dict):
     _add_quality_judgment(doc, match_stats)
 
 
-def _assess_general_match(doc, summary: dict, match_stats: dict):
+def _assess_general_match(doc, match_stats: dict):
     """通用匹配评估"""
     tl = match_stats.get("total_left", 0)
     tr = match_stats.get("total_right", 0)
@@ -668,14 +668,14 @@ def _assess_general_match(doc, summary: dict, match_stats: dict):
     _add_quality_judgment(doc, match_stats)
 
 
-def _assess_medical_screening(doc, summary: dict, total_rows: int):
+def _assess_medical_screening(doc, total_rows: int):
     """医保回款筛选评估"""
     doc.add_paragraph(f"筛选出 {total_rows} 条医保相关记录。核查要点：")
     for t in ["是否混入非数据行（政策说明等）", "年度汇总与回款表是否一致", "正负数是否合理（回款/退费）"]:
         doc.add_paragraph(f"  - {t}", style="List Bullet")
 
 
-def _assess_balance_diff(doc, scenario: str, summary: dict, match_stats: dict):
+def _assess_balance_diff(doc, scenario: str, match_stats: dict):
     """科目余额/差异分析评估"""
     if scenario == "balance":
         is_bal = match_stats.get("is_balanced", False)
@@ -738,7 +738,7 @@ def _add_quality_judgment(doc, match_stats: dict):
         doc.add_paragraph("判定结果：匹配效果很差，差额超过30%。当前匹配逻辑可能不正确，建议重新检查数据源、调整筛选关键词、确认回款表的统计口径与银行流水一致。")
 
 
-def _add_audit_recommendations(doc, scenario: str, reconcile_stats: dict = None, workpaper_files: list = None):
+def _add_audit_recommendations(doc, reconcile_stats: dict = None, workpaper_files: list = None):
     """模板化审计建议：根据匹配质量指标选择模板，不复用硬编码分支。"""
     # 从 reconcile_stats 提取质量指标
     rs = reconcile_stats or {}
@@ -893,7 +893,7 @@ def _render_scene_conclusion(doc, scenario: str, summary: dict, match_stats: dic
 # 业务合理性勾稽（匹配分层自洽 / 未达分类合计 / 调节表差异）
 # ═══════════════════════════════════════════════════════════════
 
-def _add_business_crossref_rules(doc, scenario: str, summary: dict, match_stats: dict):
+def _add_business_crossref_rules(doc, scenario: str, match_stats: dict):
     """3条硬规则：分层自洽、未达合计=未匹配、调节表差异=0。"""
     doc.add_heading("业务合理性勾稽", level=1)
     checks = []
