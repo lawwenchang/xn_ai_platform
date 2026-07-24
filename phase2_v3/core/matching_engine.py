@@ -1030,13 +1030,243 @@ def export_triage_board(triage_result: dict, output_dir: Path,
         for i, b in enumerate(triage_result.get("buckets", [])):
             df = pd.DataFrame(b["rows"])
             if not df.empty:
-                df.to_excel(writer, sheet_name=f"桶{i+1}_{b['name'][:15]}", index=False)
+                safe_name = re.sub(r'[\/*?:\[\]<>]', '_', b['name'][:15])
+                df.to_excel(writer, sheet_name=f"桶{i+1}_{safe_name}", index=False)
         # 剩余
         if rem:
             pd.DataFrame(rem).to_excel(writer, sheet_name="待人工核查", index=False)
     print(f"[分桶看板] {board_path} ({len(triage_result.get('buckets',[]))}桶/"
           f"{triage_result['summary']['total']}笔→{triage_result['summary']['remaining']}笔待人工核查)")
+    side_label = triage_result.get("side", "").replace("未匹配", "")
+    for b in triage_result.get("buckets", []):
+        if b["count"] > 50:
+            try:
+                safe_name2 = re.sub(r'[\/*?:\[\]<>]', '_', b['name'][:20])
+                wp_name = f"核查底稿_{side_label}_{safe_name2}.xlsx"
+                export_counterpart_workpaper(b, output_dir, filename=wp_name)
+            except Exception as _wp_err:
+                print(f"[分桶看板] 核查底稿生成失败: {_wp_err}")
     return str(board_path)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 核查指引模板（三层拼装：方向→旗型→特征叠加）
+# ═══════════════════════════════════════════════════════════════
+
+GUIDE_TEMPLATES = {
+    "整月单边": {
+        "流入": [
+            "1.调取企业全部银行账户流水，核对该笔是否记在他行科目（排除良性串户）",
+            "2.查银行回单用途/附言，确认资金性质（借款/货款/还款）",
+            "3.若为账外收入，追查对应业务合同与发票，评估漏记范围",
+            "4.访谈财务：该月该户资金流入未记账的原因"],
+        "流出": [
+            "1.调取他行流水，排除良性串户（收款方是否自家账户）",
+            "2.查付款回单+审批单，确认资金去向与授权",
+            "3.追踪收款账户后续流向（关联方/个人/回流本企业他户）",
+            "4.若为账外支出，评估体外循环/挪用风险，考虑舞弊风险升级"],
+    },
+    "整数大额": {
+        "流入": [
+            "1.查资金来源性质：对方户名→回单用途→借款/注资/还款协议",
+            "2.过桥测试：期后30天内是否有等额或近似等额流出",
+            "3.核对关联方清单，判断是否关联方资金往来",
+            "4.若为经营收款，函证或核对销售合同/发票"],
+        "流出": [
+            "1.查资金去向：回单+审批单，确认付款对象与授权",
+            "2.过桥测试：期后30天内是否有等额或近似等额流入（回流）",
+            "3.核对关联方清单，判断是否关联方拆借",
+            "4.若为经营付款，核对采购合同/发票/入库单"],
+    },
+    "一收一付同额": {
+        "流入": [
+            "1.比对收付两笔的对方户名：同户=疑似过桥/刷流水；异户=核对两笔业务凭证",
+            "2.查两笔的时间间隔与回单用途",
+            "3.核实是否融资性过桥（期末冲存款规模嫌疑）"],
+        "流出": [
+            "1.同流入1：比对对方户名是否同户",
+            "2.查付款与收款的先后逻辑，判断是否资金空转",
+            "3.关注是否虚增交易量配合虚开发票"],
+    },
+    "分次转入转出": {
+        "流入": ["1.合并查看同户多笔流入总额，判断是否拆分规避审批/监管",
+                "2.查后续是否有集中转出，资金是否过手性质"],
+        "流出": ["1.合并查看同户多笔流出总额，判断是否拆分付款规避审批权限",
+                "2.核对付款审批单的单笔限额与实际拆分情况"],
+    },
+    "费用小额月度差异": {
+        "流出": ["1.核对企业全部银行账户，确认该费用是否从他户扣款",
+                "2.索取银行收费回单，比对账面计提与实扣差异原因",
+                "3.连续多月固定差额→费用扣款账户可能未提供，要求补充流水"],
+    },
+    "疑似重复入账": {
+        "双向": ["1.调两笔凭证比对附件（回单号是否相同）",
+                "2.确认是否同一业务重复记账，建议冲销分录"],
+    },
+}
+
+
+def build_guide(flag_type, net, same_day_same_amount=False,
+                period_end_window=False, round_amount=False):
+    """三层模板拼装：旗型定主模板→方向定变体→特征叠加定升级提示。"""
+    direction = "流入" if net > 0 else "流出"
+    tpl = GUIDE_TEMPLATES.get(flag_type, {})
+    steps = tpl.get(direction) or tpl.get("双向") or ["1.人工分析该笔业务背景与凭证"]
+    mods = []
+    if same_day_same_amount:
+        mods.append("⚡同日复向等额：优先过桥/空转测试")
+    if period_end_window:
+        mods.append("⚡期末窗口：叠加粉饰嫌疑，优先级上调")
+    if round_amount and flag_type != "整数大额":
+        mods.append("⚡整数金额：注意非经营性资金性质")
+    return "\n".join(mods + steps)
+
+
+
+# ═══════════════════════════════════════════════════════════════
+# 大额簇核查底稿：按对手方分组 + 预计算检查列 + 规律摘要
+# ═══════════════════════════════════════════════════════════════
+
+def export_counterpart_workpaper(bucket, output_dir, filename="核查底稿.xlsx"):
+    """大额簇按对手方分组生成核查底稿。"""
+    from collections import Counter, defaultdict
+    rows = bucket.get("rows", [])
+    if not rows: return ""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / filename
+    def _g(r,*ks):
+        for k in ks:
+            v=r.get(k)
+            if v is not None and v!="": return v
+        return ""
+    def _amt(r):
+        for k in ("net_amount","金额","amount","净额"):
+            v=r.get(k,0)
+            if v:
+                try: return float(v)
+                except: pass
+        return 0.0
+    def _date(r):
+        for k in ("date","日期","交易日期"):
+            v=r.get(k,"")
+            if v:
+                try: return pd.to_datetime(v)
+                except: pass
+        return pd.NaT
+    def _cp(r): return _g(r,"counterpart","对手方","对方客户名称","对方","机构名称")
+    def _desc(r): return _g(r,"summary","摘要","desc")
+
+    dates=[_date(r) for r in rows]
+    valid=[d for d in dates if pd.notna(d)]
+    max_date=max(valid) if valid else pd.NaT
+
+    cp_groups=defaultdict(list); no_cp=[]
+    for r in rows:
+        cp=_cp(r).strip()
+        if cp: cp_groups[cp].append(r)
+        else: no_cp.append(r)
+    for cp in cp_groups: cp_groups[cp].sort(key=lambda r:str(_date(r)))
+
+    date_amt_map=Counter()
+    for r in rows:
+        d=_date(r); a=round(_amt(r),2)
+        if pd.notna(d) and a>0: date_amt_map[(d.date().isoformat(),a)]+=1
+
+    cp_monthly=Counter()
+    for r in rows:
+        cp=_cp(r).strip(); d=_date(r)
+        if cp and pd.notna(d): cp_monthly[(cp,d.strftime("%Y-%m"))]+=1
+
+    total_amt=sum(abs(_amt(r)) for r in rows)
+    cp_stats=[(cp,len(g),sum(abs(_amt(r)) for r in g)) for cp,g in cp_groups.items()]
+    cp_stats.sort(key=lambda x:x[2],reverse=True)
+    top_n=min(6,len(cp_stats)); top_cps=cp_stats[:top_n]
+    top_amt=sum(s[2] for s in top_cps)
+    top_pct=round(top_amt/max(total_amt,1)*100,1)
+
+    summary_lines=[
+        "桶名: "+bucket.get("name",""),
+        "总笔数: %d  |  总金额: %s元"%(len(rows),total_amt),
+        "对手方数: %d  |  无对手方: %d笔"%(len(cp_groups),len(no_cp)),
+        "前%d大户: 占%.1f%%金额（%s元）"%(top_n,top_pct,top_amt),
+    ]
+    for cp,cnt,amt in top_cps: summary_lines.append("  · %s: %d笔 %s元"%(cp[:20],cnt,amt))
+
+
+    work_rows = []
+    sorted_cps = sorted(cp_groups.keys(), key=lambda x: sum(abs(_amt(r)) for r in cp_groups[x]), reverse=True)
+    month_str = max_date.strftime("%Y-%m") if pd.notna(max_date) else ""
+    for cp in sorted_cps:
+        group = cp_groups[cp]
+        group_amt = sum(abs(_amt(r)) for r in group)
+        is_red_flag = cp_monthly.get((cp, month_str), 0) >= 5 if month_str else False
+        work_rows.append({
+            "对手方": "▼ " + cp + "（%d笔，%s元）" % (len(group), group_amt),
+            "红旗户": "⚠ 整月单边" if is_red_flag else "",
+            "日期": "", "摘要": "", "净额": "", "金额整数": "", "同日同额": "", "期末窗口": "",
+            "分类": "", "核查指引": "",
+        })
+        for r in group:
+            d = _date(r); a = _amt(r)
+            d_str = d.date().isoformat() if pd.notna(d) else ""
+            if abs(a) == int(abs(a)) and abs(a) > 0: is_int = "✓ 整数"
+            else: is_int = "✗ 非整数"
+            if pd.notna(d) and date_amt_map.get((d.date().isoformat(), round(a, 2)), 0) >= 2: same_day = "✓ 同日同额"
+            else: same_day = "✗ 无同日同额"
+            if pd.notna(d) and pd.notna(max_date) and (max_date - d).days <= 7: near_end = "✓ 期末±7天"
+            else: near_end = "✗ 距期末>7天"
+
+            orig_cls = _g(r, "classification", "分类")
+            cls_parts = []
+            if is_red_flag: cls_parts.append("整月单边")
+            if abs(a) == int(abs(a)) and abs(a) >= 100000: cls_parts.append("整数大额")
+            if orig_cls and orig_cls not in ("待人工核查", "待核查", ""): cls_parts.append(orig_cls)
+            if not cls_parts: cls_parts.append("待核查")
+            classification = " + ".join(cls_parts)
+
+            same_day_flag = pd.notna(d) and date_amt_map.get((d.date().isoformat(), round(a, 2)), 0) >= 2
+            near_end_flag = pd.notna(d) and pd.notna(max_date) and (max_date - d).days <= 7
+            amt_round = abs(a) == int(abs(a)) and abs(a) > 0
+            guide_type = "整月单边" if is_red_flag else ("整数大额" if (amt_round and abs(a) >= 100000) else "")
+            audit_guide = build_guide(guide_type, a, same_day_same_amount=same_day_flag,
+                                      period_end_window=near_end_flag, round_amount=amt_round)
+
+            work_rows.append({
+                "对手方": cp, "红旗户": "⚠ 整月单边" if is_red_flag else "",
+                "日期": d_str, "摘要": _desc(r)[:60], "净额": a,
+                "金额整数": is_int, "同日同额": same_day, "期末窗口": near_end,
+                "分类": classification, "核查指引": audit_guide,
+            })
+
+    work_df = pd.DataFrame(work_rows)
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        pd.DataFrame({"规律摘要": summary_lines}).to_excel(writer, sheet_name="规律摘要", index=False)
+        work_df.to_excel(writer, sheet_name="核查底稿", index=False)
+        ws = writer.sheets["核查底稿"]
+        from openpyxl.styles import Font, PatternFill
+        yf = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+        rf = Font(color="FF0000", bold=True); bf = Font(bold=True); gf = Font(color="008000", bold=True)
+        for row_idx in range(1, len(work_rows) + 1):
+            rd = work_rows[row_idx - 1]; er = row_idx + 1
+            if str(rd.get("对手方", "")).startswith("▼"):
+                for ci in range(1, len(work_df.columns) + 1):
+                    ws.cell(row=er, column=ci).font = bf
+                    ws.cell(row=er, column=ci).fill = yf
+            if str(rd.get("红旗户", "")).startswith("⚠"):
+                ws.cell(row=er, column=2).font = rf
+            for cn in ["金额整数", "同日同额", "期末窗口"]:
+                if rd.get(cn) and rd.get(cn)[0] == "✓":
+                    ci = list(work_df.columns).index(cn) + 1
+                    ws.cell(row=er, column=ci).font = gf
+        cw = {"对手方": 24, "红旗户": 14, "日期": 12, "摘要": 42, "净额": 14,
+              "金额整数": 16, "同日同额": 16, "期末窗口": 16, "分类": 22, "核查指引": 48}
+        for cn, w in cw.items():
+            if cn in work_df.columns:
+                cl = chr(65 + list(work_df.columns).index(cn))
+                ws.column_dimensions[cl].width = w
+    print("[核查底稿] %s (%d个对手方/%d笔 前%d大户占%.0f%%)" % (path, len(cp_groups), len(rows), top_n, top_pct))
+    return str(path)
+
 
 
 # 命令行入口
