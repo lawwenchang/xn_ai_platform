@@ -1093,13 +1093,21 @@ def aggregate_red_flags(red_flags, top_n=20):
 
 def detect_red_flags(std_df, side, pair_window=3, large_threshold=100000.0, round_unit=10000, burst_days=7, burst_count=3):
     flags = []; df = std_df
+    MAX_FLAGS = 5000; MAX_MERGE = 100000; MAX_BUCKET = 200
+    def _add(f):
+        if len(flags) < MAX_FLAGS:
+            flags.append(f)
+        elif len(flags) == MAX_FLAGS:
+            flags.append({'type':'红旗超限','side':side,'rows':[],'amount':0,'detail':f'已达上限{MAX_FLAGS}'})
 
     # 一收一付同额（v3.4: pandas merge 向量化，替代 O(n²) 双重循环）
     if len(df) > 100:
         try:
             sub = df[df["abs_cents"] > 0][["abs_cents", "net_cents", "date", "row_id"]].copy()
             sub["_sign"] = (sub["net_cents"] > 0).astype(int)
-            m = pd.merge(sub[sub["_sign"] == 1], sub[sub["_sign"] == 0], on="abs_cents", suffixes=("_in", "_out"))
+            ins = sub[sub['_sign'] == 1]; outs = sub[sub['_sign'] == 0]
+            m = pd.merge(ins, outs, on='abs_cents', suffixes=('_in', '_out'))
+            if len(m) > MAX_MERGE: m = m.head(MAX_MERGE)
             if not m.empty:
                 m["gap"] = (m["date_in"] - m["date_out"]).dt.days.abs()
                 m = m[m["gap"] <= pair_window]
@@ -1108,7 +1116,7 @@ def detect_red_flags(std_df, side, pair_window=3, large_threshold=100000.0, roun
                     key = tuple(sorted((r["row_id_in"], r["row_id_out"])))
                     if key not in seen:
                         seen.add(key)
-                        flags.append({"type": "一收一付同额", "side": side, "rows": list(key),
+                        _add({"type": "一收一付同额", "side": side, "rows": list(key),
                                       "amount": round(r["abs_cents"] / 100, 2),
                                       "detail": f"同额资金{int(r['gap'])}天一进一出"})
         except Exception:
@@ -1122,6 +1130,7 @@ def detect_red_flags(std_df, side, pair_window=3, large_threshold=100000.0, roun
             if cents == 0 or len(idxs) < 2: continue
             ins = [i for i in idxs if df.loc[i, "net_cents"] > 0]
             outs = [i for i in idxs if df.loc[i, "net_cents"] < 0]
+            if len(ins) * len(outs) > MAX_BUCKET: ins = ins[:14]; outs = outs[:14]
             for i in ins:
                 for j in outs:
                     d1, d2 = df.loc[i, "date"], df.loc[j, "date"]
@@ -1129,20 +1138,20 @@ def detect_red_flags(std_df, side, pair_window=3, large_threshold=100000.0, roun
                     key = tuple(sorted((df.loc[i, "row_id"], df.loc[j, "row_id"])))
                     if gap <= pair_window and key not in seen:
                         seen.add(key)
-                        flags.append({"type": "一收一付同额", "side": side, "rows": list(key),
+                        _add({"type": "一收一付同额", "side": side, "rows": list(key),
                                       "amount": round(cents / 100, 2), "detail": f"同额资金{gap}天内一进一出"})
 
     # 整数大额
     for i, r in df.iterrows():
         amt = abs(float(r["net_amount"]))
         if amt >= large_threshold and int(amt) % round_unit == 0:
-            flags.append({"type": "整数大额", "side": side, "rows": [r["row_id"]],
+            _add({"type": "整数大额", "side": side, "rows": [r["row_id"]],
                           "amount": round(amt, 2), "detail": f"单笔>{large_threshold:,.0f}且整{round_unit}倍数"})
 
     # 期末负余额
     bal = df["balance"].dropna()
     if len(bal) > 0 and float(bal.iloc[-1]) < 0:
-        flags.append({"type": "期末负余额", "side": side, "rows": [],
+        _add({"type": "期末负余额", "side": side, "rows": [],
                       "amount": round(float(bal.iloc[-1]), 2), "detail": "透支/未入账负债"})
 
     # 分次转入转出
@@ -1156,7 +1165,7 @@ def detect_red_flags(std_df, side, pair_window=3, large_threshold=100000.0, roun
             if len(wi) >= burst_count:
                 sub = df.loc[wi]
                 if (sub["net_cents"] > 0).any() and (sub["net_cents"] < 0).any():
-                    flags.append({"type": "分次转入转出", "side": side,
+                    _add({"type": "分次转入转出", "side": side,
                                   "rows": [df.loc[x, "row_id"] for x in wi],
                                   "amount": round(float(sub["net_amount"].abs().sum()), 2),
                                   "detail": f"对手方[{name}] {burst_days}天内{len(wi)}笔双向资金往来"})
@@ -1165,7 +1174,7 @@ def detect_red_flags(std_df, side, pair_window=3, large_threshold=100000.0, roun
     # 大额现金
     for i, r in df.iterrows():
         if "现金" in str(r["summary"]) and abs(float(r["net_amount"])) >= 50000:
-            flags.append({"type": "大额现金", "side": side, "rows": [r["row_id"]],
+            _add({"type": "大额现金", "side": side, "rows": [r["row_id"]],
                           "amount": round(abs(float(r["net_amount"])), 2), "detail": "大额现金收支"})
     return flags
 
