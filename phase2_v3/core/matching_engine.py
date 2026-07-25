@@ -767,7 +767,7 @@ def _block_candidates(bank_rows: list, ledger_rows: list,
 # 噪音费用词表（仅影响"是否参与逐笔匹配"，不做删除）
 # 注意：利息、冲正已从噪音中移出——准则要求关注存款收益与规模匹配性
 # （问题解答第12号），冲正重做是典型舞弊手法，二者单独成类输出。
-NOISE_FEE_WORDS = ("手续费", "短信费", "年费", "账户管理费", "工本费",
+NOISE_FEE_WORDS = ("手续费", "短信费", "年费", "账户管理费", "工本费", "电话费",
                    "服务费", "测试")
 INTEREST_WORDS = ("利息", "结息")
 REVERSAL_WORDS = ("冲正", "冲销", "红冲", "撤销")
@@ -1025,6 +1025,7 @@ def export_triage_board(triage_result: dict, output_dir: Path,
                 safe_name = re.sub(r'[\/*?:\[\]<>]', '_', b['name'][:15])
                 df.to_excel(writer, sheet_name=f"桶{i+1}_{safe_name}", index=False)
         # 剩余
+        rem = triage_result.get("remaining", [])
         if rem:
             pd.DataFrame(rem).to_excel(writer, sheet_name="待人工核查", index=False)
     print(f"[分桶看板] {board_path} ({len(triage_result.get('buckets',[]))}桶/"

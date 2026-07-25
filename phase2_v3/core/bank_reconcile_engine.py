@@ -34,10 +34,9 @@ from __future__ import annotations
 import itertools
 import json
 import re
-from collections import defaultdict, deque
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Tuple
-
+from typing import Any, Dict, List, Optional, Tuple
+from config.dictionary import FEE_WORDS
 import pandas as pd
 
 # ═══════════════════════════════════════════════════════════════
@@ -59,29 +58,29 @@ STD_COLUMNS = [
 # 列语义 → 候选列名（按优先级排列；匹配时忽略空格与全半角括号差异）
 COLUMN_ROLE_SYNONYMS: Dict[str, List[str]] = {
     "date":        ["日期", "交易日期", "记账日期", "业务日期", "入账日期", "date"],
-    "voucher_no":  ["凭证号", "凭证号码", "凭证编号", "凭证字号", "凭证"],
-    "summary":     ["摘要", "摘要信息", "用途", "备注", "说明", "附言"],
+    "voucher_no":  ["凭证号", "凭证号码", "凭证编号", "凭证字号", "凭证", "voucher_no"],
+    "summary":     ["摘要", "摘要信息", "用途", "备注", "说明", "附言", "summary"],
     "counterpart": ["对方户名", "对方客户名称", "对方", "交易对手", "对方单位",
-                    "对手方", "对方账号户名"],
-    "account":     ["银行账号", "账号", "账户", "银行账户", "开户账号"],
+                    "对手方", "对方账号户名", "counterpart"],
+    "account":     ["银行账号", "账号", "账户", "银行账户", "开户账号", "account"],
     "debit":       ["借方金额", "借方", "借方(支取)", "借方（支取）", "支取",
-                    "支出", "支出金额", "付款金额", "借方发生额"],
+                    "支出", "支出金额", "付款金额", "借方发生额", "debit"],
     "credit":      ["贷方金额", "贷方", "贷方(收入)", "贷方（收入）", "收入",
-                    "收入金额", "收款金额", "贷方发生额"],
-    "balance":     ["余额", "账户余额", "期末余额", "本次余额"],
-    "amount":      ["交易金额", "金额", "发生额", "交易额"],
-    "subject":     ["科目编码", "科目名称", "会计科目", "科目"],
+                    "收入金额", "收款金额", "贷方发生额", "credit"],
+    "balance":     ["余额", "账户余额", "期末余额", "本次余额", "balance"],
+    "amount":      ["交易金额", "金额", "发生额", "交易额", "net_amount", "amount"],
+    "subject":     ["科目名称", "会计科目", "科目","科目全称", "subject"],
 }
 
 # 序时账特征列（出现即加分）
-_JOURNAL_HINTS = {"凭证号", "凭证号码", "凭证编号", "科目编码", "科目名称", "月"}
+_JOURNAL_HINTS = {"凭证号", "凭证号码", "凭证编号", "科目编码", "科目名称", "科目全称", "月"}
 # 银行流水特征列
 _BANK_HINTS = {"对方户名", "对方客户名称", "银行账号", "账号", "余额",
                "对方账号", "开户行"}
 
 # 利息/费用/冲正词表（单独成类输出，不参与噪音删除）
 INTEREST_WORDS = ("利息", "结息")
-FEE_WORDS = ("手续费", "短信费", "年费", "账户管理费", "工本费", "服务费")
+
 REVERSAL_WORDS = ("冲正", "冲销", "红冲", "撤销")
 from config.dictionary import INTERBANK_WORDS as _INTERBANK
 # ── v3.3 内容标签层 ──
@@ -228,14 +227,6 @@ def auto_map_columns(df: pd.DataFrame,
             if nc in norm2orig:
                 mapping[role] = norm2orig[nc]
                 break
-        else:
-            # 包含式兜底（如 "借方金额(元)"）
-            for cand in candidates:
-                nc = _norm_col(cand)
-                for n, orig in norm2orig.items():
-                    if nc in n and role not in mapping:
-                        mapping[role] = orig
-                        break
     return mapping
 
 
@@ -275,13 +266,20 @@ def normalize_to_std(df: pd.DataFrame, mapping: Dict[str, str],
         if c and c in df.columns:
             return df[c]
         return pd.Series([None] * n)
-
     out["row_id"] = [f"{'B' if book_type == BANK_STATEMENT else 'J'}{i}" for i in range(n)]
-    out["date"] = pd.to_datetime(col("date"), errors="coerce")
+    date_raw = col("date")
+    if pd.api.types.is_numeric_dtype(date_raw):
+        s = date_raw.dropna()
+        if len(s) > 0 and s.iloc[:min(5, len(s))].apply(
+            lambda x: 19000101 <= int(x) <= 21001231 if pd.notna(x) else False
+        ).all():
+            date_raw = date_raw.fillna(0).astype("int64").astype(str).replace("0", pd.NA)
+    out["date"] = pd.to_datetime(date_raw, errors="coerce")
     out["voucher_no"] = col("voucher_no").astype(str).replace("None", "")
     out["summary"] = col("summary").astype(str).replace("None", "")
     out["counterpart"] = col("counterpart").astype(str).replace("None", "")
     out["account"] = col("account").astype(str).replace("None", "")
+    out["subject"] = col("subject").astype(str).replace("None", "")
     out["debit"] = pd.to_numeric(
         col("debit").astype(str).str.replace(",", "").str.replace("，", "").str.replace("¥", "").str.replace("￥", "").str.strip(),
         errors="coerce").fillna(0)
@@ -319,6 +317,86 @@ def normalize_to_std(df: pd.DataFrame, mapping: Dict[str, str],
     return out
 
 
+
+def recognize_subject_column(df):
+    if "subject" not in df.columns: return None, []
+    vals = df["subject"].astype(str)
+    if vals.str.strip().ne("").mean() >= 0.5 and vals.str.contains(chr(38134)+chr(34892)+chr(23384)+chr(27454), na=False).any():
+        return "subject", []
+    return None, []
+
+def split_by_bank_subject(book_std, subject_col="subject"):
+    import re as _re
+    is_bank = book_std[subject_col].astype(str).apply(lambda x: bool(re.match(r'^银行存款(?:$|[^\u4e00-\u9fff])', x.strip())))
+    if not is_bank.any(): return {}, book_std
+    bank_rows = book_std[is_bank]
+    non_bank = book_std[~is_bank]
+    subjects = {}
+    for subj, grp in bank_rows.groupby(subject_col):
+        m = _re.search(r"(\d{4,})", str(subj))
+        tag = m.group(1) if m else str(subj)[:20]
+        subjects[f"{tag}_{len(grp)}"] = grp.reset_index(drop=True)
+    print(f"[split] {len(subjects)} bank subjects: " + ", ".join(f"{k}({len(v)}r)" for k,v in subjects.items()))
+    if len(non_bank): print(f"[split] non-bank: {len(non_bank)} rows")
+    return subjects, non_bank
+
+def explain_across_accounts(bank_unmatched, other_subjects, book_norm, out_dir=None):
+    hints = []
+    if not other_subjects or not len(bank_unmatched):
+        print("[cross] no other subjects or no unmatched")
+        return hints
+    import json
+    from collections import defaultdict
+    kdf = pd.DataFrame(bank_unmatched) if not isinstance(bank_unmatched, pd.DataFrame) else bank_unmatched
+    print(f"[cross] ===== 跨账户资金流向探测 =====")
+    print(f"[cross] 银方未匹配 {len(kdf)} 笔 vs 其他 {len(other_subjects)} 个银行科目")
+    for label, sdf in other_subjects.items():
+        for _, row in kdf.iterrows():
+            amt = abs(row.get("net_amount", 0))
+            if amt == 0: continue
+            cp = str(row.get("counterpart", ""))
+            hits = sdf[(sdf["net_amount"].abs() - amt).abs() < 0.02]
+            if len(hits):
+                b_date = str(row.get("date", ""))[:10]
+                b_summary = str(row.get("summary", ""))[:30]
+                hints.append({
+                    "acct": label, "amt": round(amt, 2), "cp": cp[:30],
+                    "cand": len(hits),
+                    "bank_date": b_date, "bank_summary": b_summary,
+                    "book_dates": [str(d)[:10] for d in hits["date"].head(3)],
+                    "book_cps": [str(c)[:20] for c in hits.get("counterpart", pd.Series([""]*len(hits))).head(3)],
+                })
+    if hints:
+        hints.sort(key=lambda h: h["amt"], reverse=True)
+        by_acct = defaultdict(lambda: {"count": 0, "total_amt": 0.0, "samples": []})
+        for h in hints:
+            a = by_acct[h["acct"]]
+            a["count"] += 1
+            a["total_amt"] += h["amt"]
+            if len(a["samples"]) < 3:
+                a["samples"].append(h)
+        print(f"[cross] 命中 {len(hints)} 条，涉及 {len(by_acct)} 个其他账户：")
+        for acct, info in sorted(by_acct.items(), key=lambda x: x[1]["total_amt"], reverse=True):
+            print(f"[cross]   {acct[:40]}: {info['count']}笔, 合计 {info['total_amt']:,.2f}元")
+            for h in info["samples"]:
+                bd0 = h['book_dates'][0] if h['book_dates'] else '?'
+                bc0 = h['book_cps'][0] if h['book_cps'] else ''
+                print(f"[cross]     {h['amt']:>12,.2f}元 | 银:{h['bank_date']} {h['bank_summary']} | 账:{bd0} {bc0}")
+        total_cross = sum(h["amt"] for h in hints)
+        total_unmatched_bank = kdf["net_amount"].abs().sum()
+        if total_unmatched_bank:
+            pct = total_cross/total_unmatched_bank*100
+            print(f"[cross] 跨账户可解释金额合计: {total_cross:,.2f}元 / 银方未匹配总额: {total_unmatched_bank:,.2f}元 = {pct:.1f}%")
+        print(f"[cross] Top 10 明细（金额降序）:")
+        for h in hints[:10]:
+            book_dates_str = ",".join(h["book_dates"][:3])
+            print(f"[cross]   {h['amt']:>12,.2f} | 银:{h['bank_date']} {h['cp'][:25]} | 账方日期:{book_dates_str} | 账户:{h['acct'][:25]}")
+        if out_dir:
+            with open(Path(out_dir) / "cross_hints.json", "w", encoding="utf-8") as fp:
+                json.dump(hints, fp, ensure_ascii=False, indent=2)
+    else:
+        print("[cross] no hints found")
+    return hints
 def filter_bank_account(bank_std: pd.DataFrame,
                         account: Optional[str] = None) -> Tuple[pd.DataFrame, str]:
     """按银行账号过滤流水（流水含多个账户、序时账为单账户时必须先过滤）。
@@ -432,9 +510,8 @@ def _match_l2(book: pd.DataFrame, bank: pd.DataFrame,
               book_used: set, bank_used: set,
               date_window: int, tol_cents: int) -> List[Dict[str, Any]]:
     """L2 v3.4：金额精确 + 日期窗口 → merge 候选 + 日期差贪心指派。
-
-    金额桶内 merge（笛卡尔候选），日期差≤window 筛选，
     按日期差升序贪心一对一配对（drop_duplicates 双侧去重）。
+    注意：不做月份限制，月末月初日期窗口内可能跨月匹配。
     """
     left = book[~book.index.isin(book_used)][["date", "net_cents"]].copy()
     right = bank[~bank.index.isin(bank_used)][["date", "net_cents"]].copy()
@@ -470,6 +547,45 @@ def _match_l2(book: pd.DataFrame, bank: pd.DataFrame,
         bank_used.add(bi)
     return matches
 
+def _match_counterpart_n_to_1(book_m, bank_m, book_used, bank_used, tol_cents):
+    matches = []
+    for tag, src, dst, src_used, dst_used in [("bank", bank_m, book_m, bank_used, book_used),
+                                                ("book", book_m, bank_m, book_used, bank_used)]:
+        src_rem = src[~src.index.isin(src_used)]
+        dst_rem = dst[~dst.index.isin(dst_used)]
+        if len(src_rem) < 2 or len(dst_rem) < 1: continue
+        src_cp = src_rem["counterpart"].astype(str).map(normalize_counterpart_name)
+        src_m  = src_rem["date"].dt.to_period("M")
+        src_abs = src_rem["net_cents"].abs()
+        dst_cp = dst_rem["counterpart"].astype(str).map(normalize_counterpart_name)
+        dst_m  = dst_rem["date"].dt.to_period("M")
+        dst_abs = dst_rem["net_cents"].abs()
+        s = pd.DataFrame({"_cp": src_cp, "_m": src_m, "_abs": src_abs, "_si": src_rem.index})
+        d = pd.DataFrame({"_cp": dst_cp, "_m": dst_m, "_abs": dst_abs, "_di": dst_rem.index})
+        sk = s.groupby(["_cp", "_abs"]).size(); dk = d.groupby(["_cp", "_abs"]).size()
+        hot = sk[sk > 5000].index.union(dk[dk > 5000].index)
+        if len(hot):
+            s = s[~s.set_index(["_cp", "_abs"]).index.isin(hot)]
+            d = d[~d.set_index(["_cp", "_abs"]).index.isin(hot)]
+        mrg = pd.merge(s, d, on=["_cp", "_abs"], suffixes=("_s", "_d"))
+        if mrg.empty: continue
+        mrg["_mdiff"] = (mrg["_m_s"] - mrg["_m_d"]).apply(lambda x: abs(x.n) if hasattr(x, "n") else 99)
+        mrg = mrg[mrg["_mdiff"] <= 1]
+        if mrg.empty: continue
+        for (cp, mth, ab), g in mrg.groupby(["_cp", "_m_s", "_abs"]):
+            si = [i for i in g["_si"].unique() if i not in src_used]
+            di = [i for i in g["_di"].unique() if i not in dst_used]
+            if len(si) < 2 or len(di) != 1: continue
+            di0 = di[0]
+            note = f"{cp[:15]} {mth}{len(si)}p->1" if tag == "bank" else f"{cp[:15]} {mth}1->{len(si)}p"
+            matches.append({"book_idxs": [di0] if tag == "bank" else si,
+                            "bank_idxs": si if tag == "bank" else [di0],
+                            "level": "L3_cp_n1", "note": note})
+            dst_used.add(di0)
+            src_used.update(si)
+    return matches
+
+
 def _match_l3_month_remainder(book_m, bank_m, book_used, bank_used, tol_cents):
     """月模式专用：某月某方向上，未匹配流水合计 == 单笔账面 → n:1 成组。
     覆盖'整月流水汇总记一笔账'形态。O(n) 分组求和，无组合爆炸。"""
@@ -496,29 +612,276 @@ def _match_l3_month_remainder(book_m, bank_m, book_used, bank_used, tol_cents):
     return matches
 
 def _match_l3_fee_monthly(book_m, bank_m, book_used, bank_used, tol_cents):
+    """手续费滚动窗口匹配：逐月累加账款/银端余额，余额对齐时整段匹配。
+    允许多月累计对齐(容差=50元)，同时支持逐月精确匹配作为兜底。
+    """
     matches = []
-    # 账方：只取"手续费"（与验证基线 247 行口径一致）
+    _FKW = "手续费|费用外收|扣费|收费|短信费|年费|工本费|服务费"
+    _k_fee_mask = (
+        (~bank_m.index.isin(bank_used)) & (
+            bank_m["summary"].astype(str).str.strip().str.contains(_FKW, na=False) |
+            ((bank_m["summary"].astype(str).str.strip().isin(["", "nan", "None", "nat"]) |
+              bank_m["summary"].isna()) & (bank_m["net_cents"].abs() <= 5000))
+        )
+    )
     fee_b = book_m[(~book_m.index.isin(book_used)) &
-                   book_m["summary"].astype(str).str.contains("手续费", na=False)]
-    # 银方：只取"费用外收"（流水摘要原生类型码，2333 行）
-    fee_k = bank_m[(~bank_m.index.isin(bank_used)) &
-                   (bank_m["summary"].astype(str).str.strip() == "费用外收")]
+                   (book_m["summary"].astype(str).str.strip().str.contains(_FKW, na=False))]
+    fee_k = bank_m[_k_fee_mask]
+    print(f"[L3_fee_month] 候选池: 账方{len(fee_b)}笔 银方{len(fee_k)}笔 (已用: 账{len(book_used)} 银{len(bank_used)})")
     if fee_b.empty or fee_k.empty:
         return matches
     b_month = fee_b.groupby(fee_b["date"].dt.to_period("M"))["net_cents"].sum()
     k_month = fee_k.groupby(fee_k["date"].dt.to_period("M"))["net_cents"].sum()
-    for m in k_month.index:
-        if m not in b_month.index:
-            continue
-        if abs(b_month[m] - k_month[m]) <= tol_cents:
-            bidx = fee_b[(fee_b["date"].dt.to_period("M") == m) & (~fee_b.index.isin(book_used))].index.tolist()
-            kidx = fee_k[(fee_k["date"].dt.to_period("M") == m) & (~fee_k.index.isin(bank_used))].index.tolist()
-            if bidx and kidx:
-                matches.append({"book_idxs": bidx, "bank_idxs": kidx, "level": "L3_fee_month",
-                                "note": f"手续费月度聚合：{m}月 账{len(bidx)}笔↔银{len(kidx)}笔 总额相等"})
-                book_used.update(bidx)
-                bank_used.update(kidx)
+    all_months = sorted(set(b_month.index) | set(k_month.index))
+    FEE_TOL = max(tol_cents, 5000)  # 累计容差50元，比单笔容差宽松
+    b_acc, k_acc = 0, 0
+    b_buf, k_buf = [], []
+    seg_count = 0
+    for m in all_months:
+        b_val = int(b_month.get(m, 0))
+        k_val = int(k_month.get(m, 0))
+        b_acc += b_val
+        k_acc += k_val
+        b_now = fee_b[fee_b["date"].dt.to_period("M") == m].index.tolist()
+        k_now = fee_k[fee_k["date"].dt.to_period("M") == m].index.tolist()
+        b_buf.extend(b_now)
+        k_buf.extend(k_now)
+        if abs(b_acc - k_acc) <= FEE_TOL and b_buf and k_buf:
+            _b_fresh = [i for i in b_buf if i not in book_used]
+            _k_fresh = [i for i in k_buf if i not in bank_used]
+            if _b_fresh and _k_fresh:
+                seg_count += 1
+                matches.append({
+                    "book_idxs": _b_fresh, "bank_idxs": _k_fresh, "level": "L3_fee_month",
+                    "note": f"累计匹配#{seg_count}: {all_months[0]}-{m} 账{len(_b_fresh)}笔 银{len(_k_fresh)}笔 差{abs(b_acc-k_acc)/100:.1f}元"
+                })
+                book_used.update(_b_fresh)
+                bank_used.update(_k_fresh)
+            b_acc, k_acc = 0, 0
+            b_buf, k_buf = [], []
+    b_rem = fee_b[~fee_b.index.isin(book_used)]
+    k_rem = fee_k[~fee_k.index.isin(bank_used)]
+    if not b_rem.empty and not k_rem.empty:
+        br_m = b_rem.groupby(b_rem["date"].dt.to_period("M"))["net_cents"].sum()
+        kr_m = k_rem.groupby(k_rem["date"].dt.to_period("M"))["net_cents"].sum()
+        m_count = 0
+        for m in sorted(set(br_m.index) & set(kr_m.index)):
+            if abs(br_m[m] - kr_m[m]) <= FEE_TOL:
+                bidx = [i for i in b_rem[b_rem["date"].dt.to_period("M") == m].index if i not in book_used]
+                kidx = [i for i in k_rem[k_rem["date"].dt.to_period("M") == m].index if i not in bank_used]
+                if bidx and kidx:
+                    m_count += 1
+                    matches.append({
+                        "book_idxs": bidx, "bank_idxs": kidx, "level": "L3_fee_month",
+                        "note": f"月聚合: {m} 账{len(bidx)}笔 银{len(kidx)}笔 差{abs(br_m[m]-kr_m[m])/100:.1f}元"
+                    })
+                    book_used.update(bidx)
+                    bank_used.update(kidx)
+        if m_count:
+            print(f"[L3_fee_month] 月聚合兜底: +{m_count}月")
+    b_left = fee_b[~fee_b.index.isin(book_used)]
+    k_left = fee_k[~fee_k.index.isin(bank_used)]
+    print(f"[L3_fee_month] 累计+月聚合共{len(matches)}段, 剩余: 账{len(b_left)}笔({abs(b_left['net_cents'].sum())/100:.0f}元) 银{len(k_left)}笔({abs(k_left['net_cents'].sum())/100:.0f}元)")
     return matches
+def _match_l3_fee_remainder(book_m, bank_m, book_used, bank_used, tol_cents, date_window,
+                             max_group=10, fee_tol=5000):
+    """手续费剩余匹配：滑动窗口(O(N)) + 小N组合(max 3选1~3)兜底。
+    对未匹配账面费用，在同月银方费用中找连续窗口或小组合匹配。
+    """
+    from itertools import combinations
+    matches = []
+    _FKW = "手续费|费用外收|扣费|收费|短信费|年费|工本费|服务费|电话费"
+    _k_fee_mask = (
+        (~bank_m.index.isin(bank_used)) & (
+            bank_m["summary"].astype(str).str.strip().str.contains(_FKW, na=False) |
+            ((bank_m["summary"].astype(str).str.strip().isin(["", "nan", "None", "nat"]) |
+              bank_m["summary"].isna()) & (bank_m["net_cents"].abs() <= 5000))
+        )
+    )
+    b_rem = book_m[(~book_m.index.isin(book_used)) &
+                   (book_m["summary"].astype(str).str.strip().str.contains(_FKW, na=False))]
+    k_rem = bank_m[_k_fee_mask]
+    if b_rem.empty or k_rem.empty:
+        return matches
+    b_rem = b_rem.copy(); b_rem["_m"] = pd.to_datetime(b_rem["date"], errors="coerce").dt.to_period("M")
+    k_rem = k_rem.copy(); k_rem["_m"] = pd.to_datetime(k_rem["date"], errors="coerce").dt.to_period("M")
+    k_by_month = {m: g for m, g in k_rem.groupby("_m", sort=False)}
+    # 跨月扩展：账面在M月时，也从M-1和M+1月找银方费用
+    def _get_cross_pool(bm):
+        parts = [k_by_month.get(bm, pd.DataFrame())]
+        try: parts.append(k_by_month.get(bm - 1, pd.DataFrame()))
+        except: pass
+        try: parts.append(k_by_month.get(bm + 1, pd.DataFrame()))
+        except: pass
+        return pd.concat([p for p in parts if not p.empty]) if parts else pd.DataFrame()
+    _b_used = set(int(i) for i in book_used)
+    _k_used = set(int(i) for i in bank_used)
+    n_matched = 0
+    for _, br in b_rem.iterrows():
+        bi = int(br.name)
+        if bi in _b_used:
+            continue
+        target = int(br["net_cents"])
+        bm = br["_m"]
+        if bm not in k_by_month:
+            continue
+        pool = k_by_month[bm]
+        pool = pool[(~pool.index.isin(_k_used)) & ((pool["net_cents"] > 0) == (target > 0))]
+        if len(pool) < 1:
+            continue
+        # 按日期排序（滑动窗口前提）
+        pool = pool.sort_values("date") if "date" in pool.columns else pool
+        vals = [(int(pi), int(pc)) for pi, pc in zip(pool.index, pool["net_cents"])]
+        # ── 策略1: 滑动窗口（连续日期区间的条目）──
+        found = None
+        for i in range(len(vals)):
+            total = 0
+            for j in range(i, min(i + max_group, len(vals))):
+                total += vals[j][1]
+                if abs(total - target) <= fee_tol:
+                    found = [vals[k][0] for k in range(i, j + 1)]
+                    break
+                if abs(total) > abs(target) + fee_tol:
+                    break
+            if found:
+                break
+        # ── 策略2: 小组合兜底（最接近target的20个中选1~3个）──
+        if found is None:
+            closest = sorted(vals, key=lambda x: abs(x[1] - target))[:20]
+            for n in range(1, 4):
+                for combo in combinations(range(len(closest)), n):
+                    total = sum(closest[i][1] for i in combo)
+                    if abs(total - target) <= fee_tol:
+                        found = [closest[i][0] for i in combo]
+                        break
+                if found:
+                    break
+        if found:
+            found = [x for x in found if x not in _k_used]
+            if found:
+                n_matched += 1
+                matches.append({
+                    "book_idxs": [bi], "bank_idxs": found, "level": "L3_fee_remainder",
+                    "note": f"剩余匹配: {bm} 账{target/100:.2f}↔银{len(found)}笔"
+                })
+                book_used.add(bi)
+                bank_used.update(found)
+                _b_used.add(bi)
+                _k_used.update(found)
+    if n_matched:
+        print(f"[L3_fee_rem] 剩余匹配: +{n_matched}笔")
+    return matches
+
+def _match_l3_fee_embedded(book, bank, book_used, bank_used, date_window, tol_cents,
+                           max_fee_cents=5000):
+    """手续费伴随匹配：小额定费用（≤50元）允许与同向非费用行 n:1 合并匹配。
+    
+    场景：银行流水同时产生转账-100,000和费用外收-15两笔，
+          企业账只记一笔-100,015"转账"，L3_fee_difference因摘要无"手续费"而漏配。
+          本规则将费用行与非费用行合并后匹配对方单条记录。
+    """
+    import numpy as np
+
+    _FEE_PAT = "|".join(FEE_WORDS)
+    matches = []
+    # ── 方向一：n笔银行(含1笔费用) ↔ 1笔账面 ──
+    _b_used = set(int(i) for i in book_used)
+    _k_used = set(int(i) for i in bank_used)
+    # 银行侧：分出费用行和非费用行
+    k_fee_mask = bank["summary"].astype(str).str.strip().str.contains(_FEE_PAT, na=False)
+    k_fee = bank[(~bank.index.isin(_k_used)) & k_fee_mask & (bank["net_cents"].abs() <= max_fee_cents)]
+    k_non = bank[(~bank.index.isin(_k_used)) & (~k_fee_mask)]
+    if k_fee.empty or k_non.empty or book[~book.index.isin(_b_used)].empty:
+        return matches
+    # 按月份建非费用行索引
+    k_non_m = k_non.copy()
+    k_non_m["_m"] = pd.to_datetime(k_non_m["date"], errors="coerce").dt.to_period("M")
+    k_non_m["_pos"] = k_non_m["net_cents"] > 0
+    k_by_month = {m: g for m, g in k_non_m.groupby(["_m", "_pos"], sort=False)}
+    b_rem = book[~book.index.isin(_b_used)].copy()
+    b_rem["_m"] = pd.to_datetime(b_rem["date"], errors="coerce").dt.to_period("M")
+    b_rem["_pos"] = b_rem["net_cents"] > 0
+    b_by_month_cents = {}
+    for (mth, pos), g in b_rem.groupby(["_m", "_pos"], sort=False):
+        b_by_month_cents[(mth, pos)] = {int(c): list(g.index) for c, idxs in g.groupby("net_cents").groups.items()}
+    for _, fr in k_fee.iterrows():
+        fc = int(fr["net_cents"])
+        fm = pd.to_datetime(fr["date"], errors="coerce").to_period("M") if pd.notna(fr["date"]) else None
+        fpos = fc > 0
+        if fm is None:
+            continue
+        pool = k_by_month.get((fm, fpos))
+        if pool is None:
+            continue
+        for _, nr in pool.iterrows():
+            nc = int(nr["net_cents"])
+            total = fc + nc
+            bmap = b_by_month_cents.get((fm, fpos), {})
+            b_hits = bmap.get(total, []) + bmap.get(-total, [])
+            b_hits = [x for x in b_hits if x not in _b_used]
+            if b_hits:
+                bi = b_hits[0]
+                matches.append({
+                    "book_idxs": [bi], "bank_idxs": [int(fr.name), int(nr.name)],
+                    "level": "L3_fee_embedded",
+                    "note": f"费用伴随: 银行{fc/100:.2f}+{nc/100:.2f}→账面{total/100:.2f}"
+                })
+                book_used.add(bi)
+                bank_used.add(int(fr.name))
+                bank_used.add(int(nr.name))
+                _b_used.add(bi)
+                _k_used.add(int(fr.name))
+                _k_used.add(int(nr.name))
+                break
+    # ── 方向二：n笔账面(含1笔费用) ↔ 1笔银行 ──
+    _b_used2 = set(int(i) for i in book_used)
+    _k_used2 = set(int(i) for i in bank_used)
+    b_fee_mask = book["summary"].astype(str).str.strip().str.contains(_FEE_PAT, na=False)
+    b_fee = book[(~book.index.isin(_b_used2)) & b_fee_mask & (book["net_cents"].abs() <= max_fee_cents)]
+    b_non = book[(~book.index.isin(_b_used2)) & (~b_fee_mask)]
+    if b_fee.empty or b_non.empty or bank[~bank.index.isin(_k_used2)].empty:
+        return matches
+    b_non_m = b_non.copy()
+    b_non_m["_m"] = pd.to_datetime(b_non_m["date"], errors="coerce").dt.to_period("M")
+    b_non_m["_pos"] = b_non_m["net_cents"] > 0
+    bb_by_month = {m: g for m, g in b_non_m.groupby(["_m", "_pos"], sort=False)}
+    k_rem = bank[~bank.index.isin(_k_used2)].copy()
+    k_rem["_m"] = pd.to_datetime(k_rem["date"], errors="coerce").dt.to_period("M")
+    k_rem["_pos"] = k_rem["net_cents"] > 0
+    kb_by_month_cents = {}
+    for (mth, pos), g in k_rem.groupby(["_m", "_pos"], sort=False):
+        kb_by_month_cents[(mth, pos)] = {int(c): list(g.index) for c, idxs in g.groupby("net_cents").groups.items()}
+    for _, fr in b_fee.iterrows():
+        fc = int(fr["net_cents"])
+        fm = pd.to_datetime(fr["date"], errors="coerce").to_period("M") if pd.notna(fr["date"]) else None
+        fpos = fc > 0
+        if fm is None:
+            continue
+        pool = bb_by_month.get((fm, fpos))
+        if pool is None:
+            continue
+        for _, nr in pool.iterrows():
+            nc = int(nr["net_cents"])
+            total = fc + nc
+            kmap = kb_by_month_cents.get((fm, fpos), {})
+            k_hits = kmap.get(total, []) + kmap.get(-total, [])
+            k_hits = [x for x in k_hits if x not in _k_used2]
+            if k_hits:
+                ki = k_hits[0]
+                matches.append({
+                    "book_idxs": [int(fr.name), int(nr.name)], "bank_idxs": [ki],
+                    "level": "L3_fee_embedded",
+                    "note": f"费用伴随: 账面{fc/100:.2f}+{nc/100:.2f}→银行{total/100:.2f}"
+                })
+                book_used.add(int(fr.name))
+                book_used.add(int(nr.name))
+                bank_used.add(ki)
+                _b_used2.add(int(fr.name))
+                _b_used2.add(int(nr.name))
+                _k_used2.add(ki)
+                break
+    return matches
+
 
 def _match_l3_fee_difference(book: pd.DataFrame, bank: pd.DataFrame,
                               book_used: set, bank_used: set,
@@ -623,86 +986,108 @@ def _match_l3(book: pd.DataFrame, bank: pd.DataFrame,
               book_used: set, bank_used: set,
               date_window: int, tol_cents: int,
               max_group: int = 3, max_candidates: int = 30) -> List[Dict[str, Any]]:
-    """L3：同方向同窗口内 n:m 金额合计相等 → 拆分/合并入账。
-
-    v3.5: 向量化候选池（numpy 掩码替代 iterrows 全表扫描），
-          语义不变；候选池超上限时显式记日志，避免静默漏配。
-    """
+    """L3 v3.6：按月分桶+持久used掩码。O(n²)全表扫描 → O(n×桶)。
+    语义与v3.5完全一致：同方向/同窗口(dd<=window或date为NaT)/容差/
+    候选超上限显式记录/NaT锚点不做日期过滤。"""
     import numpy as np
+    from collections import defaultdict
     matches: List[Dict[str, Any]] = []
     overflow_log = []
 
-    def subset_hit(target_cents: int,
-                   cand: List[Tuple[int, int, Any]]) -> Optional[List[int]]:
-        if len(cand) > max_candidates:
+    def _prep(src: pd.DataFrame, used: set) -> dict:
+        idx = src.index.to_numpy()
+        cents = pd.to_numeric(src["net_cents"], errors="coerce").fillna(0).to_numpy(dtype="int64")
+        dts = pd.to_datetime(src["date"], errors="coerce")
+        months = np.where(dts.isna(), "NaT", dts.dt.to_period("M").astype(str))
+        pos = (cents > 0)
+        used_mask = np.isin(idx, list(used)) if used else np.zeros(len(idx), dtype=bool)
+        buckets = defaultdict(list)
+        for p in range(len(idx)):
+            buckets[months[p]].append(p)
+        return {"idx": idx, "cents": cents, "d64": dts.to_numpy(),
+                "months": months, "pos": pos, "used": used_mask,
+                "buckets": buckets, "nat": np.array(buckets.get("NaT", []), dtype=int)}
+
+    def _pool_months(anchor_m):
+        if anchor_m == "NaT":
+            return None                      # NaT锚点：全表（保持原语义）
+        p = pd.Period(anchor_m, "M")
+        return [str(p - 1), str(p), str(p + 1)]   # 邻三月覆盖±window跨月边界（如30号↔下月2号）
+
+    def window_pool(S, sign_pos, anchor_dt, anchor_m):
+        ms = _pool_months(anchor_m)
+        if ms is None:
+            p = np.arange(len(S["idx"]))
+        else:
+            cand = []
+            for m in ms:
+                b = S["buckets"].get(m)
+                if b:
+                    cand.extend(b)
+            if len(S["nat"]):
+                cand.extend(S["nat"].tolist())     # 原语义：date为空的行恒保留
+            if not cand:
+                return []
+            p = np.array(cand, dtype=int)
+        m_ = (S["pos"][p] == sign_pos) & (~S["used"][p])
+        if pd.notna(anchor_dt):
+            a = np.datetime64(pd.Timestamp(anchor_dt).to_datetime64())
+            dd = np.abs((S["d64"][p] - a) / np.timedelta64(1, "D"))
+            m_ &= (dd <= date_window) | np.isnan(dd)
+        p = p[m_]
+        return [(int(S["idx"][i]), int(S["cents"][i])) for i in p]
+
+    def subset_hit(target_cents, cand):
+        if len(cand) < 2 or len(cand) > max_candidates:
             return None
-        for size in range(2, max_group + 1):
+        for size in range(2, min(max_group, len(cand)) + 1):
             for combo in itertools.combinations(cand, size):
                 if abs(sum(c[1] for c in combo) - target_cents) <= tol_cents:
                     return [c[0] for c in combo]
         return None
 
-    def _arrays(src: pd.DataFrame):
-        idx = src.index.to_numpy()
-        cents = pd.to_numeric(src["net_cents"], errors="coerce").fillna(0).to_numpy(dtype="int64")
-        dates = pd.to_datetime(src["date"], errors="coerce").to_numpy()
-        return idx, cents, dates
+    def consume(S, row_ids):
+        if row_ids:
+            S["used"] |= np.isin(S["idx"], list(row_ids))
 
-    _cache = {}
-
-    def window_pool(src_key: str, src: pd.DataFrame, used: set, sign: int, anchor) -> list:
-        if src_key not in _cache:
-            _cache[src_key] = _arrays(src)
-        idx, cents, dates = _cache[src_key]
-        if len(idx) == 0:
-            return []
-        m = (cents > 0) == (sign > 0)
-        if used:
-            m &= ~np.isin(idx, list(used))
-        if pd.notna(anchor):
-            anchor64 = np.datetime64(pd.Timestamp(anchor).to_datetime64())
-            dd = np.abs((dates - anchor64) / np.timedelta64(1, "D"))
-            # 与原语义一致：date 为空的记录保留（不做日期过滤）
-            m &= (dd <= date_window) | np.isnan(dd)
-        sel = np.nonzero(m)[0]
-        return [(int(idx[i]), int(cents[i]), dates[i]) for i in sel]
+    B = _prep(bank, bank_used)
+    J = _prep(book, book_used)
 
     # 方向一：1 笔账 ←→ n 笔流水
-    b_idx, b_cents, b_dates = _cache.get("bank") or _arrays(bank)
-    _cache["bank"] = (b_idx, b_cents, b_dates)
-    j_idx, j_cents, j_dates = _cache.get("book") or _arrays(book)
-    _cache["book"] = (j_idx, j_cents, j_dates)
-
-    for k in range(len(j_idx)):
-        ji = int(j_idx[k])
-        if ji in book_used:
+    for k in range(len(J["idx"])):
+        if J["used"][k]:
             continue
-        cents = int(j_cents[k])
-        pool = window_pool("bank", bank, bank_used, cents, j_dates[k])
+        cents = int(J["cents"][k])
+        pool = window_pool(B, J["pos"][k], J["d64"][k], J["months"][k])
         if len(pool) > max_candidates:
-            overflow_log.append(f"L3 overflow: book J{ji} cents={cents} pool={len(pool)}>{max_candidates}")
+            overflow_log.append(f"L3 overflow: book J{int(J['idx'][k])} cents={cents} pool={len(pool)}>{max_candidates}")
         hit = subset_hit(cents, pool)
         if hit:
+            ji = int(J["idx"][k])
             matches.append({"book_idxs": [ji], "bank_idxs": hit, "level": "L3",
                             "note": f"1笔账面↔{len(hit)}笔流水（拆分/合并入账）"})
             book_used.add(ji)
             bank_used.update(hit)
+            J["used"][k] = True
+            consume(B, hit)
 
     # 方向二：n 笔账 ←→ 1 笔流水
-    for k in range(len(b_idx)):
-        bi = int(b_idx[k])
-        if bi in bank_used:
+    for k in range(len(B["idx"])):
+        if B["used"][k]:
             continue
-        cents = int(b_cents[k])
-        pool = window_pool("book", book, book_used, cents, b_dates[k])
+        cents = int(B["cents"][k])
+        pool = window_pool(J, B["pos"][k], B["d64"][k], B["months"][k])
         if len(pool) > max_candidates:
-            overflow_log.append(f"L3 overflow: bank B{bi} cents={cents} pool={len(pool)}>{max_candidates}")
+            overflow_log.append(f"L3 overflow: bank B{int(B['idx'][k])} cents={cents} pool={len(pool)}>{max_candidates}")
         hit = subset_hit(cents, pool)
         if hit:
+            bi = int(B["idx"][k])
             matches.append({"book_idxs": hit, "bank_idxs": [bi], "level": "L3",
                             "note": f"{len(hit)}笔账面↔1笔流水（拆分/合并入账）"})
             book_used.update(hit)
             bank_used.add(bi)
+            B["used"][k] = True
+            consume(J, hit)
 
     if overflow_log:
         print("[L3] 超出组合能力（静默漏配→显式记录）:")
@@ -710,7 +1095,6 @@ def _match_l3(book: pd.DataFrame, bank: pd.DataFrame,
             print(f"  {msg}")
         if len(overflow_log) > 5:
             print(f"  ... 共 {len(overflow_log)} 条")
-
     return matches
 
 import unicodedata
@@ -750,23 +1134,26 @@ def _align_counterpart_names(book_names, bank_names, min_len=3, fuzzy_th=92):
 
 def _match_l3_counterpart(book, bank, book_used, bank_used, tol_cents,
                           max_group=4, max_candidates=40):
-    """对手方分区匹配：同名小区间内做 n:m 子集和。
-    池子小（同户名几到几十笔），所以允许比全局 L3 更大的组。"""
+    """对手方分区匹配 v2（性能版）：名称分桶字典化+池子按(月,方向/金额)预索引。
+    原版每户名全表扫描、池内O(g²)；现按户名O(n)建索引，池查询近O(1)。
+    语义与原版一致：同户名+同月 1:1削峰 → 月度闭环 → n:m子集和。"""
     import itertools
     matches = []
     b_rem = book[~book.index.isin(book_used)]
     k_rem = bank[~bank.index.isin(bank_used)]
     _bad = {"", "nan", "none", "nat"}
-    b_cp = b_rem[~b_rem["counterpart"].astype(str).str.strip().str.lower().isin(_bad)]
-    b_cp = b_cp[b_cp["counterpart"].astype(str).str.strip().str.len() >= 2].copy()
-    k_cp = k_rem[~k_rem["counterpart"].astype(str).str.strip().str.lower().isin(_bad)]
-    k_cp = k_cp[k_cp["counterpart"].astype(str).str.strip().str.len() >= 2].copy()
-    b_cp["_cp"] = b_cp["counterpart"].map(normalize_counterpart_name)
-    k_cp["_cp"] = k_cp["counterpart"].map(normalize_counterpart_name)
-    b_cp["_mk"] = b_cp["date"].dt.to_period("M")
-    k_cp["_mk"] = k_cp["date"].dt.to_period("M")
-    b_cp["_pos"] = b_cp["net_cents"].apply(lambda x: int(x) > 0)
-    k_cp["_pos"] = k_cp["net_cents"].apply(lambda x: int(x) > 0)
+
+    def _prep_cp(rem):
+        cp = rem[~rem["counterpart"].astype(str).str.strip().str.lower().isin(_bad)]
+        cp = cp[cp["counterpart"].astype(str).str.strip().str.len() >= 2].copy()
+        cp["_cp"] = cp["counterpart"].map(normalize_counterpart_name)
+        cp["_mk"] = cp["date"].dt.to_period("M")
+        cp["_pos"] = cp["net_cents"] > 0
+        groups = {n: g for n, g in cp.groupby("_cp", sort=False)}
+        return cp, groups
+
+    b_cp, b_groups = _prep_cp(b_rem)
+    k_cp, k_groups = _prep_cp(k_rem)
     if b_cp.empty or k_cp.empty:
         print("[对手方分区] 一侧无对手方，跳过")
         return matches
@@ -775,25 +1162,43 @@ def _match_l3_counterpart(book, bank, book_used, bank_used, tol_cents,
         k_cp["_cp"].unique())
     print(f"[对手方分区] 账方户名 {b_cp['_cp'].nunique()} 个，"
           f"银方 {k_cp['_cp'].nunique()} 个，对齐成功 {len(name_map)} 个")
-    # 诊断（调好后可删）
+    # 诊断（生产日志，保留）
     print("账方未对齐户名示例:", sorted(set(b_cp["_cp"]) - set(name_map.keys()))[:10])
     print("银方未对齐户名示例:", sorted(set(k_cp["_cp"]) - set(name_map.values()))[:10])
     _sizes = k_cp[k_cp["_cp"].isin(name_map.values())].groupby("_cp").size().sort_values(ascending=False)
     print(f"对齐户名的银方池子: >40笔的有 {(_sizes > 40).sum()} 个，最大5个: {_sizes.head(5).to_dict()}")
 
+    def _subset_hit(target, idxs, vals):
+        for n in range(1, min(max_group, len(idxs)) + 1):
+            for combo in itertools.combinations(range(len(idxs)), n):
+                if sum(vals[i] for i in combo) == target:
+                    return [idxs[i] for i in combo]
+        return None
+
     for bname, kname in name_map.items():
-        bg = b_cp[b_cp["_cp"] == bname]
-        kg = k_cp[k_cp["_cp"] == kname]
-        # ↓↓↓ 第一层：同户名+同月+同额 1:1 配对（大池子削峰） ↓↓↓
-        _kg_avail = kg[~kg.index.isin(bank_used)]
+        bg = b_groups.get(bname)
+        kg = k_groups.get(kname)
+        if bg is None or kg is None:
+            continue
+        # 预索引：(_mk, net_cents)→行号 与 (_mk, _pos)→(行号,金额)
+        kg_mc = {}
+        for key, g in kg.groupby(["_mk", "net_cents"], sort=False):
+            kg_mc[key] = g.index.tolist()
+        kg_mp = {}
+        for key, g in kg.groupby(["_mk", "_pos"], sort=False):
+            kg_mp[key] = (g.index.tolist(), [int(x) for x in g["net_cents"]])
+        bg_mp = {}
+        for key, g in bg.groupby(["_mk", "_pos"], sort=False):
+            bg_mp[key] = (g.index.tolist(), [int(x) for x in g["net_cents"]])
+
+        # ↓↓↓ 第一层：同户名+同月+同额 1:1 配对（恰好唯一才自动确认） ↓↓↓
         for ji, jr in bg.iterrows():
             if ji in book_used:
                 continue
-            cand = _kg_avail[(~_kg_avail.index.isin(bank_used)) &
-                             (_kg_avail["_mk"] == jr["_mk"]) &
-                             (_kg_avail["net_cents"] == jr["net_cents"])]
-            if len(cand) == 1:                      # 恰好唯一才自动确认，多个候选留给子集和
-                bi = cand.index[0]
+            lst = kg_mc.get((jr["_mk"], jr["net_cents"]), [])
+            cand = [i for i in lst if i not in bank_used]
+            if len(cand) == 1:
+                bi = cand[0]
                 matches.append({"book_idxs": [ji], "bank_idxs": [bi],
                                 "level": "L3_counterpart",
                                 "note": f"对手方[{kname}]：同月同额1:1"})
@@ -819,24 +1224,20 @@ def _match_l3_counterpart(book, bank, book_used, bank_used, tol_cents,
                                      f"账{len(_bidx)}笔↔银{len(_kidx)}笔 总额相等")})
                         book_used.update(_bidx)
                         bank_used.update(_kidx)
-        # 方向一：1笔账 ↔ n笔银（同方向，即净额同号）
+        # 方向一：1笔账 ↔ n笔银（同月同向子集和）
         for ji, jr in bg.iterrows():
             if ji in book_used:
                 continue
             cents = int(jr["net_cents"])
-            pool = kg[(~kg.index.isin(bank_used)) & (kg["_mk"] == jr["_mk"]) &
-                      (kg["_pos"] == (cents > 0))]
-            if pool.empty or len(pool) > max_candidates:
+            got = kg_mp.get((jr["_mk"], cents > 0))
+            if not got:
                 continue
-            idxs, vals = pool.index.tolist(), [int(x) for x in pool["net_cents"]]
-            hit = None
-            for n in range(1, min(max_group, len(idxs)) + 1):
-                for combo in itertools.combinations(range(len(idxs)), n):
-                    if sum(vals[i] for i in combo) == cents:
-                        hit = [idxs[i] for i in combo]
-                        break
-                if hit:
-                    break
+            idxs_all, vals_all = got
+            pool = [(i, v) for i, v in zip(idxs_all, vals_all) if i not in bank_used]
+            if len(pool) < 1 or len(pool) > max_candidates:
+                continue
+            idxs, vals = [p[0] for p in pool], [p[1] for p in pool]
+            hit = _subset_hit(cents, idxs, vals)
             if hit:
                 matches.append({"book_idxs": [ji], "bank_idxs": hit,
                                 "level": "L3_counterpart",
@@ -844,22 +1245,19 @@ def _match_l3_counterpart(book, bank, book_used, bank_used, tol_cents,
                 book_used.add(ji)
                 bank_used.update(hit)
         # 方向二：n笔账 ↔ 1笔银
-        kg2 = kg[~kg.index.isin(bank_used)]
-        for bi, br in kg2.iterrows():
-            cents = int(br["net_cents"])
-            pool = bg[(~bg.index.isin(book_used)) & (bg["_mk"] == br["_mk"]) & 
-                      (bg["_pos"] == (cents > 0))]
-            if pool.empty or len(pool) > max_candidates:
+        for bi, br in kg.iterrows():
+            if bi in bank_used:
                 continue
-            idxs, vals = pool.index.tolist(), [int(x) for x in pool["net_cents"]]
-            hit = None
-            for n in range(1, min(max_group, len(idxs)) + 1):
-                for combo in itertools.combinations(range(len(idxs)), n):
-                    if sum(vals[i] for i in combo) == cents:
-                        hit = [idxs[i] for i in combo]
-                        break
-                if hit:
-                    break
+            cents = int(br["net_cents"])
+            got = bg_mp.get((br["_mk"], cents > 0))
+            if not got:
+                continue
+            idxs_all, vals_all = got
+            pool = [(i, v) for i, v in zip(idxs_all, vals_all) if i not in book_used]
+            if len(pool) < 1 or len(pool) > max_candidates:
+                continue
+            idxs, vals = [p[0] for p in pool], [p[1] for p in pool]
+            hit = _subset_hit(cents, idxs, vals)
             if hit:
                 matches.append({"book_idxs": hit, "bank_idxs": [bi],
                                 "level": "L3_counterpart",
@@ -1029,7 +1427,7 @@ def detect_fee_small_monthly_diff(book, bank, max_small_cents=5000):
     → 疑似费用扣自其他账户或漏记，列为审计线索（不核销、不改分类）。"""
     fee_kw = ("手续费", "短信费", "年费", "账户管理费", "工本费", "服务费")
     bf = book[book["summary"].astype(str).str.contains("|".join(fee_kw), na=False)]
-    kf = bank[bank["summary"].astype(str).str.strip() == "费用外收"]
+    kf = bank[bank["summary"].astype(str).str.contains("|".join(fee_kw), na=False)]
     if bf.empty or kf.empty:
         return []
     bm = bf.groupby(bf["date"].dt.to_period("M"))["net_cents"].sum()
@@ -1093,60 +1491,47 @@ def aggregate_red_flags(red_flags, top_n=20):
 
 def detect_red_flags(std_df, side, pair_window=3, large_threshold=100000.0, round_unit=10000, burst_days=7, burst_count=3):
     flags = []; df = std_df
-    MAX_FLAGS = 5000; MAX_MERGE = 100000; MAX_BUCKET = 200
+    MAX_FLAGS = 5000; MAX_MERGE = 100000; MAX_BUCKET = 200; import numpy as np; seen = set()
     def _add(f):
         if len(flags) < MAX_FLAGS:
             flags.append(f)
         elif len(flags) == MAX_FLAGS:
             flags.append({'type':'红旗超限','side':side,'rows':[],'amount':0,'detail':f'已达上限{MAX_FLAGS}'})
 
-    # 一收一付同额（v3.4: pandas merge 向量化，替代 O(n²) 双重循环）
-    if len(df) > 100:
-        try:
-            sub = df[df["abs_cents"] > 0][["abs_cents", "net_cents", "date", "row_id"]].copy()
-            sub["_sign"] = (sub["net_cents"] > 0).astype(int)
-            ins = sub[sub['_sign'] == 1]; outs = sub[sub['_sign'] == 0]
-            m = pd.merge(ins, outs, on='abs_cents', suffixes=('_in', '_out'))
-            if len(m) > MAX_MERGE: m = m.head(MAX_MERGE)
-            if not m.empty:
-                m["gap"] = (m["date_in"] - m["date_out"]).dt.days.abs()
-                m = m[m["gap"] <= pair_window]
-                seen = set()
-                for _, r in m.iterrows():
-                    key = tuple(sorted((r["row_id_in"], r["row_id_out"])))
-                    if key not in seen:
-                        seen.add(key)
-                        _add({"type": "一收一付同额", "side": side, "rows": list(key),
-                                      "amount": round(r["abs_cents"] / 100, 2),
-                                      "detail": f"同额资金{int(r['gap'])}天一进一出"})
-        except Exception:
-            pass  # 量大时降级跳过，不阻塞主流程
-    else:
-        from collections import defaultdict
-        by_abs = defaultdict(list)
-        for i, r in df.iterrows(): by_abs[int(r["abs_cents"])].append(i)
-        seen = set()
-        for cents, idxs in by_abs.items():
-            if cents == 0 or len(idxs) < 2: continue
-            ins = [i for i in idxs if df.loc[i, "net_cents"] > 0]
-            outs = [i for i in idxs if df.loc[i, "net_cents"] < 0]
-            if len(ins) * len(outs) > MAX_BUCKET: ins = ins[:14]; outs = outs[:14]
-            for i in ins:
-                for j in outs:
-                    d1, d2 = df.loc[i, "date"], df.loc[j, "date"]
-                    gap = abs((d1 - d2).days) if pd.notna(d1) and pd.notna(d2) else 0
-                    key = tuple(sorted((df.loc[i, "row_id"], df.loc[j, "row_id"])))
-                    if gap <= pair_window and key not in seen:
-                        seen.add(key)
-                        _add({"type": "一收一付同额", "side": side, "rows": list(key),
-                                      "amount": round(cents / 100, 2), "detail": f"同额资金{gap}天内一进一出"})
+    # 一收一付同额（v3.5: numpy广播向量化，超大桶聚合不展开）
+    MAX_BUCKET = 200
+    df_p = df[df["net_cents"].notna()].copy()
+    df_p["_abs"] = df_p["net_cents"].abs()
+    for abs_c, grp in df_p.groupby("_abs"):
+        ins = grp[grp["net_cents"] > 0]
+        outs = grp[grp["net_cents"] < 0]
+        if ins.empty or outs.empty:
+            continue
+        if len(ins) * len(outs) > MAX_BUCKET * MAX_BUCKET:
+            _add({"type": "一收一付同额", "side": side,
+                   "amount": round(abs_c / 100, 2),
+                   "rows": grp["row_id"].tolist(),
+                   "detail": f"高频同额{abs_c/100:,.2f}元出现{len(ins)}收{len(outs)}付，需整体核查"})
+            continue
+        d_in  = ins["date"].values.astype("datetime64[D]")
+        d_out = outs["date"].values.astype("datetime64[D]")
+        near = abs(d_in[:, None] - d_out[None, :]).astype("int64") <= pair_window
+        for ii, jj in zip(*np.where(near)):
+            if len(flags) >= MAX_FLAGS:
+                break
+            key = tuple(sorted((ins["row_id"].iloc[ii], outs["row_id"].iloc[jj])))
+            if key not in seen:
+                seen.add(key)
+                _add({"type": "一收一付同额", "side": side, "rows": list(key),
+                       "amount": round(abs_c / 100, 2),
+                       "detail": f"同额资金{int(abs((d_in[ii]-d_out[jj]).astype(int)))}天一进一出"})
 
-    # 整数大额
-    for i, r in df.iterrows():
-        amt = abs(float(r["net_amount"]))
-        if amt >= large_threshold and int(amt) % round_unit == 0:
-            _add({"type": "整数大额", "side": side, "rows": [r["row_id"]],
-                          "amount": round(amt, 2), "detail": f"单笔>{large_threshold:,.0f}且整{round_unit}倍数"})
+# 整数大额（向量化：原全表iterrows）
+    _amt_all = pd.to_numeric(df["net_amount"], errors="coerce").abs()
+    _m_big = (_amt_all >= large_threshold) & ((_amt_all.astype("int64") % round_unit) == 0)
+    for _rid, _a in zip(df.loc[_m_big, "row_id"], _amt_all[_m_big]):
+        _add({"type": "整数大额", "side": side, "rows": [_rid],
+              "amount": round(float(_a), 2), "detail": f"单笔>{large_threshold:,.0f}且整{round_unit}倍数"})
 
     # 期末负余额
     bal = df["balance"].dropna()
@@ -1154,30 +1539,43 @@ def detect_red_flags(std_df, side, pair_window=3, large_threshold=100000.0, roun
         _add({"type": "期末负余额", "side": side, "rows": [],
                       "amount": round(float(bal.iloc[-1]), 2), "detail": "透支/未入账负债"})
 
-    # 分次转入转出
+    # 分次转入转出（v3.5: 滑动窗口+二分查找，O(n log n)）
     cp = df[df["counterpart"].astype(str).str.len() >= 2]
-    for name, grp in cp.groupby("counterpart"):
-        grp = grp.sort_values("date"); dates = grp["date"].tolist(); idxs = grp.index.tolist()
-        for k in range(len(idxs)):
-            d0 = dates[k]
-            if pd.isna(d0): continue
-            wi = [x for x, d in zip(idxs, dates) if pd.notna(d) and 0 <= (d - d0).days <= burst_days]
-            if len(wi) >= burst_count:
-                sub = df.loc[wi]
-                if (sub["net_cents"] > 0).any() and (sub["net_cents"] < 0).any():
-                    _add({"type": "分次转入转出", "side": side,
-                                  "rows": [df.loc[x, "row_id"] for x in wi],
-                                  "amount": round(float(sub["net_amount"].abs().sum()), 2),
-                                  "detail": f"对手方[{name}] {burst_days}天内{len(wi)}笔双向资金往来"})
-                break
+    cp_groups = list(cp.groupby("counterpart"))
+    if len(cp_groups) > 500:
+        cp_groups = cp_groups[:500]
+    for name, grp in cp_groups:
+        grp = grp.sort_values("date")
+        dates = grp["date"].values.astype("datetime64[D]")
+        rights = np.searchsorted(dates, dates + np.timedelta64(burst_days, "D"), side="right")
+        counts = rights - np.arange(len(dates))
+        hits = np.where(counts >= burst_count)[0]
+        if len(hits) == 0:
+            continue
+        # 合并重叠窗口
+        clusters = [[hits[0]]]
+        for h in hits[1:]:
+            if h <= rights[clusters[-1][0]]:
+                clusters[-1].append(h)
+            else:
+                if len(flags) >= MAX_FLAGS:
+                    break
+                clusters.append([h])
+        for cl in clusters:
+            wi = grp.index[cl[0]:rights[cl[0]]].tolist()
+            sub = df.loc[wi]
+            if (sub["net_cents"] > 0).any() and (sub["net_cents"] < 0).any():
+                _add({"type": "分次转入转出", "side": side,
+                       "rows": [df.loc[x, "row_id"] for x in wi],
+                       "amount": round(float(sub["net_amount"].abs().sum()), 2),
+                       "detail": f"对手方[{name}] {burst_days}天内{len(wi)}笔双向资金往来"})
 
-    # 大额现金
-    for i, r in df.iterrows():
-        if "现金" in str(r["summary"]) and abs(float(r["net_amount"])) >= 50000:
-            _add({"type": "大额现金", "side": side, "rows": [r["row_id"]],
-                          "amount": round(abs(float(r["net_amount"])), 2), "detail": "大额现金收支"})
+# 大额现金（向量化：原全表iterrows）
+    _m_cash = df["summary"].astype(str).str.contains("现金", na=False) & (_amt_all >= 50000)
+    for _rid, _a in zip(df.loc[_m_cash, "row_id"], _amt_all[_m_cash]):
+        _add({"type": "大额现金", "side": side, "rows": [_rid],
+              "amount": round(float(_a), 2), "detail": "大额现金收支"})
     return flags
-
 
 def run_bank_reconciliation(book_df, bank_df, config=None, progress_callback=None):
     cfg = dict(config or {})
@@ -1233,38 +1631,38 @@ def run_bank_reconciliation(book_df, bank_df, config=None, progress_callback=Non
         book_std["counterpart"] = book_std["summary"].map(extract_counterpart)
     # v3.7: 日期偏移自适应——月末批量记账形态（账面记账日系统性滞后交易日）
     _p(12, "日期粒度检测")
-    _granularity = _detect_date_granularity(book_std)
+    _granularity = cfg.get("date_granularity") or _detect_date_granularity(book_std)
     book_m = book_std.copy(); bank_m = bank_std.copy()
     if _granularity == "month":
         print("[日期粒度] 账面为月末批量记账形态，匹配按 年月+金额 对齐（日信息不参与勾对）")
         book_m["date"] = pd.to_datetime(book_m["date"]).dt.to_period("M").dt.to_timestamp()
         bank_m["date"] = pd.to_datetime(bank_m["date"]).dt.to_period("M").dt.to_timestamp()
     book_used, bank_used = set(), set()
-    _p(14, "L3_fee_month 手续费月度聚合（前置）")
+    _p(14, "L1 金额精确+同日匹配（全量，含费用）")
+    m1 = _match_l1(book_m, bank_m, book_used, bank_used, tol_cents)
+    _p(14.5, "L2 日期窗口匹配（全量，含费用）")
+    m2 = _match_l2(book_m, bank_m, book_used, bank_used, date_window, tol_cents)
+    _p(15, "L3_fee_month 手续费月度聚合")
     m3_fee_month = _match_l3_fee_monthly(book_m, bank_m, book_used, bank_used, tol_cents)
-    # 费用行隔离：通用匹配不碰费用行，费用只走 fee 规则（防"货款↔费用外收"错配）
-    from config.dictionary import FEE_WORDS
-    _FEE_KW = "|".join(FEE_WORDS[:7]) 
-    book_g = book_m[~book_m["summary"].astype(str).str.contains(_FEE_KW, na=False)]
-    bank_g = bank_m[bank_m["summary"].astype(str).str.strip() != "费用外收"]
-    _p(14.5, "L3_counterpart 对手方分区匹配（前置）")
-    matches_cp = _match_l3_counterpart(book_g, bank_g, book_used, bank_used, tol_cents)
-    _p(15, "L1 金额精确+同日匹配")
-    
-    m1 = _match_l1(book_g, bank_g, book_used, bank_used, tol_cents)
-    _p(25, "L2 金额精确+日期窗口匹配")
-    m2 = _match_l2(book_g, bank_g, book_used, bank_used, date_window, tol_cents)
+    _FEE_KW = "|".join(FEE_WORDS)
+    _p(16, "L3_cp_n1 n:1匹配")
+    m3_cp_n1 = _match_counterpart_n_to_1(book_m, bank_m, book_used, bank_used, tol_cents)
+    _p(17, "L3_counterpart 对手方分区匹配")
+    matches_cp = _match_l3_counterpart(book_m, bank_m, book_used, bank_used, tol_cents)
+
     _p(40, "L3 n:m 拆分合并匹配")
-    m3 = _match_l3(book_g, bank_g, book_used, bank_used, date_window, tol_cents)
+    m3 = _match_l3(book_m, bank_m, book_used, bank_used, date_window, tol_cents)
     # ↓ 新增
     _p(45, "L3_month 月末汇总匹配")
     if _granularity == "month":   # 只有月末记账形态才启用，探测不到不动
-        m3_month = _match_l3_month_remainder(book_g, bank_g, book_used, bank_used, tol_cents)
+        m3_month = _match_l3_month_remainder(book_m, bank_m, book_used, bank_used, tol_cents)
     else:
         m3_month = []
 
     _p(50, "L3_fee 手续费差额匹配")
     m3_fee = _match_l3_fee_difference(book_m, bank_m, book_used, bank_used, date_window)
+    m3_fee_emb = _match_l3_fee_embedded(book_m, bank_m, book_used, bank_used, date_window, tol_cents)
+    m3_fee_rem = _match_l3_fee_remainder(book_m, bank_m, book_used, bank_used, tol_cents, date_window)
     
     if not _enable_l4:
         _p(60, "L4 跳过（数据规模大，L1-L3已覆盖核心匹配）")
@@ -1289,6 +1687,42 @@ def run_bank_reconciliation(book_df, bank_df, config=None, progress_callback=Non
     red_flags += detect_counterpart_month_gap(book_std, bank_std)
     red_flags = aggregate_red_flags(red_flags)
 
+
+    # ── 手续费匹配诊断 ──
+    _fee_book_mask = book_std["summary"].astype(str).str.strip().str.contains(_FEE_KW, na=False)
+    _fee_bank_mask = bank_std["summary"].astype(str).str.strip().str.contains(_FEE_KW, na=False)
+    _fee_book_total = int(_fee_book_mask.sum())
+    _fee_bank_total = int(_fee_bank_mask.sum())
+    _fee_book_matched = int((_fee_book_mask & book_std.index.isin(book_used)).sum())
+    _fee_bank_matched = int((_fee_bank_mask & bank_std.index.isin(bank_used)).sum())
+    # 统计 fee 专用规则匹配到的行数
+    _fee_matched_by_fee_rules = set()
+    for m in m3_fee_month + m3_fee + m3_fee_emb + m3_fee_rem:
+        for bi in m.get("bank_idxs", []):
+            _fee_matched_by_fee_rules.add(bi)
+    _fee_bank_by_fee_rules = len([i for i in _fee_matched_by_fee_rules if i in bank_std.index and _fee_bank_mask.get(i, False)])
+    print(f"[费用诊断] ===== 手续费匹配诊断 =====")
+    print(f"[费用诊断] 账方: 费用行 {_fee_book_total} 笔 → 已匹配 {_fee_book_matched} 笔 ({_fee_book_matched/_fee_book_total*100:.1f}%) → 未匹配 {_fee_book_total - _fee_book_matched} 笔" if _fee_book_total else "[费用诊断] 账方: 无费用行")
+    print(f"[费用诊断] 银方: 费用行 {_fee_bank_total} 笔 → 已匹配 {_fee_bank_matched} 笔 ({_fee_bank_matched/_fee_bank_total*100:.1f}%) → 未匹配 {_fee_bank_total - _fee_bank_matched} 笔" if _fee_bank_total else "[费用诊断] 银方: 无费用行")
+    print(f"[费用诊断] 匹配规则贡献: L3_fee_month={len(m3_fee_month)}组 L3_fee={len(m3_fee)}笔 → 银方由fee规则消耗约{_fee_bank_by_fee_rules}行")
+    # 未匹配费用样本
+    _fee_ub = [i for i in unmatched_book if any(kw in str(i.get("summary","")) for kw in FEE_WORDS)]
+    _fee_uk = [i for i in unmatched_bank if any(kw in str(i.get("summary","")) for kw in FEE_WORDS)]
+    if _fee_ub:
+        print(f"[费用诊断] 账方未匹配费用 {len(_fee_ub)} 笔 (占未匹配{len(unmatched_book)}笔的 {len(_fee_ub)/max(1,len(unmatched_book))*100:.1f}%):")
+        for u in _fee_ub[:5]:
+            print(f"[费用诊断]   {u.get('date','')} {str(u.get('summary',''))[:30]} | {u.get('net_amount',0):,.2f} | {u.get('classification','')}")
+    if _fee_uk:
+        print(f"[费用诊断] 银方未匹配费用 {len(_fee_uk)} 笔 (占未匹配{len(unmatched_bank)}笔的 {len(_fee_uk)/max(1,len(unmatched_bank))*100:.1f}%):")
+        for u in _fee_uk[:5]:
+            print(f"[费用诊断]   {u.get('date','')} {str(u.get('summary',''))[:30]} | {u.get('net_amount',0):,.2f} | {u.get('classification','')}")
+    _fee_book_gap = _fee_book_total - _fee_book_matched
+    _fee_bank_gap = _fee_bank_total - _fee_bank_matched
+    _gap_msg = []
+    if _fee_book_gap: _gap_msg.append(f"账方{_fee_book_gap}笔")
+    if _fee_bank_gap: _gap_msg.append(f"银方{_fee_bank_gap}笔")
+    print(f"[费用诊断] 剩余缺口: {'，'.join(_gap_msg) if _gap_msg else '全部已匹配 ✅'}")
+
     n_book, n_bank = len(book_std), len(bank_std)
     stats = {
         "book_rows": n_book, "bank_rows": n_bank,
@@ -1296,10 +1730,11 @@ def run_bank_reconciliation(book_df, bank_df, config=None, progress_callback=Non
         "book_mapping": book_map, "bank_mapping": bank_map,
         "account_filter": account_note,
         "matched_L1": len(m1), "matched_L2": len(m2),
-        "matched_L3_groups": len(m3) + len(m3_month) + len(m3_fee) + len(m3_fee_month) + len(matches_cp),
-        "matched_L3_fee": len(m3_fee), "matched_L3_subset": len(m3), "review_L4": len(m4),
+        "matched_L3_groups": len(m3) + len(m3_month) + len(m3_fee) + len(m3_fee_month) + len(m3_fee_emb) + len(m3_fee_rem) + len(matches_cp),
+        "matched_L3_fee": len(m3_fee), "matched_L3_fee_embedded": len(m3_fee_emb), "matched_L3_fee_remainder": len(m3_fee_rem), "matched_L3_subset": len(m3), "review_L4": len(m4),
         "matched_L3_month": len(m3_month), "matched_L3_fee_month": len(m3_fee_month),
         "matched_L3_counterpart": len(matches_cp),
+        "matched_L3_cp_n1": len(m3_cp_n1),
         "book_matched": len(book_used), "bank_matched": len(bank_used),
         "book_match_rate": round(len(book_used)/n_book*100,2) if n_book else 0.0,
         "bank_match_rate": round(len(bank_used)/n_bank*100,2) if n_bank else 0.0,
@@ -1318,9 +1753,9 @@ def run_bank_reconciliation(book_df, bank_df, config=None, progress_callback=Non
     }
     _p(100, "完成")
     return {"stats": stats, "tie_out": {"book": tie_book, "bank": tie_bank},
-            "matches_L1": m1, "matches_L2": m2, "groups_L3": m3 + m3_month + m3_fee + m3_fee_month + matches_cp, "review_L4": m4,
+            "matches_L1": m1, "matches_L2": m2, "groups_L3": m3 + m3_month + m3_fee + m3_fee_month + m3_fee_emb + m3_fee_rem + matches_cp + m3_cp_n1 + m3_cp_n1, "review_L4": m4,
             "unmatched_book": unmatched_book, "unmatched_bank": unmatched_bank,
-            "all_matches":m1 + m2 + m3 + m3_month + m3_fee + m3_fee_month + matches_cp + m4,
+            "all_matches":m1 + m2 + m3 + m3_month + m3_fee + m3_fee_month + m3_fee_emb + m3_fee_rem + matches_cp + m4,
             "duplicates": duplicates, "balance_reconciliation": recon_table.to_dict("records"),
             "red_flags": red_flags, "book_std": book_std, "bank_std": bank_std, "config": cfg}
 
@@ -1483,8 +1918,30 @@ def reconcile_files(book_path, bank_path, config=None, out_dir=None):
     cfg.setdefault("book_file", Path(book_path).name)
     cfg.setdefault("bank_file", Path(bank_path).name)
     progress_cb = cfg.pop("progress_callback", None)
-    result = run_bank_reconciliation(book_tables[0], bank_tables[0], cfg, progress_callback=progress_cb)
+    book_raw = book_tables[0]
+    bank_raw = bank_tables[0]
+    bt = detect_book_type(book_raw, cfg.get("book_file", ""))
+    bm = auto_map_columns(book_raw, bt)
+    book_norm = normalize_to_std(book_raw, bm, JOURNAL if bt not in (JOURNAL, BANK_STATEMENT) else bt)
+
+    subj_col, warns = recognize_subject_column(book_norm)
+    subjects, non_bank = None, None
+    if subj_col: subjects, non_bank = split_by_bank_subject(book_norm, subj_col)
+    if not subjects or len(subjects) <= 1:
+        result = run_bank_reconciliation(book_raw, bank_raw, cfg, progress_callback=progress_cb)
+        if out_dir: result["output_files"] = export_reconciliation_outputs(result, out_dir)
+        return result
+    main_label = max(subjects, key=lambda k: len(subjects[k]))
+    main_df = subjects[main_label]
+    other_subjects = {k:v for k,v in subjects.items() if k != main_label}
+    print(f"[pipeline] main: {main_label} ({len(main_df)}r), others: {list(other_subjects.keys())}")
+    result = run_bank_reconciliation(main_df, bank_raw, cfg, progress_callback=progress_cb)
     if out_dir: result["output_files"] = export_reconciliation_outputs(result, out_dir)
+    if other_subjects:
+        hints = explain_across_accounts(result.get("unmatched_bank", []), other_subjects, book_norm, out_dir)
+        result["cross_hints"] = hints
+    result["pipeline"] = {"main": main_label, "others": list(other_subjects.keys()),
+                          "non_bank": len(non_bank) if non_bank is not None else 0}
     return result
 
 

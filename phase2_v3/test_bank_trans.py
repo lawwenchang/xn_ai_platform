@@ -59,25 +59,6 @@ if len(kdf):
 print("\n═══════════ 对手方集群 ═══════════")
 book_std, bank_std = res["book_std"], res["bank_std"]
 fee_kw = book_std[book_std["summary"].astype(str).str.contains("手续费")]
-print("\n═══════════ 大户月度透视（前3名） ═══════════")
-for name in ["天津恒运能源", "阳信康润商", "山东巨久运输"]:
-    bs = book_std[book_std["counterpart"].astype(str).str.contains(name, na=False)]
-    ks = bank_std[bank_std["counterpart"].astype(str).str.contains(name, na=False)]
-    bm = bs.groupby(bs["date"].dt.to_period("M"))["net_cents"].sum() / 100
-    km = ks.groupby(ks["date"].dt.to_period("M"))["net_cents"].sum() / 100
-    cmp_t = pd.DataFrame({"账": bm, "银": km}).fillna(0).round(0).astype(int)
-    cmp_t["差"] = cmp_t["账"] - cmp_t["银"]
-    cmp_t["账笔数"] = bs.groupby(bs["date"].dt.to_period("M")).size()
-    cmp_t["银笔数"] = ks.groupby(ks["date"].dt.to_period("M")).size()
-    print(f"\n--- {name} ---")
-    print(cmp_t.fillna(0))
-print(f"关键词命中 {len(fee_kw)} 行")
-print(fee_kw["content_tag"].value_counts())
-for cp in ["阳信康润商", "天津恒运能", "山东巨久运"]:
-    b_cp = book_std[book_std["counterpart"].str.contains(cp, na=False)]
-    k_cp = bank_std[bank_std["counterpart"].str.contains(cp, na=False)]
-    print(f"  {cp}: 账{len(b_cp)}笔/{b_cp['net_amount'].sum():>15,.0f}  "
-          f"银{len(k_cp)}笔/{k_cp['net_amount'].sum():>15,.0f}")
 
 print("\n═══════════ 红旗清单 ═══════════")
 from collections import Counter
