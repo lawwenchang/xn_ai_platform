@@ -633,7 +633,7 @@ def _match_l3_fee_monthly(book_m, bank_m, book_used, bank_used, tol_cents):
     b_month = fee_b.groupby(fee_b["date"].dt.to_period("M"))["net_cents"].sum()
     k_month = fee_k.groupby(fee_k["date"].dt.to_period("M"))["net_cents"].sum()
     all_months = sorted(set(b_month.index) | set(k_month.index))
-    FEE_TOL = max(tol_cents, 5000)  # 累计容差50元，比单笔容差宽松
+    FEE_TOL = tol_cents
     b_acc, k_acc = 0, 0
     b_buf, k_buf = [], []
     seg_count = 0
@@ -684,7 +684,7 @@ def _match_l3_fee_monthly(book_m, bank_m, book_used, bank_used, tol_cents):
     print(f"[L3_fee_month] 累计+月聚合共{len(matches)}段, 剩余: 账{len(b_left)}笔({abs(b_left['net_cents'].sum())/100:.0f}元) 银{len(k_left)}笔({abs(k_left['net_cents'].sum())/100:.0f}元)")
     return matches
 def _match_l3_fee_remainder(book_m, bank_m, book_used, bank_used, tol_cents, date_window,
-                             max_group=10, fee_tol=5000):
+                             max_group=10):
     """手续费剩余匹配：滑动窗口(O(N)) + 小N组合(max 3选1~3)兜底。
     对未匹配账面费用，在同月银方费用中找连续窗口或小组合匹配。
     """
@@ -723,51 +723,46 @@ def _match_l3_fee_remainder(book_m, bank_m, book_used, bank_used, tol_cents, dat
             continue
         target = int(br["net_cents"])
         bm = br["_m"]
-        if bm not in k_by_month:
+        pool = _get_cross_pool(bm)
+        if pool.empty:
             continue
-        pool = k_by_month[bm]
         pool = pool[(~pool.index.isin(_k_used)) & ((pool["net_cents"] > 0) == (target > 0))]
         if len(pool) < 1:
             continue
-        # 按日期排序（滑动窗口前提）
         pool = pool.sort_values("date") if "date" in pool.columns else pool
         vals = [(int(pi), int(pc)) for pi, pc in zip(pool.index, pool["net_cents"])]
-        # ── 策略1: 滑动窗口（连续日期区间的条目）──
-        found = None
+        # 找最优子集和（不设容差上限，取最小差值）
+        best_found, best_diff = None, abs(target)
+        # 策略1: 滑动窗口
         for i in range(len(vals)):
             total = 0
             for j in range(i, min(i + max_group, len(vals))):
                 total += vals[j][1]
-                if abs(total - target) <= fee_tol:
-                    found = [vals[k][0] for k in range(i, j + 1)]
-                    break
-                if abs(total) > abs(target) + fee_tol:
-                    break
-            if found:
-                break
-        # ── 策略2: 小组合兜底（最接近target的20个中选1~3个）──
-        if found is None:
-            closest = sorted(vals, key=lambda x: abs(x[1] - target))[:20]
-            for n in range(1, 4):
-                for combo in combinations(range(len(closest)), n):
-                    total = sum(closest[i][1] for i in combo)
-                    if abs(total - target) <= fee_tol:
-                        found = [closest[i][0] for i in combo]
-                        break
-                if found:
-                    break
-        if found:
-            found = [x for x in found if x not in _k_used]
-            if found:
+                diff = abs(total - target)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_found = [vals[k][0] for k in range(i, j + 1)]
+        # 策略2: 小组合
+        closest = sorted(vals, key=lambda x: abs(x[1] - target))[:20]
+        for n in range(1, 4):
+            for combo in combinations(range(len(closest)), n):
+                total = sum(closest[i][1] for i in combo)
+                diff = abs(total - target)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_found = [closest[i][0] for i in combo]
+        if best_found:
+            best_found = [x for x in best_found if x not in _k_used]
+            if best_found:
                 n_matched += 1
                 matches.append({
-                    "book_idxs": [bi], "bank_idxs": found, "level": "L3_fee_remainder",
-                    "note": f"剩余匹配: {bm} 账{target/100:.2f}↔银{len(found)}笔"
+                    "book_idxs": [bi], "bank_idxs": best_found, "level": "L3_fee_remainder",
+                    "note": f"剩余匹配: {bm} 账{target/100:.2f}↔银{len(best_found)}笔 差{best_diff/100:.2f}元"
                 })
                 book_used.add(bi)
-                bank_used.update(found)
+                bank_used.update(best_found)
                 _b_used.add(bi)
-                _k_used.update(found)
+                _k_used.update(best_found)
     if n_matched:
         print(f"[L3_fee_rem] 剩余匹配: +{n_matched}笔")
     return matches
@@ -885,8 +880,8 @@ def _match_l3_fee_embedded(book, bank, book_used, bank_used, date_window, tol_ce
 
 def _match_l3_fee_difference(book: pd.DataFrame, bank: pd.DataFrame,
                               book_used: set, bank_used: set,
-                              date_window: int, tol_cents: int = 1000,
-                              max_fee: int = 1000) -> List[Dict[str, Any]]:
+                              date_window: int, tol_cents: int = 1,
+                              max_fee: int = 1) -> List[Dict[str, Any]]:
     """P2: 手续费差额规则——流水扣款 - 账面记录 ≈ 小额手续费时自动成组。
 
     v3.6: 向量化候选过滤（numpy 掩码替代 iterrows 双重循环），语义不变。
@@ -1638,38 +1633,46 @@ def run_bank_reconciliation(book_df, bank_df, config=None, progress_callback=Non
         book_m["date"] = pd.to_datetime(book_m["date"]).dt.to_period("M").dt.to_timestamp()
         bank_m["date"] = pd.to_datetime(bank_m["date"]).dt.to_period("M").dt.to_timestamp()
     book_used, bank_used = set(), set()
-    _p(14, "L1 金额精确+同日匹配（全量，含费用）")
+    _p(14, "L1 金额精确+同日匹配（全量）")
     m1 = _match_l1(book_m, bank_m, book_used, bank_used, tol_cents)
-    _p(14.5, "L2 日期窗口匹配（全量，含费用）")
+    _p(15, "L2 日期窗口匹配（全量）")
     m2 = _match_l2(book_m, bank_m, book_used, bank_used, date_window, tol_cents)
-    _p(15, "L3_fee_month 手续费月度聚合")
-    m3_fee_month = _match_l3_fee_monthly(book_m, bank_m, book_used, bank_used, tol_cents)
     _FEE_KW = "|".join(FEE_WORDS)
-    _p(16, "L3_cp_n1 n:1匹配")
+    _p(17, "L3_cp_n1 n:1匹配")
     m3_cp_n1 = _match_counterpart_n_to_1(book_m, bank_m, book_used, bank_used, tol_cents)
-    _p(17, "L3_counterpart 对手方分区匹配")
+    _p(18, "L3_counterpart 对手方分区匹配")
     matches_cp = _match_l3_counterpart(book_m, bank_m, book_used, bank_used, tol_cents)
-
     _p(40, "L3 n:m 拆分合并匹配")
     m3 = _match_l3(book_m, bank_m, book_used, bank_used, date_window, tol_cents)
-    # ↓ 新增
     _p(45, "L3_month 月末汇总匹配")
-    if _granularity == "month":   # 只有月末记账形态才启用，探测不到不动
+    if _granularity == "month":
         m3_month = _match_l3_month_remainder(book_m, bank_m, book_used, bank_used, tol_cents)
     else:
         m3_month = []
-
     _p(50, "L3_fee 手续费差额匹配")
     m3_fee = _match_l3_fee_difference(book_m, bank_m, book_used, bank_used, date_window)
-    m3_fee_emb = _match_l3_fee_embedded(book_m, bank_m, book_used, bank_used, date_window, tol_cents)
-    m3_fee_rem = _match_l3_fee_remainder(book_m, bank_m, book_used, bank_used, tol_cents, date_window)
-    
+    _p(55, "L3_fee_month 手续费月度聚合")
+    m3_fee_month = _match_l3_fee_monthly(book_m, bank_m, book_used, bank_used, tol_cents)
     if not _enable_l4:
-        _p(60, "L4 跳过（数据规模大，L1-L3已覆盖核心匹配）")
+        _p(60, "L4 模糊匹配")
         m4 = []
     else:
         _p(60, "L4 模糊匹配")
         m4 = _match_l4(book_m, bank_m, book_used, bank_used, fuzzy_th)
+    # 诊断：追踪特定银行费用被谁匹配
+    _trace_bank = bank_std[(bank_std["date"].astype(str).str.startswith("2018-12")) &
+                           (bank_std["summary"].astype(str).str.contains("短信费"))]
+    if not _trace_bank.empty:
+        print("[L3诊断] 2018-12 银方短信费匹配追踪:")
+        for bi in _trace_bank.index:
+            b_amt = _trace_bank.loc[bi, "net_amount"]
+            for m in m1 + m2 + m3 + m3_month + m3_fee + m3_cp_n1 + matches_cp + m3_fee_month:
+                bank_list = m.get("bank_idxs") or ([m.get("bank_idx")] if "bank_idx" in m else [])
+                if bi in bank_list:
+                    book_list = m.get("book_idxs") or ([m.get("book_idx")] if "book_idx" in m else [])
+                    print(f"  [{m['level']}] 银{len(bank_list)}笔 ↔ 账{len(book_list)}笔 | {m.get('note','')}")                    
+                    for ji in book_list:
+                        print(f"  [{m['level']}] 银#{bi}({b_amt}) ↔ 账#{ji} {book_std.loc[ji,'summary'][:30]} {book_std.loc[ji,'net_amount']}")
 
     _p(70, "未匹配项四分类")
     unmatched_book, unmatched_bank = classify_unmatched(book_std, bank_std, book_used, bank_used, date_window)
@@ -1685,6 +1688,14 @@ def run_bank_reconciliation(book_df, bank_df, config=None, progress_callback=Non
     red_flags += _check_balance_continuity(bank_std)
     red_flags += detect_fee_small_monthly_diff(book_std, bank_std)
     red_flags += detect_counterpart_month_gap(book_std, bank_std)
+    # 费用标签错配检测：银方费用标签 对上了 账方非费用摘要
+    for m in m1 + m2:
+        if "bank_idx" in m and m["bank_idx"] in bank_std.index and m["book_idx"] in book_std.index:
+            bk_tag = str(bank_std.loc[m["bank_idx"], "content_tag"])
+            bj_sum = str(book_std.loc[m["book_idx"], "summary"])
+            if "费用" in bk_tag and "手续费" not in bj_sum and "费用" not in bj_sum:
+                red_flags.append({"type": "费用标签错配", "side": "双方",
+                    "detail": f"账{m['book_idx']}({bj_sum[:20]}) 银{m['bank_idx']}({bk_tag}) {bank_std.loc[m['bank_idx'], 'net_amount']:.0f}元"})
     red_flags = aggregate_red_flags(red_flags)
 
 
@@ -1697,7 +1708,7 @@ def run_bank_reconciliation(book_df, bank_df, config=None, progress_callback=Non
     _fee_bank_matched = int((_fee_bank_mask & bank_std.index.isin(bank_used)).sum())
     # 统计 fee 专用规则匹配到的行数
     _fee_matched_by_fee_rules = set()
-    for m in m3_fee_month + m3_fee + m3_fee_emb + m3_fee_rem:
+    for m in m3_fee_month + m3_fee:
         for bi in m.get("bank_idxs", []):
             _fee_matched_by_fee_rules.add(bi)
     _fee_bank_by_fee_rules = len([i for i in _fee_matched_by_fee_rules if i in bank_std.index and _fee_bank_mask.get(i, False)])
@@ -1730,8 +1741,8 @@ def run_bank_reconciliation(book_df, bank_df, config=None, progress_callback=Non
         "book_mapping": book_map, "bank_mapping": bank_map,
         "account_filter": account_note,
         "matched_L1": len(m1), "matched_L2": len(m2),
-        "matched_L3_groups": len(m3) + len(m3_month) + len(m3_fee) + len(m3_fee_month) + len(m3_fee_emb) + len(m3_fee_rem) + len(matches_cp),
-        "matched_L3_fee": len(m3_fee), "matched_L3_fee_embedded": len(m3_fee_emb), "matched_L3_fee_remainder": len(m3_fee_rem), "matched_L3_subset": len(m3), "review_L4": len(m4),
+        "matched_L3_groups": len(m3) + len(m3_month) + len(m3_fee) + len(m3_fee_month) + len(matches_cp),
+        "matched_L3_fee": len(m3_fee), "matched_L3_subset": len(m3), "review_L4": len(m4),
         "matched_L3_month": len(m3_month), "matched_L3_fee_month": len(m3_fee_month),
         "matched_L3_counterpart": len(matches_cp),
         "matched_L3_cp_n1": len(m3_cp_n1),
@@ -1753,9 +1764,9 @@ def run_bank_reconciliation(book_df, bank_df, config=None, progress_callback=Non
     }
     _p(100, "完成")
     return {"stats": stats, "tie_out": {"book": tie_book, "bank": tie_bank},
-            "matches_L1": m1, "matches_L2": m2, "groups_L3": m3 + m3_month + m3_fee + m3_fee_month + m3_fee_emb + m3_fee_rem + matches_cp + m3_cp_n1 + m3_cp_n1, "review_L4": m4,
+            "matches_L1": m1, "matches_L2": m2, "groups_L3": m3 + m3_month + m3_fee + m3_fee_month + matches_cp + m3_cp_n1 + m3_cp_n1, "review_L4": m4,
             "unmatched_book": unmatched_book, "unmatched_bank": unmatched_bank,
-            "all_matches":m1 + m2 + m3 + m3_month + m3_fee + m3_fee_month + m3_fee_emb + m3_fee_rem + matches_cp + m4,
+            "all_matches":m1 + m2 + m3 + m3_month + m3_fee + m3_fee_month + matches_cp + m4,
             "duplicates": duplicates, "balance_reconciliation": recon_table.to_dict("records"),
             "red_flags": red_flags, "book_std": book_std, "bank_std": bank_std, "config": cfg}
 
@@ -1906,8 +1917,83 @@ def export_reconciliation_outputs(result, out_dir):
     # CSV 预览（报告"数据明细前50行"用）
     detail.head(51).to_csv(str(out / "analysis_result.csv"), index=False, encoding="utf-8-sig")
     written.append("analysis_result.csv")
+    # 非银行费用匹配结果
+    if result.get("nonbank_fee_hints"):
+        pd.DataFrame(result["nonbank_fee_hints"]).to_excel(str(out / "非银行科目费用匹配.xlsx"), index=False)
+        written.append("非银行科目费用匹配.xlsx")
+
     return written
 
+
+def match_fee_to_nonbank(result, non_bank):
+    """银方费用 -> 非银行科目 n:1月度等额匹配。消耗已命中的银方条目。
+    """
+    from config.dictionary import FEE_WORDS
+    from itertools import combinations
+    _FKW = "|".join(FEE_WORDS)
+    unmatched = result.get("unmatched_bank", [])
+    if not unmatched or non_bank is None or non_bank.empty: return []
+    kdf = pd.DataFrame(unmatched) if not isinstance(unmatched, pd.DataFrame) else unmatched
+    kdf = kdf[
+        kdf["summary"].astype(str).str.strip().str.contains(_FKW, na=False) |
+        ((kdf["summary"].astype(str).str.strip().isin(["", "nan", "None", "nat"]) |
+          kdf["summary"].isna()) & (kdf["net_amount"].abs() <= 50))
+    ]
+    if kdf.empty: return []
+    nb = non_bank[non_bank["net_cents"] < 0].copy()
+    nb = nb[nb["subject"].astype(str).str.strip().str.contains(_FKW, na=False)]
+    if nb.empty: return []
+    kdf = kdf.copy(); kdf["_m"] = pd.to_datetime(kdf["date"], errors="coerce").dt.to_period("M")
+    kdf = kdf.reset_index(drop=True)
+    nb["_m"] = pd.to_datetime(nb["date"], errors="coerce").dt.to_period("M")
+    k_by_month = {m: g for m, g in kdf.groupby("_m", sort=False)}
+    hints, n, matched_ids = [], 0, set()
+    for km, kg in k_by_month.items():
+        parts = []
+        for offset in [0, 1]:
+            try: parts.append(nb[nb["_m"] == km + offset])
+            except: pass
+        parts = [p for p in parts if not p.empty]
+        if not parts: continue
+        pool = pd.concat(parts)
+        kg_sorted = kg.sort_values("date") if "date" in kg.columns else kg
+        vals = [(int(i), int(round(abs(r["net_amount"]) * 100))) for i, r in kg_sorted.iterrows()]
+        for _, nr in pool.sort_values("net_cents").iterrows():
+            target = int(round(abs(nr["net_amount"]) * 100))
+            found = None
+            for w in range(len(vals)):
+                total = 0
+                for j in range(w, min(w + 20, len(vals))):
+                    total += vals[j][1]
+                    if total == target: found = [vals[k][0] for k in range(w, j + 1)]; break
+                    if total > target: break
+                if found: break
+            if found is None:
+                closest = sorted(vals, key=lambda x: abs(x[1] - target))[:20]
+                for m in range(1, 5):
+                    for combo in combinations(range(len(closest)), m):
+                        if sum(closest[i][1] for i in combo) == target:
+                            found = [closest[i][0] for i in combo]; break
+                    if found: break
+            if found:
+                n += 1
+                matched_ids.update(found)
+                hints.append({
+                    "nonbank_date": str(nr.get("date", ""))[:10],
+                    "nonbank_amt": round(target / 100, 2),
+                    "nonbank_subject": str(nr.get("subject", ""))[:40],
+                    "bank_count": len(found),
+                    "month": str(km),
+                })
+                vals = [(i, v) for i, v in vals if i not in found]
+    if hints:
+        print(f"[非银行费用] 命中 {n} 笔 (仅参考，不消耗条目)")
+        for h in hints[:10]:
+            print(f"[非银行费用]   {h['nonbank_date']} 账{h['nonbank_amt']:>10,.2f} {h['nonbank_subject'][:25]} <- 银{h['bank_count']}笔")
+        result["nonbank_fee_hints"] = hints
+    else:
+        print("[非银行费用] 无匹配")
+    return hints
 
 def reconcile_files(book_path, bank_path, config=None, out_dir=None):
     from core.document_loader import load_tables
@@ -1936,6 +2022,8 @@ def reconcile_files(book_path, bank_path, config=None, out_dir=None):
     other_subjects = {k:v for k,v in subjects.items() if k != main_label}
     print(f"[pipeline] main: {main_label} ({len(main_df)}r), others: {list(other_subjects.keys())}")
     result = run_bank_reconciliation(main_df, bank_raw, cfg, progress_callback=progress_cb)
+    if non_bank is not None and not non_bank.empty:
+        match_fee_to_nonbank(result, non_bank)
     if out_dir: result["output_files"] = export_reconciliation_outputs(result, out_dir)
     if other_subjects:
         hints = explain_across_accounts(result.get("unmatched_bank", []), other_subjects, book_norm, out_dir)
