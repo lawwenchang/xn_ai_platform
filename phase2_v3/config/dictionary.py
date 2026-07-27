@@ -13,7 +13,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-FEE_WORDS = ("手续费", "收费", "短信费", "年费", "账户管理费", "工本费",
+FEE_WORDS = ("手续费", "收费", "短信费", "年费", "账户管理费", "工本费"
              "服务费", "费用外收", "批量扣费")
 INTEREST_WORDS = ("利息", "结息", "批量结息")
 REVERSAL_WORDS = ("冲正", "冲销", "红冲", "撤销")
