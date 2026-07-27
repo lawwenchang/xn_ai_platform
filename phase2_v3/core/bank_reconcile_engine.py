@@ -671,6 +671,7 @@ def _match_l3_month_remainder(book_m, bank_m, book_used, bank_used, tol_cents):
             for key in set(b_grp.index) & set(j_grp.index):
                 b_sum = int(round(float(b_grp.loc[key])))
                 j_sum = int(round(float(j_grp.loc[key])))
+
                 if abs(b_sum - j_sum) <= tol_cents and b_sum != 0:
                     bidxs = rem_bv[(rem_bv["date"].dt.to_period("M") == key[0]) &
                                    ((rem_bv["net_cents"] > 0) == key[1]) &
@@ -679,47 +680,83 @@ def _match_l3_month_remainder(book_m, bank_m, book_used, bank_used, tol_cents):
                                    ((rem_jv["net_cents"] > 0) == key[1]) &
                                    (~rem_jv.index.isin(book_used))].index.tolist()
                     if len(bidxs) <= 1 and len(jidxs) <= 1:
-                        continue  # 跳过1:1，留给L1/L2处理
-                    # 防线3：对手方交叉校验
+                        continue
+                    # ── 三色风险分层 ──
+                    abs_amt = abs(j_sum) / 100  # 元
+                    TE = 50000    # 实际执行的重要性水平（默认5万）
+                    SAD = TE / 10 # 明显微小错报临界值
+
+                    # 对手方交叉校验
                     cp_b = set(str(rem_bv.loc[i, "counterpart"]) for i in bidxs
                                if pd.notna(rem_bv.loc[i, "counterpart"]) and str(rem_bv.loc[i, "counterpart"]).strip())
                     cp_j = set(str(rem_jv.loc[i, "counterpart"]) for i in jidxs
                                if pd.notna(rem_jv.loc[i, "counterpart"]) and str(rem_jv.loc[i, "counterpart"]).strip())
-                    level = "L3_month"
-                    fallback_note = ""
+                    cp_ok = not cp_b or not cp_j or bool(cp_b & cp_j)
+
+                    # 摘要标签覆盖率校验
+                    tags_b, tags_j, tagged_b, tagged_j = set(), set(), 0, 0
+                    for i in bidxs:
+                        t = str(rem_bv.loc[i, "content_tag"]) if "content_tag" in rem_bv.columns else ""
+                        if t: tags_b.update(t.split(",")); tagged_b += 1
+                    for i in jidxs:
+                        t = str(rem_jv.loc[i, "content_tag"]) if "content_tag" in rem_jv.columns else ""
+                        if t: tags_j.update(t.split(",")); tagged_j += 1
+                    tags_b.discard(""); tags_j.discard("")
+                    common_tags = tags_b & tags_j
+                    tag_ok = bool(common_tags) and (tagged_b == 0 or tagged_j == 0 or
+                               min(tagged_b / max(1, len(bidxs)), tagged_j / max(1, len(jidxs))) >= 0.15)
+
+                    # 高风险关键词
+                    RED_FLAG_KW = ("现金", "提现", "借款", "还款", "暂付", "暂收", "投资", "理财",
+                                   "划款", "调账", "冲正")
+                    has_red_kw = any(
+                        kw in str(rem_bv.loc[i, "summary"]) or kw in str(rem_jv.loc[j, "summary"])
+                        for i in bidxs for j in jidxs
+                        for kw in RED_FLAG_KW
+                    )
+                    # 化整为零特征（n>=3 拆分/合并形态）
+                    split_pattern = (len(bidxs) >= 3 and len(jidxs) == 1) or (len(jidxs) >= 3 and len(bidxs) == 1)
+
+                    # ── 三色判定 ──
                     needs_review = False
-                    if cp_b and cp_j and not (cp_b & cp_j):
-                        # 对手方无交集 → 再用摘要标签交叉验证
-                        tags_b = set()
-                        tags_j = set()
-                        for i in bidxs:
-                            t = str(rem_bv.loc[i, "content_tag"]) if "content_tag" in rem_bv.columns else ""
-                            if t: tags_b.update(t.split(","))
-                        for i in jidxs:
-                            t = str(rem_jv.loc[i, "content_tag"]) if "content_tag" in rem_jv.columns else ""
-                            if t: tags_j.update(t.split(","))
-                        tags_b.discard(""); tags_j.discard("")
-                        if tags_b and tags_j and (tags_b & tags_j):
-                            fallback_note = f" [对手方无交集，摘要标签一致({','.join(tags_b & tags_j)})，自动通过]"
-                        else:
-                            needs_review = True
-                            fallback_note = " [对手方无交集，摘要标签也无交集，待人工复核]"
-                    # 防线1：摘要样本
+                    if (cp_ok or tag_ok) and abs_amt <= SAD and not has_red_kw and not split_pattern:
+                        tier, tier_label = 1, "自动通过"
+                    elif abs_amt > TE or has_red_kw or split_pattern:
+                        tier, tier_label = 3, "必须人工核查"
+                        needs_review = True
+                    else:
+                        tier, tier_label = 2, "抽样复核"
+                        needs_review = True
+
+                    # note
                     j_sample = str(rem_jv.loc[jidxs[0], "summary"])[:20] if jidxs else ""
                     b_sample = str(rem_bv.loc[bidxs[0], "summary"])[:20] if bidxs else ""
-                    note = (f"双向月末对齐：{key[0]}月{'收入' if key[1] else '支出'} "
-                            f"账{len(jidxs)}笔 银{len(bidxs)}笔 合计{abs(j_sum)/100:,.0f}元"
-                            f" | 账:{j_sample} | 银:{b_sample}{fallback_note}")
+                    detail = []
+                    if not cp_ok: detail.append("对手方无交集")
+                    if common_tags:
+                        detail.append("标签一致(%s)" % ",".join(common_tags))
+                    elif not tag_ok:
+                        detail.append("标签不匹配")
+                    if not detail:
+                        detail.append("全部校验通过")
+                    detail_str = "; ".join(detail)
+                    note = (f"[T{tier}] 双向月末对齐：{key[0]}月{'收入' if key[1] else '支出'} "
+                            f"账{len(jidxs)}笔 银{len(bidxs)}笔 合计{abs_amt:,.0f}元 "
+                            f"| 账:{j_sample} | 银:{b_sample} | {detail_str} | {tier_label}")
+
                     book_used.update(jidxs)
                     bank_used.update(bidxs)
                     matches.append({
                         "book_idxs": jidxs, "bank_idxs": bidxs,
-                        "level": level, "needs_review": needs_review,
+                        "level": "L3_month",
+                        "needs_review": needs_review,
+                        "risk_tier": tier,
                         "note": note
                     })
-                    # 防线2：双侧≥5笔时标记红旗
                     if len(bidxs) >= 5 and len(jidxs) >= 5:
                         print(f"[红旗] {note}")
+
+   
     return matches
 
 def _match_l3_fee_monthly(book_m, bank_m, book_used, bank_used, tol_cents):
@@ -1893,11 +1930,16 @@ def _build_detail_workpaper(result):
     for m in result["matches_L1"] + result["matches_L2"]:
         status[m["book_idx"]] = {"状态":"已核对","层级":m["level"],"对方行":result["bank_std"].loc[m["bank_idx"],"row_id"],"备注":m["note"]}
     for m in result["groups_L3"]:
+        tier = m.get("risk_tier", 0)
+        if tier == 1:       st_label = "已核对(自动通过)"
+        elif tier == 3:     st_label = "已核对(必须核查)"
+        elif m.get("needs_review"): st_label = "已核对(抽样复核)"
+        else:               st_label = "已核对(L3)"
         bank_list = m.get("bank_idxs") or ([m["bank_idx"]] if "bank_idx" in m else [])
         book_list = m.get("book_idxs") or ([m["book_idx"]] if "book_idx" in m else [])
         partners = ",".join(result["bank_std"].loc[b,"row_id"] for b in bank_list)
         for j in book_list: 
-            status[j] = {"状态":"已核对","层级":m["level"],"对方行":partners,"备注":m["note"]}
+            status[j] = {"状态": st_label, "层级": m["level"], "对方行": partners, "备注": m["note"]}
     for m in result["review_L4"]:
         status[m["book_idx"]] = {"状态":"待人工复核","层级":m["level"],"对方行":result["bank_std"].loc[m["bank_idx"],"row_id"],"备注":m["note"]}
     unmatched_cls = {i["row_id"]:i for i in result["unmatched_book"]}
@@ -1923,7 +1965,11 @@ def _build_marked_sheets(result):
     for m in result["matches_L1"] + result["matches_L2"]:
         bank_status[m["bank_idx"]] = "对银成功"
     for m in result["groups_L3"]:
-        label = "对银成功(待复核)" if m.get("needs_review") else "对银成功(L3)"
+        tier = m.get("risk_tier", 0)
+        if tier == 1:       label = "对银成功(自动通过)"
+        elif tier == 3:     label = "对银成功(必须核查)"
+        elif m.get("needs_review"): label = "对银成功(抽样复核)"
+        else:               label = "对银成功(L3)"
         for bi in m.get("bank_idxs") or ([m["bank_idx"]] if "bank_idx" in m else []):
             bank_status[bi] = label
     for m in result["review_L4"]:
@@ -1948,12 +1994,17 @@ def _build_marked_sheets(result):
     for m in result["matches_L1"] + result["matches_L2"]:
         book_status[m["book_idx"]] = "对账成功"
     for m in result["groups_L3"]:
-        label = "对账成功(待复核)" if m.get("needs_review") else "对账成功(L3)"
+        tier = m.get("risk_tier", 0)
+        if tier == 1:       label = "对账成功(自动通过)"
+        elif tier == 3:     label = "对账成功(必须核查)"
+        elif m.get("needs_review"): label = "对账成功(抽样复核)"
+        else:               label = "对账成功(L3)"
         for ji in m.get("book_idxs") or ([m["book_idx"]] if "book_idx" in m else []):
             book_status[ji] = label
     for m in result["review_L4"]:
         for ji in m.get("book_idxs") or ([m["book_idx"]] if "book_idx" in m else []):
             book_status[ji] = "对账成功(L4)"
+
     book_rows = []
     unmatched_book_map = {i["src_index"]: i for i in result["unmatched_book"]}
     for ji, r in book_std.iterrows():
