@@ -2329,6 +2329,37 @@ def _generate_confirmation_letters(result, out_dir):
     print(f"[询证函] 已生成{written}份Word文档 -> {out}")
     return written
 
+
+
+def _build_counterparty_flow(result, top_n=10):
+    """资金流追踪：Top对手方逐月收付明细"""
+    bank_std = result["bank_std"]
+    book_std = result["book_std"]
+    cp_df = _build_counterparty_summary(result)
+    top_cps = cp_df.head(top_n)["对方名称"].tolist()
+    rows = []
+    for cp in top_cps:
+        # 银方
+        bm = bank_std[bank_std["counterpart"].astype(str).str.strip() == str(cp).strip()].copy()
+        if not bm.empty:
+            bm["月份"] = pd.to_datetime(bm["date"], errors="coerce").dt.to_period("M").astype(str)
+            for m, grp in bm.groupby("月份"):
+                rows.append({"对方": cp, "月份": m, "来源": "银方", "笔数": len(grp),
+                             "收入": round(float(grp["net_amount"].clip(lower=0).sum()), 2),
+                             "支出": round(float((-grp["net_amount"]).clip(lower=0).sum()), 2)})
+        # 账方
+        jm = book_std[book_std["counterpart"].astype(str).str.strip() == str(cp).strip()].copy()
+        if not jm.empty:
+            jm["月份"] = pd.to_datetime(jm["date"], errors="coerce").dt.to_period("M").astype(str)
+            for m, grp in jm.groupby("月份"):
+                rows.append({"对方": cp, "月份": m, "来源": "账方", "笔数": len(grp),
+                             "收入": round(float(grp["credit"].clip(lower=0).sum()), 2),
+                             "支出": round(float(grp["debit"].clip(lower=0).sum()), 2)})
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    return df.sort_values(["对方", "月份"])
+
 def export_reconciliation_outputs(result, out_dir):
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True); written = []
     detail = _build_detail_workpaper(result)
@@ -2481,6 +2512,48 @@ def export_reconciliation_outputs(result, out_dir):
         status_text = "平衡" if abn == 0 else f"{abn}侧异常"; print(f"[三方勾稽] {status_text}")
     except Exception as _e:
         print(f"[三方勾稽] 生成失败: {_e}")
+    # v3.14: 初步分析包
+    try:
+        trend2 = _build_trend_analysis(result)
+        cp_df4 = _build_counterparty_summary(result)
+        st3 = result["stats"]
+        rf = result["red_flags"]
+        rf_types = {}
+        for f in rf:
+            t = f.get("type", "其他")
+            rf_types[t] = rf_types.get(t, 0) + 1
+        rf_summary = pd.DataFrame([{"异常类型": k, "数量": v} for k, v in rf_types.items()])
+        big_mask2 = (abs(result["bank_std"]["net_amount"]) >= 50000) & (abs(result["bank_std"]["net_amount"]) % 10000 == 0)
+        cutoff2 = _build_cutoff_test(result, days=7)
+        anomaly_summary = pd.DataFrame([
+            {"指标": "未匹配总数(银方)", "数值": st3["unmatched_bank"]},
+            {"指标": "未匹配总数(账方)", "数值": st3["unmatched_book"]},
+            {"指标": "红旗数量", "数值": st3.get("red_flag_count", 0)},
+            {"指标": "整数大额", "数值": int(big_mask2.sum())},
+            {"指标": "截止性大额(期末7天)", "数值": len(cutoff2)},
+            {"指标": "待人工复核(L4)", "数值": st3.get("review_L4", 0)},
+        ])
+        with pd.ExcelWriter(str(out / "初步分析包.xlsx"), engine="openpyxl") as xw:
+            trend2.to_excel(xw, sheet_name="1-波动分析", index=False)
+            cp_df4.to_excel(xw, sheet_name="2-集中度分析", index=False)
+            anomaly_summary.to_excel(xw, sheet_name="3-异常特征概览", index=False)
+            if not rf_summary.empty:
+                rf_summary.to_excel(xw, sheet_name="3b-红旗分类", index=False)
+        written.append("初步分析包.xlsx")
+        print(f"[初步分析] {len(trend2)}月趋势 + {len(cp_df4)}对手方 + {len(anomaly_summary)}项指标")
+    except Exception as _e:
+        print(f"[初步分析] 生成失败: {_e}")
+    # v3.14: 资金流追踪
+    try:
+        cp_flow = _build_counterparty_flow(result, top_n=10)
+        if not cp_flow.empty:
+            cp_flow.to_excel(str(out / "对手方资金流追踪.xlsx"), index=False)
+            cp_flow.to_excel(str(out / "对手方资金流追踪.xlsx"), index=False)
+            written.append("对手方资金流追踪.xlsx")
+            n_cps = cp_flow["对方"].nunique()
+            print(f"[资金流] {n_cps}个Top对手方逐月流水")
+    except Exception as _e:
+        print(f"[资金流] 生成失败: {_e}")
     summary = {"stats":result["stats"],"tie_out":result["tie_out"],"reconciliation":result["balance_reconciliation"]}
     p = out / "reconciliation_summary.json"; p.write_text(json.dumps(summary,ensure_ascii=False,indent=2,default=str),encoding="utf-8"); written.append(p.name)
      # ── v3.9: 报告生成器数据契约（journal_entries.json + analysis_result.csv）──
