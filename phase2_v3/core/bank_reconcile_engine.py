@@ -70,6 +70,13 @@ COLUMN_ROLE_SYNONYMS: Dict[str, List[str]] = {
     "balance":     ["余额", "账户余额", "期末余额", "本次余额", "balance"],
     "amount":      ["交易金额", "金额", "发生额", "交易额", "net_amount", "amount"],
     "subject":     ["科目名称", "会计科目", "科目","科目全称", "subject"],
+    # 台账专用
+    "counterpart_ledger": ["客户名称", "供应商名称", "单位名称", "往来单位", "客户", "供应商",
+                            "对方单位", "对方名称", "公司名称", "户名"],
+    "opening_balance": ["期初余额", "年初余额", "上年结转", "期初", "opening"],
+    "closing_balance": ["期末余额", "年末余额", "余额", "期末", "closing"],
+    "received": ["本期回款", "回款金额", "收款金额", "收到", "借方发生", "借方金额"],
+    "shipped": ["本期发货", "发货金额", "销售金额", "付款金额", "贷方发生", "贷方金额"],
 }
 
 # 序时账特征列（出现即加分）
@@ -2360,6 +2367,102 @@ def _build_counterparty_flow(result, top_n=10):
         return df
     return df.sort_values(["对方", "月份"])
 
+
+
+def _auto_map_ledger(df):
+    """台账列自动映射"""
+    norm2orig = {_norm_col(c): str(c) for c in df.columns}
+    mapping = {}
+    for role in ["counterpart_ledger", "opening_balance", "closing_balance", "received", "shipped"]:
+        for cand in COLUMN_ROLE_SYNONYMS.get(role, []):
+            nc = _norm_col(cand)
+            if nc in norm2orig:
+                mapping[role] = norm2orig[nc]
+                break
+    return mapping
+
+def reconcile_ledger_with_bank(ledger_path, bank_result, ledger_mapping=None):
+    """台账-银行流水第一层：余额核对
+    输入：台账Excel路径、银行对账结果
+    输出：按对手方的余额比对DataFrame
+    """
+    df = pd.read_excel(ledger_path)
+    if ledger_mapping:
+        mp = ledger_mapping
+    else:
+        mp = _auto_map_ledger(df)
+        print(f"[台账] 自动列映射: {mp}")
+    cp_col = mp.get("counterpart_ledger", df.columns[0])
+    # 金额列：优先用closing_balance，其次opening
+    amt_col = mp.get("closing_balance") or mp.get("opening_balance")
+    if amt_col is None:
+        # 尝试找数值列
+        for c in df.columns:
+            if c != cp_col and df[c].dtype in ("float64", "int64"):
+                amt_col = c
+                break
+    if amt_col is None:
+        raise ValueError("无法识别台账金额列，请手动指定 ledger_mapping")
+    # 日期列
+    date_col = None
+    for role in ["date"]:
+        for cand in COLUMN_ROLE_SYNONYMS.get(role, []):
+            nc = _norm_col(cand)
+            if nc in {_norm_col(c) for c in df.columns}:
+                date_col = cand
+                break
+    # 归集
+    df2 = df[[cp_col, amt_col]].copy()
+    df2.columns = ["对方名称", "台账金额"]
+    df2["台账金额"] = pd.to_numeric(df2["台账金额"], errors="coerce").fillna(0)
+    # 名称归一化
+    df2["_norm"] = df2["对方名称"].astype(str).apply(normalize_counterpart_name)
+    ledger_grp = df2.groupby("_norm").agg(
+        台账笔数=("台账金额", "count"),
+        台账余额=("台账金额", "sum"),
+        台账对方=("对方名称", "first")
+    ).round(2)
+    # 银行侧对手方数据
+    cp_df = _build_counterparty_summary(bank_result)
+    cp_df["_norm"] = cp_df["对方名称"].astype(str).apply(normalize_counterpart_name)
+    # 合并比对
+    merged = ledger_grp.join(cp_df.set_index("_norm")[["银方净额", "银方笔数", "银方收入", "银方支出", "差异(银-账)", "风险标记"]], how="outer").fillna(0)
+    merged["台账余额"] = merged["台账余额"].round(2)
+    merged["银方净额"] = merged["银方净额"].round(2)
+    merged["差额"] = (merged["银方净额"] - merged["台账余额"]).round(2)
+    merged["台账对方"] = merged["台账对方"].replace(0, "").replace("0", "")
+    # 分层
+    TE = 50000
+    tiers = []
+    for _, row in merged.iterrows():
+        diff = abs(row["差额"])
+        has_bank = row["银方笔数"] > 0
+        has_ledger = row["台账笔数"] > 0
+        if not has_ledger and has_bank:
+            tiers.append("红-流水有台账无(体外回款?)")
+        elif has_ledger and not has_bank:
+            tiers.append("红-台账有流水无(虚假回款?)")
+        elif diff == 0 and has_bank and has_ledger:
+            tiers.append("绿-余额相符")
+        elif diff < TE and has_bank and has_ledger:
+            tiers.append("黄-差异<TE")
+        elif diff >= TE:
+            tiers.append("红-差异>=TE")
+        else:
+            tiers.append("灰-仅单侧")
+    merged["核对结果"] = tiers
+    # 排序
+    order = {"红": 0, "黄": 1, "绿": 2, "灰": 3}
+    merged["_sort"] = merged["核对结果"].apply(lambda x: order.get(x[0], 9))
+    merged = merged.sort_values(["_sort", "差额"], key=lambda x: abs(x) if x.name == "差额" else x)
+    merged = merged.drop(columns=["_sort", "_norm"])
+    # 统计
+    green = (merged["核对结果"].str.startswith("绿")).sum()
+    yellow = (merged["核对结果"].str.startswith("黄")).sum()
+    red = (merged["核对结果"].str.startswith("红")).sum()
+    print(f"[台账核对] {len(merged)}个对手方: 绿{green} 黄{yellow} 红{red}")
+    return merged, mp
+
 def export_reconciliation_outputs(result, out_dir):
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True); written = []
     detail = _build_detail_workpaper(result)
@@ -2386,6 +2489,16 @@ def export_reconciliation_outputs(result, out_dir):
         written += ["银行流水匹配情况.xlsx", "序时账匹配情况.xlsx"]
     except Exception as _e:
         print(f"[export] 逐笔标记底稿（匹配情况）生成失败: {type(_e).__name__}: {_e}")
+    # v3.15: 台账-银行流水余额核对（如果配置了台账路径）
+    if result.get("config", {}).get("ledger_path"):
+        try:
+            ledger_path = result["config"]["ledger_path"]
+            ledger_map = result["config"].get("ledger_mapping")
+            ledger_df, _ = reconcile_ledger_with_bank(ledger_path, result, ledger_map)
+            ledger_df.to_excel(str(out / "台账余额核对.xlsx"), index=False)
+            written.append("台账余额核对.xlsx")
+        except Exception as _e:
+            print(f"[台账核对] 生成失败: {_e}")
     flags = pd.DataFrame(result["red_flags"] + [{**d,"type":"疑似重复入账","detail":d["reason"]} for d in result["duplicates"]])
     if not flags.empty: flags = flags.rename(columns={"type":"类型","side":"侧别","rows":"涉及行","amount":"金额","detail":"说明"})
     p = out / "异常资金交易清单.xlsx"; flags.to_excel(str(p), index=False); written.append(p.name)
