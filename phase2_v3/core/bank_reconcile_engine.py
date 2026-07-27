@@ -57,12 +57,12 @@ STD_COLUMNS = [
 
 # 列语义 → 候选列名（按优先级排列；匹配时忽略空格与全半角括号差异）
 COLUMN_ROLE_SYNONYMS: Dict[str, List[str]] = {
-    "date":        ["日期", "交易日期", "记账日期", "业务日期", "入账日期", "date"],
+    "date":        ["日期", "交易日期", "记账日期", "业务日期", "入账日期", "date", "交易时间"],
     "voucher_no":  ["凭证号", "凭证号码", "凭证编号", "凭证字号", "凭证", "voucher_no"],
     "summary":     ["摘要", "摘要信息", "用途", "备注", "说明", "附言", "summary"],
     "counterpart": ["对方户名", "对方客户名称", "对方", "交易对手", "对方单位",
                     "对手方", "对方账号户名", "counterpart"],
-    "account":     ["银行账号", "账号", "账户", "银行账户", "开户账号", "account"],
+    "account":     ["银行账号", "账号", "账户", "银行账户", "开户账号", "本方账号", "account"],
     "debit":       ["借方金额", "借方", "借方(支取)", "借方（支取）", "支取",
                     "支出", "支出金额", "付款金额", "借方发生额", "debit"],
     "credit":      ["贷方金额", "贷方", "贷方(收入)", "贷方（收入）", "收入",
@@ -314,6 +314,7 @@ def normalize_to_std(df: pd.DataFrame, mapping: Dict[str, str],
     out["abs_cents"] = out["net_cents"].abs()
     # 剔除借贷均为 0 的空行
     out = out[out["net_cents"] != 0].reset_index(drop=True)
+    out["src_index"] = list(range(len(out)))
     return out
 
 
@@ -415,14 +416,46 @@ def filter_bank_account(bank_std: pd.DataFrame,
         hit = bank_std[mask.str.contains(key, na=False)]
         if hit.empty:
             return bank_std, f"⚠ 指定账号 {account} 在流水中未出现，未过滤（请人工确认）"
-        return hit.reset_index(drop=True), f"已按账号 {account} 过滤：{len(hit)} 笔"
+        hit = hit.reset_index(drop=True)
+        if "src_index" in hit.columns:
+            hit["src_index"] = list(range(len(hit)))
+        return hit, f"已按账号 {account} 过滤：{len(hit)} 笔"
     if len(accounts) == 1:
         return bank_std, f"流水为单一账户 {accounts[0]}，无需过滤"
     top = bank_std["account"].value_counts().idxmax()
     hit = bank_std[bank_std["account"] == top].reset_index(drop=True)
+    if "src_index" in hit.columns:
+        hit["src_index"] = list(range(len(hit)))
     return hit, (f"⚠ 流水含 {len(accounts)} 个账户，自动取笔数最多的 {top}"
                  f"（{len(hit)} 笔）；如不符请指定账号")
 
+
+
+
+def auto_correct_bank_direction(bank_df, bank_std, bank_map, tie_bank, book_type):
+    """银行流水方向自动修正：勾稽不平时尝试交换借贷方向。
+    返回 (修正后的 bank_std, bank_map, tie_bank)。"""
+    if not tie_bank.get("checked") or tie_bank.get("balanced", False):
+        return bank_std, bank_map, tie_bank
+    diff = abs(tie_bank.get("difference", 0))
+    if diff < 0.02:
+        return bank_std, bank_map, tie_bank
+    print(f"[方向检测] 银行流水勾稽不平(差{diff:,.0f})，尝试交换收入/支出方向...")
+    swapped = dict(bank_map)
+    swapped["debit"], swapped["credit"] = bank_map.get("credit"), bank_map.get("debit")
+    if not swapped.get("debit") or not swapped.get("credit"):
+        print("[方向检测] 缺少借贷列，无法交换")
+        return bank_std, bank_map, tie_bank
+    std2 = normalize_to_std(bank_df, swapped, book_type)
+    std2 = tag_content(std2)
+    std2, _ = filter_bank_account(std2, None)
+    tie2 = tie_out_balance(std2)
+    if tie2.get("balanced", False):
+        print(f"[方向检测] 交换后勾稽平衡，已自动修正")
+        return std2, swapped, tie2
+    else:
+        print(f"[方向检测] 交换后仍不平衡(差{tie2.get('difference',0):,.0f})，保留原方向")
+        return bank_std, bank_map, tie_bank
 
 # ═══════════════════════════════════════════════════════════════
 # 步骤 3：双方勾稽（对账前置校验）
@@ -584,6 +617,14 @@ def _match_counterpart_n_to_1(book_m, bank_m, book_used, bank_used, tol_cents):
             dst_used.add(di0)
             src_used.update(si)
     return matches
+def _is_fee_row(df, fkw):
+    """检查行是否为费用：摘要或对方户名含费用关键词"""
+    s = df["summary"].astype(str).str.strip()
+    has_fee = s.str.contains(fkw, na=False)
+    if "counterpart" in df.columns:
+        cp = df["counterpart"].astype(str).str.strip()
+        has_fee = has_fee | cp.str.contains(fkw, na=False)
+    return has_fee
 
 
 def _match_l3_month_remainder(book_m, bank_m, book_used, bank_used, tol_cents):
@@ -598,17 +639,87 @@ def _match_l3_month_remainder(book_m, bank_m, book_used, bank_used, tol_cents):
         rem = src[~src.index.isin(src_used)]
         if rem.empty:
             continue
-        grp = rem.groupby([rem["date"].dt.to_period("M"), rem["net_cents"].gt(0)])["net_cents"].sum()
+        rem_valid = rem[rem["date"].notna()]
+        if rem_valid.empty:
+            continue
+        grp = rem_valid.groupby([rem_valid["date"].dt.to_period("M"), rem_valid["net_cents"].gt(0)])["net_cents"].sum()
         for di, r in dst[~dst.index.isin(dst_used)].iterrows():
+            if pd.isna(r["date"]):
+                continue
             key = (r["date"].to_period("M"), r["net_cents"] > 0)
+            #if str(key[0]) == "2025-07":
+            #    print(f"[L3_month] 2025-07 检查: key={key} 在grp中={key in grp.index} grp值={grp.loc[key] if key in grp.index else 'N/A'} 目标={r['net_cents']}")
             if key in grp.index and abs(grp.loc[key] - r["net_cents"]) <= tol_cents:
-                idxs = rem[(rem["date"].dt.to_period("M") == key[0]) &
-                           ((rem["net_cents"] > 0) == key[1]) & (~rem.index.isin(src_used))].index.tolist()
+                idxs = rem_valid[(rem_valid["date"].dt.to_period("M") == key[0]) &
+                           ((rem_valid["net_cents"] > 0) == key[1]) & (~rem_valid.index.isin(src_used))].index.tolist()
                 matches.append({"book_idxs": [di] if side_src == "bank" else idxs,
                                 "bank_idxs": idxs if side_src == "bank" else [di],
                                 "level": "L3_month",
                                 "note": f"月末汇总记账：{key[0]}月同方向{len(idxs)}笔合计"})
                 src_used.update(idxs); dst_used.add(di)
+    # 第三遍：双向月末余额对齐——双侧都是多笔但合计相等
+    rem_b = bank_m[~bank_m.index.isin(bank_used)]
+    rem_j = book_m[~book_m.index.isin(book_used)]
+    if not rem_b.empty and not rem_j.empty:
+        rem_bv = rem_b[rem_b["date"].notna()]
+        rem_jv = rem_j[rem_j["date"].notna()]
+        if not rem_bv.empty and not rem_jv.empty:
+            b_grp = rem_bv.groupby([rem_bv["date"].dt.to_period("M"),
+                                    rem_bv["net_cents"].gt(0)])["net_cents"].sum()
+            j_grp = rem_jv.groupby([rem_jv["date"].dt.to_period("M"),
+                                    rem_jv["net_cents"].gt(0)])["net_cents"].sum()
+            for key in set(b_grp.index) & set(j_grp.index):
+                b_sum = int(round(float(b_grp.loc[key])))
+                j_sum = int(round(float(j_grp.loc[key])))
+                if abs(b_sum - j_sum) <= tol_cents and b_sum != 0:
+                    bidxs = rem_bv[(rem_bv["date"].dt.to_period("M") == key[0]) &
+                                   ((rem_bv["net_cents"] > 0) == key[1]) &
+                                   (~rem_bv.index.isin(bank_used))].index.tolist()
+                    jidxs = rem_jv[(rem_jv["date"].dt.to_period("M") == key[0]) &
+                                   ((rem_jv["net_cents"] > 0) == key[1]) &
+                                   (~rem_jv.index.isin(book_used))].index.tolist()
+                    if len(bidxs) <= 1 and len(jidxs) <= 1:
+                        continue  # 跳过1:1，留给L1/L2处理
+                    # 防线3：对手方交叉校验
+                    cp_b = set(str(rem_bv.loc[i, "counterpart"]) for i in bidxs
+                               if pd.notna(rem_bv.loc[i, "counterpart"]) and str(rem_bv.loc[i, "counterpart"]).strip())
+                    cp_j = set(str(rem_jv.loc[i, "counterpart"]) for i in jidxs
+                               if pd.notna(rem_jv.loc[i, "counterpart"]) and str(rem_jv.loc[i, "counterpart"]).strip())
+                    level = "L3_month"
+                    fallback_note = ""
+                    needs_review = False
+                    if cp_b and cp_j and not (cp_b & cp_j):
+                        # 对手方无交集 → 再用摘要标签交叉验证
+                        tags_b = set()
+                        tags_j = set()
+                        for i in bidxs:
+                            t = str(rem_bv.loc[i, "content_tag"]) if "content_tag" in rem_bv.columns else ""
+                            if t: tags_b.update(t.split(","))
+                        for i in jidxs:
+                            t = str(rem_jv.loc[i, "content_tag"]) if "content_tag" in rem_jv.columns else ""
+                            if t: tags_j.update(t.split(","))
+                        tags_b.discard(""); tags_j.discard("")
+                        if tags_b and tags_j and (tags_b & tags_j):
+                            fallback_note = f" [对手方无交集，摘要标签一致({','.join(tags_b & tags_j)})，自动通过]"
+                        else:
+                            needs_review = True
+                            fallback_note = " [对手方无交集，摘要标签也无交集，待人工复核]"
+                    # 防线1：摘要样本
+                    j_sample = str(rem_jv.loc[jidxs[0], "summary"])[:20] if jidxs else ""
+                    b_sample = str(rem_bv.loc[bidxs[0], "summary"])[:20] if bidxs else ""
+                    note = (f"双向月末对齐：{key[0]}月{'收入' if key[1] else '支出'} "
+                            f"账{len(jidxs)}笔 银{len(bidxs)}笔 合计{abs(j_sum)/100:,.0f}元"
+                            f" | 账:{j_sample} | 银:{b_sample}{fallback_note}")
+                    book_used.update(jidxs)
+                    bank_used.update(bidxs)
+                    matches.append({
+                        "book_idxs": jidxs, "bank_idxs": bidxs,
+                        "level": level, "needs_review": needs_review,
+                        "note": note
+                    })
+                    # 防线2：双侧≥5笔时标记红旗
+                    if len(bidxs) >= 5 and len(jidxs) >= 5:
+                        print(f"[红旗] {note}")
     return matches
 
 def _match_l3_fee_monthly(book_m, bank_m, book_used, bank_used, tol_cents):
@@ -619,13 +730,13 @@ def _match_l3_fee_monthly(book_m, bank_m, book_used, bank_used, tol_cents):
     _FKW = "手续费|费用外收|扣费|收费|短信费|年费|工本费|服务费"
     _k_fee_mask = (
         (~bank_m.index.isin(bank_used)) & (
-            bank_m["summary"].astype(str).str.strip().str.contains(_FKW, na=False) |
+            _is_fee_row(bank_m, _FKW) |
             ((bank_m["summary"].astype(str).str.strip().isin(["", "nan", "None", "nat"]) |
               bank_m["summary"].isna()) & (bank_m["net_cents"].abs() <= 5000))
         )
     )
     fee_b = book_m[(~book_m.index.isin(book_used)) &
-                   (book_m["summary"].astype(str).str.strip().str.contains(_FKW, na=False))]
+                   (_is_fee_row(book_m, _FKW))]
     fee_k = bank_m[_k_fee_mask]
     print(f"[L3_fee_month] 候选池: 账方{len(fee_b)}笔 银方{len(fee_k)}笔 (已用: 账{len(book_used)} 银{len(bank_used)})")
     if fee_b.empty or fee_k.empty:
@@ -693,13 +804,13 @@ def _match_l3_fee_remainder(book_m, bank_m, book_used, bank_used, tol_cents, dat
     _FKW = "手续费|费用外收|扣费|收费|短信费|年费|工本费|服务费|电话费"
     _k_fee_mask = (
         (~bank_m.index.isin(bank_used)) & (
-            bank_m["summary"].astype(str).str.strip().str.contains(_FKW, na=False) |
+            _is_fee_row(bank_m, _FKW) |
             ((bank_m["summary"].astype(str).str.strip().isin(["", "nan", "None", "nat"]) |
               bank_m["summary"].isna()) & (bank_m["net_cents"].abs() <= 5000))
         )
     )
     b_rem = book_m[(~book_m.index.isin(book_used)) &
-                   (book_m["summary"].astype(str).str.strip().str.contains(_FKW, na=False))]
+                   (_is_fee_row(book_m, _FKW))]
     k_rem = bank_m[_k_fee_mask]
     if b_rem.empty or k_rem.empty:
         return matches
@@ -1618,8 +1729,10 @@ def run_bank_reconciliation(book_df, bank_df, config=None, progress_callback=Non
     # v3.4: L4 默认关闭（RapidFuzz 语义匹配 O(n²) 太重，L1-L3+L3_fee 已覆盖确定匹配）
     _enable_l4 = cfg.get("enable_l4", False)  # 需要时显式开启
     bank_std, account_note = filter_bank_account(bank_std, cfg.get("account"))
+    bank_std["src_index"] = list(range(len(bank_std)))
     tie_book = tie_out_balance(book_std, cfg.get("book_opening"), cfg.get("book_closing"))
     tie_bank = tie_out_balance(bank_std, cfg.get("bank_opening"), cfg.get("bank_closing"))
+    bank_std, bank_map, tie_bank = auto_correct_bank_direction(bank_df, bank_std, bank_map, tie_bank, _bk)
     # v3.10: 账方对手方缺失时，从摘要提取主体（序时账无对方列形态）
     if book_std["counterpart"].fillna("").astype(str).str.strip().eq("").mean() > 0.5:
         print("[对手方] 账方对手方缺失>50%，从摘要提取主体")
@@ -1653,6 +1766,10 @@ def run_bank_reconciliation(book_df, bank_df, config=None, progress_callback=Non
     m3_fee = _match_l3_fee_difference(book_m, bank_m, book_used, bank_used, date_window)
     _p(55, "L3_fee_month 手续费月度聚合")
     m3_fee_month = _match_l3_fee_monthly(book_m, bank_m, book_used, bank_used, tol_cents)
+    _p(57, "L3_month 月末汇总匹配（第二遍：费用剔除后补刀）")
+    if _granularity == "month":
+        m3_month2 = _match_l3_month_remainder(book_m, bank_m, book_used, bank_used, tol_cents)
+        m3_month.extend(m3_month2)
     if not _enable_l4:
         _p(60, "L4 模糊匹配")
         m4 = []
@@ -1806,19 +1923,21 @@ def _build_marked_sheets(result):
     for m in result["matches_L1"] + result["matches_L2"]:
         bank_status[m["bank_idx"]] = "对银成功"
     for m in result["groups_L3"]:
+        label = "对银成功(待复核)" if m.get("needs_review") else "对银成功(L3)"
         for bi in m.get("bank_idxs") or ([m["bank_idx"]] if "bank_idx" in m else []):
-            bank_status[bi] = "对银成功(L3)"
+            bank_status[bi] = label
     for m in result["review_L4"]:
-        bank_status[m["bank_idx"]] = "对银成功(L4)"
+        for bi in m.get("bank_idxs") or ([m["bank_idx"]] if "bank_idx" in m else []):
+            bank_status[bi] = "对银成功(L4)"
     bank_rows = []
-    unmatched_bank_map = {i["row_id"]: i for i in result["unmatched_bank"]}
+    unmatched_bank_map = {i["src_index"]: i for i in result["unmatched_bank"]}
     for bi, r in bank_std.iterrows():
         row = {"行号": r["row_id"], "日期": str(r["date"])[:10], "摘要": r["summary"],
                "对方": r.get("counterpart", ""), "净额": round(float(r["net_amount"]), 2)}
         if bi in bank_status:
             row["对账状态"] = bank_status[bi]
         else:
-            cls = unmatched_bank_map.get(r["row_id"], {})
+            cls = unmatched_bank_map.get(bi, {})
             row["对账状态"] = cls.get("classification", "待人工核查")
             row["依据"] = cls.get("basis", "")
         bank_rows.append(row)
@@ -1829,12 +1948,14 @@ def _build_marked_sheets(result):
     for m in result["matches_L1"] + result["matches_L2"]:
         book_status[m["book_idx"]] = "对账成功"
     for m in result["groups_L3"]:
+        label = "对账成功(待复核)" if m.get("needs_review") else "对账成功(L3)"
         for ji in m.get("book_idxs") or ([m["book_idx"]] if "book_idx" in m else []):
-            book_status[ji] = "对账成功(L3)"
+            book_status[ji] = label
     for m in result["review_L4"]:
-        book_status[m["book_idx"]] = "对账成功(L4)"
+        for ji in m.get("book_idxs") or ([m["book_idx"]] if "book_idx" in m else []):
+            book_status[ji] = "对账成功(L4)"
     book_rows = []
-    unmatched_book_map = {i["row_id"]: i for i in result["unmatched_book"]}
+    unmatched_book_map = {i["src_index"]: i for i in result["unmatched_book"]}
     for ji, r in book_std.iterrows():
         row = {"行号": r["row_id"], "日期": str(r["date"])[:10], "凭证号": r["voucher_no"],
                "摘要": r["summary"], "对方": r.get("counterpart", ""),
@@ -1843,7 +1964,7 @@ def _build_marked_sheets(result):
         if ji in book_status:
             row["对账状态"] = book_status[ji]
         else:
-            cls = unmatched_book_map.get(r["row_id"], {})
+            cls = unmatched_book_map.get(ji, {})
             row["对账状态"] = cls.get("classification", "待人工核查")
             row["依据"] = cls.get("basis", "")
         book_rows.append(row)
@@ -1935,13 +2056,13 @@ def match_fee_to_nonbank(result, non_bank):
     if not unmatched or non_bank is None or non_bank.empty: return []
     kdf = pd.DataFrame(unmatched) if not isinstance(unmatched, pd.DataFrame) else unmatched
     kdf = kdf[
-        kdf["summary"].astype(str).str.strip().str.contains(_FKW, na=False) |
+        _is_fee_row(kdf, _FKW) |
         ((kdf["summary"].astype(str).str.strip().isin(["", "nan", "None", "nat"]) |
           kdf["summary"].isna()) & (kdf["net_amount"].abs() <= 50))
     ]
     if kdf.empty: return []
     nb = non_bank[non_bank["net_cents"] < 0].copy()
-    nb = nb[nb["subject"].astype(str).str.strip().str.contains(_FKW, na=False)]
+    nb = nb[_is_fee_row(nb, _FKW)]
     if nb.empty: return []
     kdf = kdf.copy(); kdf["_m"] = pd.to_datetime(kdf["date"], errors="coerce").dt.to_period("M")
     kdf = kdf.reset_index(drop=True)
