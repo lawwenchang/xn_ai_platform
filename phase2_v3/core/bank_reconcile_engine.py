@@ -721,7 +721,7 @@ def _match_l3_month_remainder(book_m, bank_m, book_used, bank_used, tol_cents):
                     needs_review = False
                     if (cp_ok or tag_ok) and abs_amt <= SAD and not has_red_kw and not split_pattern:
                         tier, tier_label = 1, "自动通过"
-                    elif abs_amt > TE or has_red_kw or split_pattern:
+                    elif has_red_kw or split_pattern or (abs_amt > TE and max(1, max(abs(rem_bv.loc[bidxs,"net_amount"]).max() if bidxs else 0, abs(rem_jv.loc[jidxs,"net_amount"]).max() if jidxs else 0)) > 1000):
                         tier, tier_label = 3, "必须人工核查"
                         needs_review = True
                     else:
@@ -744,17 +744,32 @@ def _match_l3_month_remainder(book_m, bank_m, book_used, bank_used, tol_cents):
                             f"账{len(jidxs)}笔 银{len(bidxs)}笔 合计{abs_amt:,.0f}元 "
                             f"| 账:{j_sample} | 银:{b_sample} | {detail_str} | {tier_label}")
 
-                    book_used.update(jidxs)
-                    bank_used.update(bidxs)
-                    matches.append({
-                        "book_idxs": jidxs, "bank_idxs": bidxs,
-                        "level": "L3_month",
-                        "needs_review": needs_review,
-                        "risk_tier": tier,
-                        "note": note
-                    })
-                    if len(bidxs) >= 5 and len(jidxs) >= 5:
-                        print(f"[红旗] {note}")
+                    # 拆分大小额：单笔>1000保持原tier，<=1000降为T2
+                    SMALL_CUT = 1000
+                    large_b = [i for i in bidxs if abs(rem_bv.loc[i, "net_amount"]) > SMALL_CUT] if bidxs else []
+                    small_b = [i for i in bidxs if abs(rem_bv.loc[i, "net_amount"]) <= SMALL_CUT] if bidxs else []
+                    large_j = [i for i in jidxs if abs(rem_jv.loc[i, "net_amount"]) > SMALL_CUT] if jidxs else []
+                    small_j = [i for i in jidxs if abs(rem_jv.loc[i, "net_amount"]) <= SMALL_CUT] if jidxs else []
+                    for b_part, j_part, sub_tier, sub_label in [
+                        (large_b, large_j, tier, tier_label),
+                        (small_b, small_j, min(tier, 2), "抽样复核" if tier >= 2 else tier_label),
+                    ]:
+                        if not b_part and not j_part:
+                            continue
+                        sub_note = note if (not small_b and not small_j) else (
+                            note.replace(f"[T{tier}]", f"[T{sub_tier}]").replace(tier_label, sub_label)
+                            + f" | 拆分: 单笔{'>' if sub_tier == tier else '<='}1000元部分")
+                        book_used.update(j_part)
+                        bank_used.update(b_part)
+                        matches.append({
+                            "book_idxs": j_part, "bank_idxs": b_part,
+                            "level": "L3_month",
+                            "needs_review": (sub_tier >= 2),
+                            "risk_tier": sub_tier,
+                            "note": sub_note
+                        })
+                        if len(b_part) >= 5 and len(j_part) >= 5:
+                            print(f"[红旗] {sub_note}")
 
    
     return matches
@@ -1918,7 +1933,7 @@ def run_bank_reconciliation(book_df, bank_df, config=None, progress_callback=Non
     }
     _p(100, "完成")
     return {"stats": stats, "tie_out": {"book": tie_book, "bank": tie_bank},
-            "matches_L1": m1, "matches_L2": m2, "groups_L3": m3 + m3_month + m3_fee + m3_fee_month + matches_cp + m3_cp_n1 + m3_cp_n1, "review_L4": m4,
+            "matches_L1": m1, "matches_L2": m2, "groups_L3": m3 + m3_month + m3_fee + m3_fee_month + matches_cp + m3_cp_n1, "review_L4": m4,
             "unmatched_book": unmatched_book, "unmatched_bank": unmatched_bank,
             "all_matches":m1 + m2 + m3 + m3_month + m3_fee + m3_fee_month + matches_cp + m4,
             "duplicates": duplicates, "balance_reconciliation": recon_table.to_dict("records"),
@@ -1941,14 +1956,18 @@ def _build_detail_workpaper(result):
         for j in book_list: 
             status[j] = {"状态": st_label, "层级": m["level"], "对方行": partners, "备注": m["note"]}
     for m in result["review_L4"]:
-        status[m["book_idx"]] = {"状态":"待人工复核","层级":m["level"],"对方行":result["bank_std"].loc[m["bank_idx"],"row_id"],"备注":m["note"]}
-    unmatched_cls = {i["row_id"]:i for i in result["unmatched_book"]}
+        bank_list = m.get("bank_idxs") or ([m["bank_idx"]] if "bank_idx" in m else [])
+        book_list = m.get("book_idxs") or ([m["book_idx"]] if "book_idx" in m else [])
+        partners = ",".join(result["bank_std"].loc[b,"row_id"] for b in bank_list)
+        for j in book_list:
+            status[j] = {"状态":"待人工复核","层级":m["level"],"对方行":partners,"备注":m["note"]}
+    unmatched_cls = {i["src_index"]:i for i in result["unmatched_book"]}
     rows = []
     for ji, r in book_std.iterrows():
         base = {"行号":r["row_id"],"日期":r["date"].date().isoformat() if pd.notna(r["date"]) else "","凭证号":r["voucher_no"],"摘要":r["summary"],"对方":r["counterpart"],"借方金额":round(float(r["debit"]),2),"贷方金额":round(float(r["credit"]),2),"净额":round(float(r["net_amount"]),2)}
         if ji in status: base.update(status[ji])
         else:
-            cls = unmatched_cls.get(r["row_id"],{})
+            cls = unmatched_cls.get(ji, {})
             base.update({"状态":cls.get("classification","待人工核查"),"层级":"-","对方行":"-","备注":cls.get("basis","")})
         rows.append(base)
     return pd.DataFrame(rows)
@@ -2023,6 +2042,293 @@ def _build_marked_sheets(result):
     return bank_df, book_df
 
 
+
+
+def _build_counterparty_summary(result):
+    """对手方收付汇总表：按对方单位聚合银方/账方流量，一次覆盖往来函证对账、账龄回款核销、关联方识别、截止性测试四大痛点。"""
+    book_std = result["book_std"]
+    bank_std = result["bank_std"]
+
+    # 构建已匹配索引集合（从 all_matches 提取）
+    book_matched_idx = set()
+    bank_matched_idx = set()
+    for m in result["all_matches"]:
+        for ji in m.get("book_idxs") or ([m["book_idx"]] if "book_idx" in m else []):
+            book_matched_idx.add(ji)
+        for bi in m.get("bank_idxs") or ([m["bank_idx"]] if "bank_idx" in m else []):
+            bank_matched_idx.add(bi)
+
+    # 银方按对手方聚合
+    bank_cp = bank_std.copy()
+    bank_cp["matched"] = bank_cp.index.isin(bank_matched_idx)
+    bank_cp["收入"] = bank_cp["net_amount"].clip(lower=0)
+    bank_cp["支出"] = (-bank_cp["net_amount"]).clip(lower=0)
+    bank_grp = bank_cp.groupby("counterpart").agg(
+        银方笔数=("net_amount", "count"),
+        银方收入=("收入", "sum"),
+        银方支出=("支出", "sum"),
+        银方净额=("net_amount", "sum"),
+        银方已匹配笔数=("matched", "sum"),
+        银方已匹配金额=("net_amount", lambda x: x[bank_cp.loc[x.index, "matched"]].abs().sum()),
+        银方未匹配笔数=("matched", lambda x: (~x).sum()),
+        银方未匹配金额=("net_amount", lambda x: x[~bank_cp.loc[x.index, "matched"]].abs().sum()),
+    ).round(2)
+
+    # 账方按对手方聚合
+    book_cp = book_std.copy()
+    book_cp["matched"] = book_cp.index.isin(book_matched_idx)
+    book_cp["借方"] = book_cp["debit"].clip(lower=0)
+    book_cp["贷方"] = book_cp["credit"].clip(lower=0)
+    book_grp = book_cp.groupby("counterpart").agg(
+        账方笔数=("net_amount", "count"),
+        账方借方=("借方", "sum"),
+        账方贷方=("贷方", "sum"),
+        账方净额=("net_amount", "sum"),
+        账方已匹配笔数=("matched", "sum"),
+        账方已匹配金额=("net_amount", lambda x: x[book_cp.loc[x.index, "matched"]].abs().sum()),
+        账方未匹配笔数=("matched", lambda x: (~x).sum()),
+        账方未匹配金额=("net_amount", lambda x: x[~book_cp.loc[x.index, "matched"]].abs().sum()),
+    ).round(2)
+
+    # 合并
+    df = bank_grp.join(book_grp, how="outer").fillna(0)
+    df["差异(银-账)"] = (df["银方净额"] - df["账方净额"]).round(2)
+    # 总笔数
+    df["银方笔数"] = df["银方笔数"].astype(int)
+    df["账方笔数"] = df["账方笔数"].astype(int)
+    df["银方已匹配笔数"] = df["银方已匹配笔数"].astype(int)
+    df["银方未匹配笔数"] = df["银方未匹配笔数"].astype(int)
+    df["账方已匹配笔数"] = df["账方已匹配笔数"].astype(int)
+    df["账方未匹配笔数"] = df["账方未匹配笔数"].astype(int)
+
+    # 风险标记
+    flags = []
+    for cp in df.index:
+        f = []
+        row = df.loc[cp]
+        if row["差异(银-账)"] != 0 and abs(row["差异(银-账)"]) > 100:
+            f.append("差异>$100")
+        if row["银方未匹配笔数"] >= 5 or row["账方未匹配笔数"] >= 5:
+            f.append("未匹配多笔")
+        if cp and cp.strip():
+            for kw in ("方万鹏", "赵萍", "格林威特", "东晨", "同瑞", "手足"):
+                if kw in str(cp):
+                    f.append("关联方")
+                    break
+        flags.append(",".join(f) if f else "")
+    df["风险标记"] = flags
+
+    # 集中度：占比和Pareto
+    total_abs = df["银方净额"].abs().sum() + df["账方净额"].abs().sum()
+    if total_abs > 0:
+        df["金额占比%"] = ((df["银方净额"].abs() + df["账方净额"].abs()) / total_abs * 100).round(1)
+        cum = 0
+        pareto = []
+        for v in df["金额占比%"]:
+            cum += v
+            if cum <= 80:
+                pareto.append("A类(80%)")
+            elif cum <= 95:
+                pareto.append("B类(15%)")
+            else:
+                pareto.append("C类(5%)")
+        df["Pareto分层"] = pareto
+
+    # 排序：风险标记非空在前，差异绝对值大的在前
+    df["_sort"] = df["风险标记"].apply(lambda x: 0 if x else 1) * 10000 + df["差异(银-账)"].abs()
+    df = df.sort_values("_sort").drop(columns=["_sort"])
+    df = df.reset_index().rename(columns={"counterpart": "对方名称"})
+    return df
+
+
+
+def _build_trend_analysis(result):
+    """趋势分析：按月汇总银方/账方收入支出"""
+    bank_std = result["bank_std"]
+    book_std = result["book_std"]
+    bank_cp = bank_std.copy()
+    bank_cp["月份"] = pd.to_datetime(bank_cp["date"], errors="coerce").dt.to_period("M").astype(str)
+    bank_cp["收入"] = bank_cp["net_amount"].clip(lower=0)
+    bank_cp["支出"] = (-bank_cp["net_amount"]).clip(lower=0)
+    bm = bank_cp.groupby("月份").agg(银方笔数=("net_amount", "count"), 银方收入=("收入", "sum"), 银方支出=("支出", "sum")).round(2)
+    book_cp = book_std.copy()
+    book_cp["月份"] = pd.to_datetime(book_cp["date"], errors="coerce").dt.to_period("M").astype(str)
+    book_cp["借方"] = book_cp["debit"].clip(lower=0)
+    book_cp["贷方"] = book_cp["credit"].clip(lower=0)
+    jm = book_cp.groupby("月份").agg(账方笔数=("net_amount", "count"), 账方借方=("借方", "sum"), 账方贷方=("贷方", "sum")).round(2)
+    df = bm.join(jm, how="outer").fillna(0).sort_index()
+    df["银方净流入"] = (df["银方收入"] - df["银方支出"]).round(2)
+    df["账方净发生"] = (df["账方借方"] - df["账方贷方"]).round(2)
+    df["差异"] = (df["银方净流入"] - df["账方净发生"]).round(2)
+    # 异常标记：差异超过月均2倍标准差
+    if len(df) >= 3:
+        std = df["差异"].std()
+        if std > 0:
+            df["异常标记"] = df["差异"].apply(lambda x: "异常" if abs(x) > std * 2 else "")
+    return df.reset_index()
+
+
+
+def _build_cutoff_test(result, days=7):
+    """截止性测试：期末前后大额交易"""
+    bank_std = result["bank_std"]
+    book_std = result["book_std"]
+    max_bd = pd.to_datetime(book_std["date"], errors="coerce").max()
+    max_bb = pd.to_datetime(bank_std["date"], errors="coerce").max()
+    TE = 50000
+    rows = []
+    for label, df, max_d in [("银方", bank_std, max_bb), ("账方", book_std, max_bd)]:
+        if pd.isna(max_d):
+            continue
+        cutoff = max_d - pd.Timedelta(days=days)
+        df2 = df.copy()
+        df2["_dt"] = pd.to_datetime(df2["date"], errors="coerce")
+        mask = (df2["_dt"] >= cutoff) & (abs(df2["net_amount"]) > TE)
+        for _, r in df2[mask].iterrows():
+            rows.append({
+                "侧别": label, "日期": str(r["date"])[:10],
+                "摘要": r["summary"], "对方": r.get("counterpart", ""),
+                "金额": round(float(r["net_amount"]), 2),
+                "距期末天数": (max_d - r["_dt"]).days
+            })
+    return pd.DataFrame(rows).sort_values("金额", key=abs, ascending=False) if rows else pd.DataFrame()
+
+
+
+def _build_fee_monthly_analysis(result):
+    """费用月度分析：银行手续费按月趋势"""
+    bank_std = result["bank_std"]
+    FEE_KW = ("手续费", "短信费", "年费", "账户管理费", "工本费", "服务费", "扣费")
+    mask = bank_std["summary"].astype(str).apply(lambda s: any(kw in s for kw in FEE_KW))
+    fee = bank_std[mask].copy()
+    if fee.empty:
+        return pd.DataFrame()
+    fee["月份"] = pd.to_datetime(fee["date"], errors="coerce").dt.to_period("M").astype(str)
+    fm = fee.groupby("月份").agg(笔数=("net_amount", "count"), 费用合计=("net_amount", lambda x: x.abs().sum())).round(2)
+    fm["笔均"] = (fm["费用合计"] / fm["笔数"]).round(2)
+    # 异常月份：费用超过月均2倍
+    if len(fm) >= 3:
+        avg = fm["费用合计"].mean()
+        fm["异常标记"] = fm["费用合计"].apply(lambda x: "偏高" if x > avg * 2 else ("偏低" if x < avg * 0.3 else ""))
+    return fm.sort_index().reset_index()
+
+
+
+def _build_aging_by_counterparty(result):
+    """账龄分析：按对手方+账龄区间分桶未匹配金额"""
+    ub = result["unmatched_book"]
+    uk = result["unmatched_bank"]
+    max_date = pd.Timestamp.now()
+    # 尝试从数据中提取最大日期
+    for items in [ub, uk]:
+        for it in items:
+            d = it.get("date", "")
+            if d:
+                try:
+                    dt = pd.Timestamp(d)
+                    if dt > max_date or max_date == pd.Timestamp.now():
+                        max_date = dt
+                except:
+                    pass
+    rows = []
+    for label, items in [("账方", ub), ("银方", uk)]:
+        for it in items:
+            cp = str(it.get("counterpart", "")).strip()
+            if not cp:
+                cp = "(无对手方)"
+            amt = abs(it.get("net_amount", 0))
+            d = it.get("date", "")
+            days = 999
+            if d:
+                try:
+                    days = (max_date - pd.Timestamp(d)).days
+                except:
+                    pass
+            if days <= 90:
+                bucket = "0-90天"
+            elif days <= 180:
+                bucket = "91-180天"
+            elif days <= 365:
+                bucket = "181-365天"
+            else:
+                bucket = "365天以上"
+            rows.append({"侧别": label, "对方名称": cp, "日期": str(d)[:10] if d else "",
+                         "金额": round(amt, 2), "账龄天数": days, "账龄区间": bucket})
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df, pd.DataFrame()
+    # 明细
+    detail = df.sort_values(["对方名称", "账龄天数"], ascending=[True, False])
+    # 汇总：按对手方+账龄区间聚合
+    summary = df.groupby(["对方名称", "账龄区间"]).agg(
+        笔数=("金额", "count"), 合计金额=("金额", "sum")
+    ).round(2).reset_index()
+    # pivot
+    pivot = summary.pivot_table(index="对方名称", columns="账龄区间", values="合计金额", aggfunc="sum", fill_value=0)
+    for col in ["0-90天", "91-180天", "181-365天", "365天以上"]:
+        if col not in pivot.columns:
+            pivot[col] = 0
+    pivot["合计"] = pivot.sum(axis=1)
+    pivot = pivot.sort_values("合计", ascending=False)
+    return detail, pivot.reset_index()
+
+
+
+def _generate_confirmation_letters(result, out_dir):
+    """生成询证函Word文档：按模板填充对手方、金额、期间"""
+    from docx import Document
+    cp_df = _build_counterparty_summary(result)
+    top = cp_df.head(15)
+    out = Path(out_dir) / "询证函"
+    out.mkdir(parents=True, exist_ok=True)
+    st = result["stats"]
+    date_range = ""
+    try:
+        bd = pd.to_datetime(result["book_std"]["date"], errors="coerce")
+        date_range = bd.min().strftime("%Y/%m/%d") + " 至 " + bd.max().strftime("%Y/%m/%d")
+    except:
+        pass
+    written = 0
+    for _, row in top.iterrows():
+        cp_name = str(row["对方名称"]).strip()
+        if not cp_name or cp_name == "nan":
+            continue
+        doc = Document()
+        doc.add_heading("企业询证函", level=0)
+        doc.add_paragraph(f"编号: XC{written+1:03d}")
+        doc.add_paragraph(f"致: {cp_name}")
+        doc.add_paragraph("")
+        doc.add_paragraph(f"本公司聘请的审计机构正在对本公司{date_range}的财务报表进行审计。")
+        doc.add_paragraph("按照中国注册会计师审计准则的要求，应当询证本公司与贵单位的往来账项等事项。")
+        doc.add_paragraph("下列数据出自本公司账簿记录，如与贵单位记录相符，请在本函下端'信息证明无误'处签章证明；")
+        doc.add_paragraph('如有不符，请在"信息不符"处列明不符项目及金额。回函请直接寄至审计机构。')
+        doc.add_paragraph("")
+        # 往来明细表
+        table = doc.add_table(rows=3, cols=5, style="Table Grid")
+        headers = ["项目", "期间", "本公司账面金额", "贵单位账面金额", "差异"]
+        for i, h in enumerate(headers):
+            table.rows[0].cells[i].text = h
+        table.rows[1].cells[0].text = "应收/应付余额"
+        table.rows[1].cells[1].text = date_range
+        table.rows[1].cells[2].text = f"{row['账方净额']:,.2f}"
+        table.rows[1].cells[3].text = ""
+        table.rows[1].cells[4].text = ""
+        table.rows[2].cells[0].text = "其中: 银行流水净额"
+        table.rows[2].cells[1].text = date_range
+        table.rows[2].cells[2].text = f"{row['银方净额']:,.2f}"
+        table.rows[2].cells[3].text = ""
+        table.rows[2].cells[4].text = ""
+        doc.add_paragraph("")
+        doc.add_paragraph("结论: 1.信息证明无误    2.信息不符(请列明)")
+        doc.add_paragraph("")
+        doc.add_paragraph(f"经办人: ________    日期: ________")
+        doc.add_paragraph(f"回函地址: ________")
+        safe_name = cp_name.replace("/", "_").replace("\\", "_")[:30]
+        doc.save(str(out / f"询证函_{safe_name}.docx"))
+        written += 1
+    print(f"[询证函] 已生成{written}份Word文档 -> {out}")
+    return written
+
 def export_reconciliation_outputs(result, out_dir):
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True); written = []
     detail = _build_detail_workpaper(result)
@@ -2052,6 +2358,129 @@ def export_reconciliation_outputs(result, out_dir):
     flags = pd.DataFrame(result["red_flags"] + [{**d,"type":"疑似重复入账","detail":d["reason"]} for d in result["duplicates"]])
     if not flags.empty: flags = flags.rename(columns={"type":"类型","side":"侧别","rows":"涉及行","amount":"金额","detail":"说明"})
     p = out / "异常资金交易清单.xlsx"; flags.to_excel(str(p), index=False); written.append(p.name)
+    # v3.11: 对手方收付汇总表（含集中度Pareto）
+    try:
+        cp_df = _build_counterparty_summary(result)
+        cp_df.to_excel(str(out / "对手方收付汇总表.xlsx"), index=False)
+        written.append("对手方收付汇总表.xlsx")
+        n_cp = len(cp_df)
+        n_flag = (cp_df["风险标记"] != "").sum()
+        print(f"[对手方汇总] {n_cp}个对手方，{n_flag}个有风险标记")
+    except Exception as _e:
+        print(f"[对手方汇总] 生成失败: {_e}")
+    # v3.12: 趋势分析
+    try:
+        trend = _build_trend_analysis(result)
+        trend.to_excel(str(out / "月度趋势分析.xlsx"), index=False)
+        written.append("月度趋势分析.xlsx")
+        n_abn = (trend.get("异常标记", "") != "").sum() if "异常标记" in trend.columns else 0
+        print(f"[趋势分析] {len(trend)}个月，{n_abn}个月异常波动")
+    except Exception as _e:
+        print(f"[趋势分析] 生成失败: {_e}")
+    # v3.12: 截止性测试
+    try:
+        cutoff = _build_cutoff_test(result, days=7)
+        if not cutoff.empty:
+            cutoff.to_excel(str(out / "截止性测试.xlsx"), index=False)
+            written.append("截止性测试.xlsx")
+            print(f"[截止性] 期末前后大额交易{len(cutoff)}笔")
+    except Exception as _e:
+        print(f"[截止性] 生成失败: {_e}")
+    # v3.12: 费用月度分析
+    try:
+        fee_m = _build_fee_monthly_analysis(result)
+        if not fee_m.empty:
+            fee_m.to_excel(str(out / "银行费用月度分析.xlsx"), index=False)
+            written.append("银行费用月度分析.xlsx")
+            n_fee_abn = (fee_m.get("异常标记", "") != "").sum() if "异常标记" in fee_m.columns else 0
+            print(f"[费用分析] {len(fee_m)}个月费用记录，{n_fee_abn}个月异常")
+    except Exception as _e:
+        print(f"[费用分析] 生成失败: {_e}")
+    # v3.12: 整数大额清单
+    try:
+        bank_std = result["bank_std"]
+        big_mask = (abs(bank_std["net_amount"]) >= 50000) & (abs(bank_std["net_amount"]) % 10000 == 0)
+        big = bank_std[big_mask][["date", "summary", "counterpart", "net_amount"]].copy()
+        if not big.empty:
+            big.columns = ["日期", "摘要", "对方", "金额"]
+            big["日期"] = big["日期"].astype(str).str[:10]
+            big.to_excel(str(out / "整数大额交易清单.xlsx"), index=False)
+            written.append("整数大额交易清单.xlsx")
+            print(f"[整数大额] {len(big)}笔")
+    except Exception as _e:
+        print(f"[整数大额] 生成失败: {_e}")
+    # v3.12: 函证数据（Top对手方）
+    try:
+        cp_df2 = _build_counterparty_summary(result)
+        top_cp = cp_df2.head(20)[["对方名称", "银方净额", "账方净额", "差异(银-账)", "风险标记"]]
+        top_cp.columns = ["被询证单位", "银行流水净额", "账面净额", "差异", "注意事项"]
+        top_cp.to_excel(str(out / "函证数据清单.xlsx"), index=False)
+        written.append("函证数据清单.xlsx")
+        print(f"[函证] Top20对手方函证数据已生成")
+    except Exception as _e:
+        print(f"[函证] 生成失败: {_e}")
+    # v3.12: 报告数据提取JSON
+    try:
+        st = result["stats"]
+        cp_df3 = _build_counterparty_summary(result)
+        flag_cps = cp_df3[cp_df3["风险标记"] != ""]["对方名称"].tolist()
+        report_data = {
+            "基本信息": {
+                "账方匹配率": f"{st['book_match_rate']}%",
+                "银方匹配率": f"{st['bank_match_rate']}%",
+                "未匹配_账方": st["unmatched_book"],
+                "未匹配_银方": st["unmatched_bank"],
+                "待复核_L4": st.get("review_L4", 0),
+                "红旗数量": st.get("red_flag_count", 0),
+            },
+            "未达账项": {
+                "银收企未收": st["timing_categories"].get(CAT_BANK_RECV, 0),
+                "银付企未付": st["timing_categories"].get(CAT_BANK_PAY, 0),
+                "企收银未收": st["timing_categories"].get(CAT_ENT_RECV, 0),
+                "企付银未付": st["timing_categories"].get(CAT_ENT_PAY, 0),
+                "待人工核查": st["timing_categories"].get(CAT_REVIEW, 0),
+            },
+            "风险对手方": flag_cps[:20],
+            "异常月份": trend[trend.get("异常标记", "") != ""]["月份"].tolist() if "异常标记" in trend.columns else [],
+        }
+        (out / "报告数据提取.json").write_text(
+            json.dumps(report_data, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8")
+        written.append("报告数据提取.json")
+        print(f"[报告数据] JSON已提取")
+    except Exception as _e:
+        print(f"[报告数据] 提取失败: {_e}")
+    # v3.13: 账龄分析
+    try:
+        aging_detail, aging_pivot = _build_aging_by_counterparty(result)
+        if not aging_detail.empty:
+            aging_detail.to_excel(str(out / "账龄分析明细.xlsx"), index=False)
+            aging_pivot.to_excel(str(out / "账龄分析汇总.xlsx"), index=False)
+            written += ["账龄分析明细.xlsx", "账龄分析汇总.xlsx"]
+            print(f"[账龄分析] {len(aging_detail)}笔未达，{len(aging_pivot)}个对手方")
+    except Exception as _e:
+        print(f"[账龄分析] 生成失败: {_e}")
+    # v3.13: 三方圆勾稽
+    try:
+        st2 = result["stats"]
+        tie = result["tie_out"]
+        tie_rows = []
+        for side, t in [("账方", tie.get("book", {})), ("银方", tie.get("bank", {}))]:
+            opening = t.get("opening", 0) or 0
+            total_net = t.get("total_net", 0) or 0
+            closing = t.get("closing", 0) or 0
+            expected = round(opening + total_net, 2)
+            diff = round(expected - (closing or 0), 2)
+            tie_rows.append({"侧别": side, "期初余额": opening, "本期净发生额": total_net,
+                             "计算期末": expected, "账面期末": closing or 0, "差异": diff,
+                             "状态": "平衡" if abs(diff) < 0.02 else "异常"})
+        tie_df = pd.DataFrame(tie_rows)
+        tie_df.to_excel(str(out / "三方圆勾稽.xlsx"), index=False)
+        written.append("三方圆勾稽.xlsx")
+        abn = (tie_df["状态"] == "异常").sum()
+        status_text = "平衡" if abn == 0 else f"{abn}侧异常"; print(f"[三方勾稽] {status_text}")
+    except Exception as _e:
+        print(f"[三方勾稽] 生成失败: {_e}")
     summary = {"stats":result["stats"],"tie_out":result["tie_out"],"reconciliation":result["balance_reconciliation"]}
     p = out / "reconciliation_summary.json"; p.write_text(json.dumps(summary,ensure_ascii=False,indent=2,default=str),encoding="utf-8"); written.append(p.name)
      # ── v3.9: 报告生成器数据契约（journal_entries.json + analysis_result.csv）──
