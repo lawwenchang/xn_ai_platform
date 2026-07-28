@@ -2463,6 +2463,49 @@ def reconcile_ledger_with_bank(ledger_path, bank_result, ledger_mapping=None):
     print(f"[台账核对] {len(merged)}个对手方: 绿{green} 黄{yellow} 红{red}")
     return merged, mp
 
+
+
+def check_trial_balance_consistency(book_std, tb_path=None):
+    """科目余额表交叉校验：序时账 vs 科目余额表"""
+    checks = []
+    # 1. 内部一致性：借方合计 = 贷方合计
+    total_debit = round(float(book_std["debit"].sum()), 2)
+    total_credit = round(float(book_std["credit"].sum()), 2)
+    diff = round(total_debit - total_credit, 2)
+    checks.append({"检查项": "序时账借贷平衡", "借方合计": total_debit, "贷方合计": total_credit,
+                   "差异": diff, "结果": "通过" if abs(diff) < 0.02 else "异常"})
+    # 2. 净额合计 vs 借贷差
+    net_sum = round(float(book_std["net_amount"].sum()), 2)
+    expected_net = round(total_debit - total_credit, 2)
+    checks.append({"检查项": "净额=借-贷", "净额合计": net_sum, "借-贷": expected_net,
+                   "差异": round(net_sum - expected_net, 2),
+                   "结果": "通过" if abs(net_sum - expected_net) < 0.02 else "异常"})
+    # 3. 资产=负债+权益（序时账角度：所有科目净额合计=0）
+    checks.append({"检查项": "科目净额合计=0(复式记账)", "净额合计": net_sum,
+                   "差额": abs(net_sum), "结果": "通过" if abs(net_sum) < 10 else "注意(可能存在未分配)"})
+    # 4. 如果有科目余额表，交叉比对
+    if tb_path:
+        try:
+            tb = pd.read_excel(tb_path)
+            # 自动找科目列和金额列
+            subj_col = None; amt_col = None
+            for c in tb.columns:
+                s = str(c)
+                if any(kw in s for kw in ["科目", "名称"]):
+                    subj_col = c
+                if any(kw in s for kw in ["期末余额", "余额", "金额"]):
+                    amt_col = c
+            if subj_col and amt_col:
+                tb["金额"] = pd.to_numeric(tb[amt_col], errors="coerce").fillna(0)
+                tb_total = round(float(tb["金额"].sum()), 2)
+                checks.append({"检查项": "科目余额表合计 vs 序时账(需按科目展开)",
+                               "科目余额表合计": tb_total, "序时账净额": net_sum,
+                               "差异": round(tb_total - net_sum, 2),
+                               "结果": "待按科目明细比对"})
+        except Exception as e:
+            checks.append({"检查项": "科目余额表读取", "结果": f"读取失败: {e}"})
+    return pd.DataFrame(checks)
+
 def export_reconciliation_outputs(result, out_dir):
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True); written = []
     detail = _build_detail_workpaper(result)
@@ -2667,6 +2710,16 @@ def export_reconciliation_outputs(result, out_dir):
             print(f"[资金流] {n_cps}个Top对手方逐月流水")
     except Exception as _e:
         print(f"[资金流] 生成失败: {_e}")
+    # v3.16: 报告复核-数据一致性校验
+    try:
+        tb_path = result.get("config", {}).get("trial_balance_path")
+        tb_check = check_trial_balance_consistency(result["book_std"], tb_path)
+        tb_check.to_excel(str(out / "数据一致性校验.xlsx"), index=False)
+        written.append("数据一致性校验.xlsx")
+        n_fail = (tb_check["结果"] != "通过").sum()
+        print(f"[一致性] {len(tb_check)}项检查，{n_fail}项需关注")
+    except Exception as _e:
+        print(f"[一致性] 检查失败: {_e}")
     summary = {"stats":result["stats"],"tie_out":result["tie_out"],"reconciliation":result["balance_reconciliation"]}
     p = out / "reconciliation_summary.json"; p.write_text(json.dumps(summary,ensure_ascii=False,indent=2,default=str),encoding="utf-8"); written.append(p.name)
      # ── v3.9: 报告生成器数据契约（journal_entries.json + analysis_result.csv）──
