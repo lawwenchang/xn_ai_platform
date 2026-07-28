@@ -613,10 +613,13 @@ class ReportReviewer:
         """账龄分析 vs 科目余额表往来科目"""
         self.coverage["账龄勾稽"] = "通过"
         ar_aging = 0.0
+        # 仅取"应收账款"行，而非全表求和（账龄表含多个往来科目）
+        name_col = aging.columns[0]
+        ar_mask = aging[name_col].astype(str).str.contains("应收账款", na=False)
         if "合计" in aging.columns:
-            ar_aging = pd.to_numeric(aging["合计"], errors="coerce").sum()
+            ar_aging = pd.to_numeric(aging.loc[ar_mask, "合计"], errors="coerce").sum()
         elif "合计金额" in aging.columns:
-            ar_aging = pd.to_numeric(aging["合计金额"], errors="coerce").sum()
+            ar_aging = pd.to_numeric(aging.loc[ar_mask, "合计金额"], errors="coerce").sum()
         subj_col = amt_col = 0
         if tb is not None:
             for i, c in enumerate(tb.columns):

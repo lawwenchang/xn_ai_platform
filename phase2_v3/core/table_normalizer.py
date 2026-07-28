@@ -41,9 +41,14 @@ CONTRACT_DIRECTION = "方向"
 # ═══════════════════════════════════════════════════════════════
 
 SUBTOTAL_KEYWORDS = {
-    "合计", "小计", "总计", "累计", "合 计", "小 计", "总 计",
+    "合计", "小计", "总计", "合 计", "小 计", "总 计",
     "subtotal", "total", "sum", "grand total",
+    # 与"累计"相关的合计关键词（精确匹配，避免误伤"累计折旧"等合法表头）
+    "累计金额", "累计发生额", "本年累计", "本期累计", "累计数", "累计额",
 }
+
+# 当单元格含"累计"但不是合计行时的排除词（合法财务表头列名）
+_ACCUMULATED_HEADER_EXCLUSIONS = {"折旧", "摊销", "减值", "计提", "坏账"}
 
 
 
@@ -95,19 +100,31 @@ def _is_potential_header_row(row, col_count: int) -> bool:
         s = str(v).strip()
         if any(kw in s for kw in SUBTOTAL_KEYWORDS):
             return False
+        # 额外检查：含"累计"但不是合法财务表头列名（如"累计折旧"）→ 合计行
+        if "累计" in s and not any(ex in s for ex in _ACCUMULATED_HEADER_EXCLUSIONS):
+            return False
     return True
 
 
 def find_header_row(df: pd.DataFrame, max_scan: int = 20) -> int:
     """在 DataFrame 中定位真正的表头行。
-    
+
     策略：从前 max_scan 行中找最像表头的那一行。打分依据：
     - 非空率高
     - 值多样性高（表头每列不同，数据行有重复）
     - 不含明显的数字模式或合计关键词
-    
+    - 含表头特征关键词加分（编号/名称/日期/金额/余额…）
+
     返回 0-based 行号。如果找不到，返回 0（假定第一行就是表头）。
     """
+    # 典型中文表头关键词（数据行极少出现）
+    HEADER_HINTS = [
+        "编号", "名称", "日期", "金额", "余额", "部门", "类别", "编码", "代码",
+        "单位", "备注", "摘要", "状态", "方式", "类型", "规格", "型号",
+        "存放", "使用", "数量", "原值", "净值", "累计", "折旧", "科目",
+        "凭证", "币种", "方向", "期初", "期末", "借方", "贷方", "发生额",
+        "卡片", "录入", "存放", "增加", "减少", "计提",
+    ]
     if df.empty:
         return 0
     col_count = len(df.columns)
@@ -117,10 +134,19 @@ def find_header_row(df: pd.DataFrame, max_scan: int = 20) -> int:
         row = df.iloc[i]
         if not _is_potential_header_row(row, col_count):
             continue
-        # 打分：非空率 + 唯一值率
         non_blank = sum(1 for v in row if not _is_blank(v))
         unique_vals = len({str(v).strip() for v in row if not _is_blank(v)})
-        score = non_blank * 2 + unique_vals
+        # 表头关键词加分
+        header_bonus = 0
+        for v in row:
+            if _is_blank(v):
+                continue
+            s = str(v).strip()
+            for kw in HEADER_HINTS:
+                if kw in s:
+                    header_bonus += 1
+                    break
+        score = non_blank * 2 + unique_vals + header_bonus * 3
         if score > best_score:
             best_score = score
             best_row = i
@@ -176,6 +202,138 @@ def clean_dataframe(
         result = result[~blank_mask].copy()
         result = result.reset_index(drop=True)
     return result
+
+# ═══════════════════════════════════════════════════════════════
+# 多级表头识别与合并（在设列名之前调用）
+# ═══════════════════════════════════════════════════════════════
+
+# 典型中文表头关键词（与 find_header_row 保持一致）
+_HEADER_HINTS = [
+    "编号", "名称", "日期", "金额", "余额", "部门", "类别", "编码", "代码",
+    "单位", "备注", "摘要", "状态", "方式", "类型", "规格", "型号",
+    "存放", "使用", "数量", "原值", "净值", "累计", "折旧", "科目",
+    "凭证", "币种", "方向", "期初", "期末", "借方", "贷方", "发生额",
+    "卡片", "录入", "增加", "减少", "计提",
+]
+
+
+def _cell_str(df, r, c) -> str:
+    """安全获取单元格字符串值（NaN → ''）"""
+    v = df.iloc[r, c]
+    return str(v).strip() if not _is_blank(v) else ""
+
+
+def resolve_multilevel_header(
+    raw: pd.DataFrame, header_row: int
+) -> Tuple[List[str], int]:
+    """识别并合并多级表头（在设列名之前调用）。
+
+    通用策略（不依赖具体文件名/格式）：
+    1. 上方行无值 或 只有 1 个不同值 → 标题行，不合并
+    2. 上方行有 ≥2 个不同值 且 含表头关键词 → 父级表头，合并两行
+    3. 否则不合并
+
+    Args:
+        raw: 原始 DataFrame（header=None 读取，未设列名）
+        header_row: find_header_row 返回的表头行号（0-based）
+
+    Returns:
+        (column_names, data_start_row):
+            - column_names:  合并后的列名列表
+            - data_start_row: 数据起始行号（表头行 + 1）
+    """
+    col_count = len(raw.columns)
+
+    # ── 无上方行：单层表头 ──
+    above_row = header_row - 1
+    if above_row < 0:
+        cols = [_cell_str(raw, header_row, i) or f"Col_{i}" for i in range(col_count)]
+        return cols, header_row + 1
+
+    # ── 收集上方行信息 ──
+    above_vals = [_cell_str(raw, above_row, i) for i in range(col_count)]
+    above_non_blank = [v for v in above_vals if v]
+    above_distinct = len(set(above_non_blank))
+
+    # ── 规则 1：上方行太稀疏（非空列 < max(总列10%, 2)）→ 不合并 ──
+    if len(above_non_blank) < max(col_count * 0.1, 2):
+        cols = [_cell_str(raw, header_row, i) or f"Col_{i}" for i in range(col_count)]
+        return cols, header_row + 1
+
+    # ── 规则 2：上方行只有 1 个不同的值 → 标题行（如 "固定资产卡片"），不合并 ──
+    #    这是区分「标题行」和「父级表头」的通用规则：
+    #    - 标题行：一个标题合并所有列 → 去重后 1 个值
+    #    - 父级表头：多个分组标签散落各列 → 去重后 ≥2 个值
+    if above_distinct < 2:
+        cols = [_cell_str(raw, header_row, i) or f"Col_{i}" for i in range(col_count)]
+        return cols, header_row + 1
+
+    # ── 规则 3：上方行无表头关键词 → 不合并 ──
+    above_hints = 0
+    for v in above_vals:
+        if v and any(kw in v for kw in _HEADER_HINTS):
+            above_hints += 1
+
+    if above_hints == 0:
+        cols = [_cell_str(raw, header_row, i) or f"Col_{i}" for i in range(col_count)]
+        return cols, header_row + 1
+
+
+    # ── 规则 4：表头行自身必须含表头关键词（否则极可能是 find_header_row 误判的数据行）──
+    header_hints = 0
+    for v in [_cell_str(raw, header_row, i) for i in range(col_count)]:
+        if v and any(kw in v for kw in _HEADER_HINTS):
+            header_hints += 1
+    if header_hints == 0:
+        # 表头行没有任何关键词 → 检查是否为方向/单位指示行（如"借"/"贷"）
+        # 若上方行含表头关键词且当前行只有方向指示+空值 → 合并两行
+        non_blank_vals = [_cell_str(raw, header_row, i) for i in range(col_count)]
+        direction_chars = {'借', '贷', '借 ' , '贷 ', 'Dr', 'Cr', 'dr', 'cr'}
+        is_direction_row = all(
+            v == '' or v in direction_chars
+            for v in non_blank_vals
+        )
+        if is_direction_row:
+            # 方向指示行：允许通过，进入下方的合并逻辑
+            header_hints = 1  # 伪造一个值跳过本规则
+        else:
+            # 真正被误判的数据行 → 回退到上方行作为表头
+            if above_row >= 0:
+                cols = [_cell_str(raw, above_row, i) or f"Col_{i}" for i in range(col_count)]
+            else:
+                cols = [_cell_str(raw, header_row, i) or f"Col_{i}" for i in range(col_count)]
+            return cols, header_row + 1
+
+    # ── 多级表头！合并两行 ──
+    merged_cols = []
+    prev_filled = ""
+    for i in range(col_count):
+        r1 = _cell_str(raw, above_row, i)
+        r2 = _cell_str(raw, header_row, i)
+        if r1:
+            prev_filled = r1
+        if r1 and r2:
+            merged_cols.append(f"{r1}_{r2}")
+        elif r1:
+            merged_cols.append(r1)
+        elif r2:
+            merged_cols.append(f"{prev_filled}_{r2}" if prev_filled else r2)
+        else:
+            merged_cols.append(f"Col_{i}")
+
+    # 去重后缀
+    seen: Dict[str, int] = {}
+    final_cols = []
+    for c in merged_cols:
+        if c in seen:
+            seen[c] += 1
+            final_cols.append(f"{c}_{seen[c]}")
+        else:
+            seen[c] = 1
+            final_cols.append(c)
+
+    return final_cols, header_row + 1
+
 
 # ═══════════════════════════════════════════════════════════════
 # 探测分流器：detect_table_shape

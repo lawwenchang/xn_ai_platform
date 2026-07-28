@@ -119,26 +119,13 @@ def _read_table(fp: Path) -> pd.DataFrame:
 
 
 def _detect_header_row(fp: Path, max_try: int = 6) -> int:
-    """自动检测 Excel 表头行（与 routes.py Load 算子口径一致）"""
-    best_score, best_hr = -1, 0
-    for hr in range(max_try):
-        try:
-            cols = list(pd.read_excel(str(fp), header=hr, nrows=0).columns)
-        except Exception:
-            break
-        score = 0
-        for c in cols:
-            cs = str(c)
-            if cs.startswith("Unnamed"):
-                score -= 1
-            elif len(cs) > 2 and not any("一" <= ch <= "鿿" for ch in cs):
-                score -= 1
-            else:
-                score += 1
-        score += len(cols) * 0.5
-        if score > best_score:
-            best_score, best_hr = score, hr
-    return best_hr if best_score > 0 else 0
+    """自动检测 Excel 表头行（委托 find_header_row 按内容多样性打分）"""
+    try:
+        from core.table_normalizer import find_header_row
+        raw = pd.read_excel(str(fp), header=None)
+        return find_header_row(raw, max_scan=max(max_try, 10))
+    except Exception:
+        return 0
 
 
 # ═══════════════════════════════════════════════════════════════
