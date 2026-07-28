@@ -103,7 +103,7 @@ class ReportReviewer:
             s = str(c)
             if any(kw in s for kw in ["科目", "名称"]):
                 subj_col = c
-            if any(kw in s for kw in ["期末余额", "余额", "金额"]):
+            if any(kw in s for kw in ["期末余额", "余额", "金额"]) and "期初" not in s:
                 amt_col = c
         if subj_col is None or amt_col is None:
             return
@@ -132,7 +132,7 @@ class ReportReviewer:
             s = str(c)
             if any(kw in s for kw in ["科目", "名称"]):
                 subj_col = c
-            if any(kw in s for kw in ["期末余额", "余额", "金额"]):
+            if any(kw in s for kw in ["期末余额", "余额", "金额"]) and "期初" not in s:
                 amt_col = c
         if subj_col is None or amt_col is None:
             return
@@ -166,7 +166,7 @@ class ReportReviewer:
             s = str(c)
             if any(kw in s for kw in ["科目", "名称"]):
                 subj_col = c
-            if any(kw in s for kw in ["期末余额", "余额", "金额"]):
+            if any(kw in s for kw in ["期末余额", "余额", "金额"]) and "期初" not in s:
                 amt_col = c
         if subj_col is None or amt_col is None:
             return
@@ -207,7 +207,7 @@ class ReportReviewer:
         for c in tb.columns:
             if any(kw in str(c) for kw in ["科目", "名称"]):
                 subj_col = c
-            if any(kw in str(c) for kw in ["期末余额", "余额", "金额"]):
+            if any(kw in str(c) for kw in ["期末余额", "余额", "金额"]) and "期初" not in str(c):
                 amt_col = c
         if subj_col is None or amt_col is None:
             return
@@ -216,7 +216,7 @@ class ReportReviewer:
         for _, row in tb.iterrows():
             curr[str(row[subj_col]).strip()] = float(
                 pd.to_numeric(row[amt_col], errors="coerce") or 0)
-        for _, row in self.prior_tb.iterrows():
+        for _, row in prior_tb.iterrows():
             prior[str(row[subj_col]).strip()] = float(
                 pd.to_numeric(row[amt_col], errors="coerce") or 0)
         changes = []
@@ -235,6 +235,36 @@ class ReportReviewer:
             self.findings.append({"类别": "异动分析", "位置": ch["科目"],
                 "检查项": "同比>20%", "本期": ch["本期"], "上期": ch["上期"],
                 "变动额": ch["变动额"], "变动率%": ch["变动率%"], "结果": "需关注"})
+
+        # -- 5b. 期初期末勾稽：本期期初 = 上期期末 --
+        beg_col = None
+        for c in tb.columns:
+            if any(kw in str(c) for kw in ["期初余额", "年初余额", "上年末余额"]):
+                beg_col = c
+                break
+        if beg_col is not None:
+            mismatch_count = 0
+            for name in curr:
+                cur_beg_mask = tb[subj_col].astype(str).str.strip() == name
+                cur_beg = float(pd.to_numeric(
+                    tb.loc[cur_beg_mask, beg_col], errors="coerce").sum() or 0)
+                prior_end = prior.get(name, 0)
+                if abs(cur_beg) > 1 and abs(prior_end) > 1:
+                    diff = round(abs(cur_beg - prior_end), 2)
+                    if diff > 0.5:
+                        mismatch_count += 1
+                        if mismatch_count <= 20:
+                            self.findings.append({"类别": "期初期末勾稽", "位置": name,
+                                "检查项": "本期期初vs上期期末", "本期期初": round(cur_beg, 2),
+                                "上期期末": round(prior_end, 2), "差异": diff,
+                                "结果": "异常"})
+            if mismatch_count > 0:
+                self.coverage["期初期末勾稽"] = "异常({}处不衔接)".format(mismatch_count)
+            else:
+                self.coverage["期初期末勾稽"] = "通过"
+        else:
+            self.coverage["期初期末勾稽"] = "跳过(本期TB无期初余额列)"
+
 
     # -- 6. LLM 错别字/标点/术语 --
     def _extract_docx_text(self):
@@ -319,41 +349,233 @@ class ReportReviewer:
             except Exception as ex:
                 print("[LLM公式] " + str(ex))
 
+
+    # -- 8. 报表与附注勾稽 --
+    def _check_note_to_statement(self, tb, unaudited_fs, notes):
+        """报表项目 vs 对应附注明细的加总一致性"""
+        self.coverage["报表与附注勾稽"] = "通过"
+        if notes is None and unaudited_fs is None:
+            self.coverage["报表与附注勾稽"] = "跳过(缺附注数据)"
+            return
+
+        subj_col = amt_col = 0
+        tb_vals = {}
+        if tb is not None:
+            for i, c in enumerate(tb.columns):
+                s = str(c)
+                if any(kw in s for kw in ["科目", "名称"]): subj_col = i
+                if any(kw in s for kw in ["期末余额", "余额", "金额"]) and "期初" not in s: amt_col = i
+            for _, row in tb.iterrows():
+                name = str(row.iloc[subj_col]).strip()
+                tb_vals[name] = float(pd.to_numeric(row.iloc[amt_col], errors="coerce") or 0)
+
+        NOTE_TB_MAP = {
+            "应收账款": ["应收账款"], "其他应收款": ["其他应收款"],
+            "预付账款": ["预付账款", "预付"], "存货": ["存货"],
+            "固定资产": ["固定资产"], "在建工程": ["在建工程"],
+            "无形资产": ["无形资产"], "应付账款": ["应付账款"],
+            "其他应付款": ["其他应付款"], "预收账款": ["预收账款", "预收"],
+            "短期借款": ["短期借款"], "长期借款": ["长期借款"],
+            "应交税费": ["应交税费"], "应付职工薪酬": ["应付职工薪酬"],
+        }
+
+        note_dict = {}
+        if notes is not None:
+            if isinstance(notes, dict):
+                note_dict.update(notes)
+            elif isinstance(notes, pd.DataFrame):
+                note_dict["附注表"] = notes
+        if unaudited_fs is not None and isinstance(unaudited_fs, dict):
+            for k, v in unaudited_fs.items():
+                if any(kw in str(k) for kw in ["附注", "账龄", "固定资产", "存货",
+                        "应收账款", "应付账款", "借款", "税费", "薪酬", "明细"]):
+                    note_dict[str(k)] = v
+
+        for note_name, note_df in note_dict.items():
+            if not isinstance(note_df, pd.DataFrame):
+                continue
+            note_total = 0.0
+            for possible_col in ["合计", "合计金额", "期末余额", "期末", "账面价值", "账面净值"]:
+                if possible_col in note_df.columns:
+                    vals = pd.to_numeric(note_df[possible_col], errors="coerce")
+                    total_mask = note_df.iloc[:, 0].astype(str).str.contains(
+                        "合计|总计|小计", na=False)
+                    # 金额列排除合计行避免重复; "合计"列则直接取合计行
+                    if possible_col not in ("合计", "合计金额") and total_mask.any():
+                        note_total = float(vals[~total_mask].sum())
+                    else:
+                        note_total = float(vals.sum())
+                    break
+            if note_total == 0.0:
+                last_col = note_df.columns[-1]
+                vals = pd.to_numeric(note_df[last_col], errors="coerce").dropna()
+                if len(vals) > 0:
+                    total_mask = note_df.iloc[:, 0].astype(str).str.contains(
+                        "合计|总计|小计", na=False)
+                    note_total = float(vals[~total_mask].sum()) if total_mask.any() else float(vals.sum())
+            if abs(note_total) < 1:
+                continue
+
+            matched = False
+            for note_key, tb_keys in NOTE_TB_MAP.items():
+                if note_key in str(note_name):
+                    for tb_key in tb_keys:
+                        for tn, ta in tb_vals.items():
+                            if tb_key in tn and "减值" not in tn and "坏账" not in tn:
+                                diff = round(abs(note_total - ta), 2)
+                                if diff > 0.5:
+                                    self.findings.append({"类别": "报表与附注勾稽",
+                                        "位置": str(note_name),
+                                        "检查项": "附注合计 vs TB{}".format(tb_key),
+                                        "附注合计": round(note_total, 2),
+                                        "TB科目值": round(ta, 2), "差异": diff,
+                                        "结果": "异常"})
+                                    self.coverage["报表与附注勾稽"] = "异常"
+                                matched = True; break
+                        if matched: break
+                    if matched: break
+
+
+    # -- 9. 附注科目内勾稽 --
+    def _check_note_internal(self, notes):
+        """同一附注内部的逻辑关系（如期初 + 本期增加 - 本期减少 = 期末）"""
+        self.coverage["附注科目内勾稽"] = "通过"
+        if notes is None:
+            self.coverage["附注科目内勾稽"] = "跳过(缺附注数据)"
+            return
+
+        note_dict = {}
+        if isinstance(notes, dict):
+            note_dict.update(notes)
+        elif isinstance(notes, pd.DataFrame):
+            note_dict["附注表"] = notes
+        if not note_dict:
+            self.coverage["附注科目内勾稽"] = "跳过(无附注表)"
+            return
+
+        for note_name, note_df in note_dict.items():
+            if not isinstance(note_df, pd.DataFrame) or note_df.empty:
+                continue
+
+            col_beg = col_add = col_sub = col_end = None
+            for c in note_df.columns:
+                s = str(c)
+                if col_beg is None and any(kw in s for kw in ["期初", "年初", "上年末"]):
+                    col_beg = c
+                if col_add is None and any(kw in s for kw in ["本期增加", "本年增加", "计提", "新增"]):
+                    col_add = c
+                if col_sub is None and any(kw in s for kw in ["本期减少", "本年减少", "核销", "转回", "转销", "处置"]):
+                    col_sub = c
+                if col_end is None and any(kw in s for kw in ["期末", "年末"]):
+                    col_end = c
+
+            if col_beg is None or col_end is None:
+                continue
+            if col_add is None and col_sub is None:
+                continue
+
+            name_col = note_df.columns[0]
+            err_count = 0
+            for _, row in note_df.iterrows():
+                beg = float(pd.to_numeric(row[col_beg], errors="coerce") or 0)
+                add = float(pd.to_numeric(row[col_add], errors="coerce") or 0) if col_add else 0
+                sub = float(pd.to_numeric(row[col_sub], errors="coerce") or 0) if col_sub else 0
+                end = float(pd.to_numeric(row[col_end], errors="coerce") or 0)
+
+                if abs(beg) < 1 and abs(add) < 1 and abs(sub) < 1 and abs(end) < 1:
+                    continue
+
+                expected = round(beg + add - sub, 2)
+                diff = round(abs(end - expected), 2)
+                if diff > 0.5:
+                    err_count += 1
+                    if err_count <= 20:
+                        name = str(row[name_col]).strip()
+                        self.findings.append({"类别": "附注科目内勾稽",
+                            "位置": "{}/{}".format(note_name, name),
+                            "检查项": "期初+增加-减少=期末",
+                            "期初": beg, "本期增加": add, "本期减少": sub,
+                            "期末(报表)": end, "期末(计算)": expected, "差异": diff,
+                            "结果": "异常"})
+
+            if err_count > 0:
+                self.coverage["附注科目内勾稽"] = "异常({}处)".format(err_count)
+
     # -- 主流程 --
     def run(self):
         print("[报告复核] 开始...")
+        # 加载数据源
         tb = _load_source(self.src.get('trial_balance'))
         prior_tb = _load_source(self.src.get('prior_tb'))
+        unaudited_fs = _load_source(self.src.get('unaudited_fs'))
+        cash_flow = _load_source(self.src.get('cash_flow'))
+        fixed_assets = _load_source(self.src.get('fixed_assets'))
+        bank_summary = _load_source(self.src.get('bank_summary'))
+        aging = _load_source(self.src.get('aging'))
+        notes = self.src.get('notes')  # dict of DataFrames
+
+        # 加载未审报表（可能为多sheet Excel）
+        if unaudited_fs is None and 'unaudited_fs' in self.src:
+            raw = self.src['unaudited_fs']
+            if isinstance(raw, str):
+                try:
+                    unaudited_fs = pd.read_excel(raw, sheet_name=None)
+                except Exception:
+                    unaudited_fs = pd.read_excel(raw)
+
         if self.report_path:
             self._extract_docx_tables()
-        self._check_balance_sheet_equation(tb)
-        self._check_financial_ratios(tb)
+
+        # === 类型5：表内项目勾稽 ===
         self._check_table_formulas()
+        self._check_balance_sheet_equation(tb)
+
+        # === 类型1：报表间勾稽 ===
+        if unaudited_fs is not None or cash_flow is not None:
+            self._check_cross_statement(unaudited_fs, cash_flow, tb)
+
+        # === 类型7：账表勾稽 ===
         self._cross_check(tb)
-        self._variance_analysis(tb, prior_tb)
-        # 新增：银行汇总交叉校验
-        bank_summary = _load_source(self.src.get('bank_summary'))
         if bank_summary is not None:
             self._check_bank_consistency(bank_summary, tb)
-        # 新增：账龄分析对接
-        aging = _load_source(self.src.get('aging'))
         if aging is not None:
             self._check_aging_consistency(aging, tb)
-        # LLM
+
+        # === 类型2：报表与附注勾稽 ===
+        if notes is not None or (isinstance(unaudited_fs, dict) and unaudited_fs):
+            self._check_note_to_statement(tb, unaudited_fs, notes)
+
+        # === 类型3：附注科目内勾稽 ===
+        self._check_note_internal(notes)
+
+        # === 类型4：附注跨科目勾稽（合理性检验）===
+        self._check_cross_note_reasonableness(tb, fixed_assets)
+
+        # === 类型6：期初期末勾稽 + 异动分析 ===
+        self._variance_analysis(tb, prior_tb)
+
+        # === 补充校验 ===
+        self._check_financial_ratios(tb)
+
+        # LLM（仅当有Word报告且LLM可用时）
         if self.llm_url and self.report_path:
             print("[报告复核] LLM: 错别字检查...")
             self._check_typos()
             print("[报告复核] LLM: 公式验证...")
             self._check_formulas_llm()
+
+        # 汇总
         df = pd.DataFrame(self.findings)
         n = len(df)
         na = (df.get("结果") == "异常").sum() if "结果" in df.columns else 0
         print("[报告复核] {}项: {}异常".format(n, na))
+
         # 标注未提供的数据源
         for key, label in [("trial_balance","科目余额表"), ("prior_tb","上年TB"),
                            ("unaudited_fs","未审报表"), ("adjustments","调整分录"),
                            ("aging","账龄表"), ("fixed_assets","固资卡片"),
-                           ("bank_summary","银行汇总"), ("cash_flow","现金流表")]:
+                           ("bank_summary","银行汇总"), ("cash_flow","现金流表"),
+                           ("notes","附注明细")]:
             if key not in self.src:
                 self.coverage[label + "(未提供)"] = "跳过"
         return df
@@ -373,7 +595,7 @@ class ReportReviewer:
             for i, c in enumerate(tb.columns):
                 s = str(c)
                 if any(kw in s for kw in ["科目", "名称"]): subj_col = i
-                if any(kw in s for kw in ["期末余额", "余额", "金额"]): amt_col = i
+                if any(kw in s for kw in ["期末余额", "余额", "金额"]) and "期初" not in s: amt_col = i
         cash_amt = 0.0
         if tb is not None:
             for _, row in tb.iterrows():
@@ -400,7 +622,7 @@ class ReportReviewer:
             for i, c in enumerate(tb.columns):
                 s = str(c)
                 if any(kw in s for kw in ["科目", "名称"]): subj_col = i
-                if any(kw in s for kw in ["期末余额", "余额", "金额"]): amt_col = i
+                if any(kw in s for kw in ["期末余额", "余额", "金额"]) and "期初" not in s: amt_col = i
         ar_tb = 0.0
         if tb is not None:
             for _, row in tb.iterrows():
@@ -571,9 +793,27 @@ def _load_source(src):
 
 def review_report(report_docx=None, data_files=None, data_sources=None,
                   prior_report_docx=None, output_dir=None):
-    """报告复核
-    data_files: 文件路径列表，自动根据文件名识别类型
-    data_sources: 手动指定 {键: 路径或DataFrame}，优先级高于 data_files
+    """报告复核 - 一键审计报告质量检查（七类勾稽关系）
+
+    参数:
+        report_docx: 审计报告Word文档路径（可选，无Word报告时仅做非LLM校验）
+        data_files:   文件路径列表，自动根据文件名识别类型
+        data_sources: 手动指定 {键: 路径或DataFrame}，优先级高于 data_files
+            支持的键:
+            - trial_balance:  科目余额表(.xlsx)
+            - prior_tb:       上年科目余额表(.xlsx)
+            - unaudited_fs:   未审报表(.xlsx，多sheet含资产负债表/利润表)
+            - cash_flow:      现金流量表(.xlsx)
+            - fixed_assets:   固定资产卡片/折旧明细(.xlsx)
+            - bank_summary:   银行流水汇总(.xlsx)
+            - aging:          账龄分析表(.xlsx)
+            - adjustments:    审计调整分录(.xlsx)
+            - notes:          附注明细(dict: {附注名: DataFrame})
+        prior_report_docx: 上年审计报告路径（暂未使用）
+        output_dir:       输出目录，生成 报告复核结果.xlsx 和 校验覆盖状态.xlsx
+
+    返回:
+        DataFrame: findings 列表，包含所有检查项结果
     """
     # 自动归类
     auto = {}
@@ -589,6 +829,7 @@ def review_report(report_docx=None, data_files=None, data_sources=None,
             "cash_flow":     ["现金流量", "cash_flow", "现金流"],
             "tax":           ["应交税费", "税费明细", "tax"],
             "payroll":       ["应付职工薪酬", "工资薪酬", "payroll", "薪酬"],
+            "notes":         ["附注明细", "坏账准备", "存货跌价", "长期资产减值"],
         }
         for fp in data_files:
             name = Path(fp).stem
@@ -606,6 +847,11 @@ def review_report(report_docx=None, data_files=None, data_sources=None,
         src.update(data_sources)
 
     r = ReportReviewer(report_docx, src, prior_report_docx)
+
+    # 无LLM时禁用（避免连接超时）
+    if not os.environ.get("VLLM_TUNNEL_URL"):
+        r.disable_llm()
+
     df = r.run()
     if output_dir:
         out = Path(output_dir); out.mkdir(parents=True, exist_ok=True)
