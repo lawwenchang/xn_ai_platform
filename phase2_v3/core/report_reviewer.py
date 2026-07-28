@@ -15,6 +15,98 @@ VLLM_URL = os.environ.get("VLLM_TUNNEL_URL", "http://localhost:18000/v1/chat/com
 VLLM_KEY = os.environ.get("VLLM_API_KEY", "EMPTY")
 VLLM_MODEL_NAME = os.environ.get("VLLM_MODEL", "qwen3-235b")
 
+def _filter_tb_parents(tb):
+    """Filter TB to only parent/aggregate rows, excluding child/auxiliary-account rows.
+
+    Chinese TBs often have:
+      - Parent row: 辅助核算名称=NaN, containing the科目aggregate
+      - Child rows: 辅助核算名称=供应商/客户名, breaking down the parent
+
+    Without this filter, iterating all rows and summing/substring-matching
+    would double-count (parent + children).
+
+    Returns filtered DataFrame, or original if no filter column detected.
+    """
+    if tb is None:
+        return tb
+    # Strategy 1: detect auxiliary-account column (辅助核算名称)
+    aux_col = None
+    for c in tb.columns:
+        s = str(c).strip()
+        if "辅助核算名称" in s or "辅助核算" in s or "辅助名称" in s:
+            aux_col = c
+            break
+    if aux_col is not None:
+        # Keep rows where auxiliary name is NaN or empty string
+        mask = tb[aux_col].isna() | (tb[aux_col].astype(str).str.strip() == "")
+        filtered = tb[mask].copy()
+        # Diagnostic
+        removed = len(tb) - len(filtered)
+        if removed > 0:
+            print(f"  [TB过滤] 辅助核算列='{aux_col}': 保留 {len(filtered)} 行, 排除 {removed} 行辅助明细")
+        return filtered
+
+    # Strategy 2: detect科目编码 hierarchy (shorter code = parent)
+    code_col = None
+    for c in tb.columns:
+        s = str(c).strip()
+        if s in ("科目编码", "科目代码", "编码", "代码") or "科目编码" in s:
+            code_col = c
+            break
+    if code_col is not None:
+        # Parent codes are typically the shortest within each科目名称 group
+        # Keep rows whose code is not a longer variant of another parent
+        codes = tb[code_col].astype(str).str.strip()
+        is_child = pd.Series(False, index=tb.index)
+        for i, code in codes.items():
+            for j, other in codes.items():
+                if i != j and len(str(code)) > len(str(other)) and str(code).startswith(str(other)):
+                    is_child[i] = True
+                    break
+        filtered = tb[~is_child].copy()
+        removed = len(tb) - len(filtered)
+        if removed > 0:
+            print(f"  [TB过滤] 科目编码层级: 保留 {len(filtered)} 行, 排除 {removed} 行子科目")
+        return filtered
+
+    # Strategy 3: fallback -科目名称 without separators like "-", "（", "("
+    subj_col, _ = _find_best_tb_columns(tb)
+    if subj_col is not None:
+        names = tb[subj_col].astype(str).str.strip()
+        is_detail = names.str.contains(r"[-—（）()/_]", na=False, regex=True)
+        # But also ensure the parent actually exists (keep rows where name has NO separator)
+        parent_mask = ~is_detail
+        if parent_mask.sum() > 0 and parent_mask.sum() < len(tb):
+            filtered = tb[parent_mask].copy()
+            removed = len(tb) - len(filtered)
+            print(f"  [TB过滤] 科目名称层级(无分隔符): 保留 {len(filtered)} 行, 排除 {removed} 行子科目")
+            return filtered
+
+    return tb
+def _find_best_tb_columns(df, subj_kws=None, amt_kws=None):
+    """Scan columns by keyword match SCORE (not last-match).
+    '科目名称'(score=2) wins over '辅助核算名称'(score=1).
+    Returns (subj_col_name, amt_col_name)."""
+    if subj_kws is None:
+        subj_kws = ["科目", "名称"]
+    if amt_kws is None:
+        amt_kws = ["期末余额", "余额", "金额"]
+    subj_col = amt_col = None
+    subj_best = amt_best = 0
+    for c in df.columns:
+        s = str(c)
+        sc = sum(1 for kw in subj_kws if kw in s)
+        if sc > subj_best:
+            subj_best = sc
+            subj_col = str(c)
+        sc = sum(1 for kw in amt_kws if kw in s)
+        if "期初" in s:
+            sc = 0
+        if sc > amt_best:
+            amt_best = sc
+            amt_col = str(c)
+    return subj_col, amt_col
+
 
 class ReportReviewer:
 
@@ -98,13 +190,7 @@ class ReportReviewer:
             self.coverage["资产负债勾稽"] = "跳过(缺科目余额表)"
             return
 
-        subj_col = amt_col = None
-        for c in tb.columns:
-            s = str(c)
-            if any(kw in s for kw in ["科目", "名称"]):
-                subj_col = c
-            if any(kw in s for kw in ["期末余额", "余额", "金额"]) and "期初" not in s:
-                amt_col = c
+        subj_col, amt_col = _find_best_tb_columns(tb)
         if subj_col is None or amt_col is None:
             return
         a = l = e = 0.0
@@ -127,13 +213,7 @@ class ReportReviewer:
     def _check_financial_ratios(self, tb):
         if tb is None:
             return
-        subj_col = amt_col = None
-        for c in tb.columns:
-            s = str(c)
-            if any(kw in s for kw in ["科目", "名称"]):
-                subj_col = c
-            if any(kw in s for kw in ["期末余额", "余额", "金额"]) and "期初" not in s:
-                amt_col = c
+        subj_col, amt_col = _find_best_tb_columns(tb)
         if subj_col is None or amt_col is None:
             return
         bal = {}
@@ -161,13 +241,7 @@ class ReportReviewer:
             elif not self.tables: self.coverage["报告交叉校验"] = "跳过(缺Word报告)"
             return
 
-        subj_col = amt_col = None
-        for c in tb.columns:
-            s = str(c)
-            if any(kw in s for kw in ["科目", "名称"]):
-                subj_col = c
-            if any(kw in s for kw in ["期末余额", "余额", "金额"]) and "期初" not in s:
-                amt_col = c
+        subj_col, amt_col = _find_best_tb_columns(tb)
         if subj_col is None or amt_col is None:
             return
         tb_vals = {}
@@ -203,12 +277,7 @@ class ReportReviewer:
             self.coverage["异动分析"] = "跳过(缺{}期数据)".format("本" if tb is None else "上")
             return
 
-        subj_col = amt_col = None
-        for c in tb.columns:
-            if any(kw in str(c) for kw in ["科目", "名称"]):
-                subj_col = c
-            if any(kw in str(c) for kw in ["期末余额", "余额", "金额"]) and "期初" not in str(c):
-                amt_col = c
+        subj_col, amt_col = _find_best_tb_columns(tb)
         if subj_col is None or amt_col is None:
             return
         curr = {}
@@ -243,11 +312,14 @@ class ReportReviewer:
                 beg_col = c
                 break
         if beg_col is not None:
+            # 统一用 dict 方式取值（与 prior_end 一致），避免 .sum() 累加多行
+            curr_beg = {}
+            for _, row in tb.iterrows():
+                curr_beg[str(row[subj_col]).strip()] = float(
+                    pd.to_numeric(row[beg_col], errors="coerce") or 0)
             mismatch_count = 0
             for name in curr:
-                cur_beg_mask = tb[subj_col].astype(str).str.strip() == name
-                cur_beg = float(pd.to_numeric(
-                    tb.loc[cur_beg_mask, beg_col], errors="coerce").sum() or 0)
+                cur_beg = curr_beg.get(name, 0)
                 prior_end = prior.get(name, 0)
                 if abs(cur_beg) > 1 and abs(prior_end) > 1:
                     diff = round(abs(cur_beg - prior_end), 2)
@@ -358,16 +430,13 @@ class ReportReviewer:
             self.coverage["报表与附注勾稽"] = "跳过(缺附注数据)"
             return
 
-        subj_col = amt_col = 0
+        subj_col = amt_col = None
         tb_vals = {}
         if tb is not None:
-            for i, c in enumerate(tb.columns):
-                s = str(c)
-                if any(kw in s for kw in ["科目", "名称"]): subj_col = i
-                if any(kw in s for kw in ["期末余额", "余额", "金额"]) and "期初" not in s: amt_col = i
+            subj_col, amt_col = _find_best_tb_columns(tb)
             for _, row in tb.iterrows():
-                name = str(row.iloc[subj_col]).strip()
-                tb_vals[name] = float(pd.to_numeric(row.iloc[amt_col], errors="coerce") or 0)
+                name = str(row[subj_col]).strip()
+                tb_vals[name] = float(pd.to_numeric(row[amt_col], errors="coerce") or 0)
 
         NOTE_TB_MAP = {
             "应收账款": ["应收账款"], "其他应收款": ["其他应收款"],
@@ -514,6 +583,10 @@ class ReportReviewer:
         aging = _load_source(self.src.get('aging'))
         notes = self.src.get('notes')  # dict of DataFrames
 
+        # 过滤科目余额表：仅保留父级聚合行，排除辅助核算明细行，避免双重计算
+        tb = _filter_tb_parents(tb)
+        prior_tb = _filter_tb_parents(prior_tb)
+
         # 加载未审报表（可能为多sheet Excel）
         if unaudited_fs is None and 'unaudited_fs' in self.src:
             raw = self.src['unaudited_fs']
@@ -590,17 +663,14 @@ class ReportReviewer:
         else:
             self.coverage["银行资金勾稽"] = "跳过(列名不识别)"
             return
-        subj_col = amt_col = 0
+        subj_col = amt_col = None
         if tb is not None:
-            for i, c in enumerate(tb.columns):
-                s = str(c)
-                if any(kw in s for kw in ["科目", "名称"]): subj_col = i
-                if any(kw in s for kw in ["期末余额", "余额", "金额"]) and "期初" not in s: amt_col = i
+            subj_col, amt_col = _find_best_tb_columns(tb)
         cash_amt = 0.0
         if tb is not None:
             for _, row in tb.iterrows():
-                if "货币资金" in str(row.iloc[subj_col]):
-                    cash_amt += float(pd.to_numeric(row.iloc[amt_col], errors="coerce") or 0)
+                if "货币资金" in str(row[subj_col]):
+                    cash_amt += float(pd.to_numeric(row[amt_col], errors="coerce") or 0)
         diff = round(bank_total - cash_amt, 2)
         self.findings.append({"类别": "银行勾稽", "位置": "货币资金",
             "检查项": "银行汇总 vs 科目余额表", "银行汇总": round(bank_total, 2),
@@ -620,18 +690,22 @@ class ReportReviewer:
             ar_aging = pd.to_numeric(aging.loc[ar_mask, "合计"], errors="coerce").sum()
         elif "合计金额" in aging.columns:
             ar_aging = pd.to_numeric(aging.loc[ar_mask, "合计金额"], errors="coerce").sum()
-        subj_col = amt_col = 0
+        subj_col = amt_col = None
         if tb is not None:
-            for i, c in enumerate(tb.columns):
-                s = str(c)
-                if any(kw in s for kw in ["科目", "名称"]): subj_col = i
-                if any(kw in s for kw in ["期末余额", "余额", "金额"]) and "期初" not in s: amt_col = i
+            subj_col, amt_col = _find_best_tb_columns(tb)
         ar_tb = 0.0
         if tb is not None:
             for _, row in tb.iterrows():
-                if "应收账款" in str(row.iloc[subj_col]):
-                    ar_tb += float(pd.to_numeric(row.iloc[amt_col], errors="coerce") or 0)
+                if "应收账款" in str(row[subj_col]):
+                    ar_tb += float(pd.to_numeric(row[amt_col], errors="coerce") or 0)
         diff = round(ar_aging - ar_tb, 2)
+        # DIAGNOSTIC
+        print(f"  [账龄诊断] 账龄表应收账款合计={ar_aging:,.2f}, TB应收账款={ar_tb:,.2f}, diff={diff:,.2f}")
+        print(f"  [账龄诊断] aging列名={list(aging.columns[:3])}, TB-subj_col={subj_col}, TB-amt_col={amt_col}")
+        if ar_mask.sum() > 0:
+            print(f"  [账龄诊断] ar_mask选中{ar_mask.sum()}行: {aging.loc[ar_mask, name_col].tolist()}")
+        else:
+            print(f"  [账龄诊断] ar_mask未选中任何行! name_col='{name_col}', 首列值={aging.iloc[:,0].tolist()[:5]}")
         if ar_aging > 0 or ar_tb > 0:
             self.findings.append({"类别": "账龄勾稽", "位置": "应收账款",
                 "检查项": "账龄表 vs 科目余额表", "账龄合计": round(ar_aging, 2),
@@ -682,14 +756,10 @@ class ReportReviewer:
 
         # 从 TB 取（兜底）
         if tb is not None:
-            subj_col = amt_col = 0
-            for i, c in enumerate(tb.columns):
-                s = str(c)
-                if any(kw in s for kw in ["科目","名称"]): subj_col = i
-                if any(kw in s for kw in ["期末余额","余额","金额"]): amt_col = i
+            subj_col, amt_col = _find_best_tb_columns(tb)
             for _, row in tb.iterrows():
-                name = str(row.iloc[subj_col])
-                amt = float(pd.to_numeric(row.iloc[amt_col], errors="coerce") or 0)
+                name = str(row[subj_col])
+                amt = float(pd.to_numeric(row[amt_col], errors="coerce") or 0)
                 if is_net_profit is None and "净利润" in name and "未分配" not in name:
                     is_net_profit = amt
 
@@ -734,19 +804,16 @@ class ReportReviewer:
     def _check_cross_note_reasonableness(self, tb, fixed_assets):
         """跨科目合理性：折旧率、利息率是否在合理区间"""
         self.coverage["附注跨科目勾稽"] = "通过"
-        subj_col = amt_col = 0
+        subj_col = amt_col = None
         if tb is not None:
-            for i, c in enumerate(tb.columns):
-                s = str(c)
-                if any(kw in s for kw in ["科目","名称"]): subj_col = i
-                if any(kw in s for kw in ["期末余额","余额","金额"]): amt_col = i
+            subj_col, amt_col = _find_best_tb_columns(tb)
 
         # --- 9a. 折旧率合理区间 ---
         dep = fa_orig = 0.0
         if tb is not None:
             for _, row in tb.iterrows():
-                name = str(row.iloc[subj_col])
-                amt = abs(float(pd.to_numeric(row.iloc[amt_col], errors="coerce") or 0))
+                name = str(row[subj_col])
+                amt = abs(float(pd.to_numeric(row[amt_col], errors="coerce") or 0))
                 if "累计折旧" in name: dep = amt
                 if "固定资产" in name and "累计" not in name and "减值" not in name: fa_orig = amt
         if fixed_assets is not None:
@@ -771,8 +838,8 @@ class ReportReviewer:
         interest = loan = 0.0
         if tb is not None:
             for _, row in tb.iterrows():
-                name = str(row.iloc[subj_col])
-                amt = abs(float(pd.to_numeric(row.iloc[amt_col], errors="coerce") or 0))
+                name = str(row[subj_col])
+                amt = abs(float(pd.to_numeric(row[amt_col], errors="coerce") or 0))
                 if "利息支出" in name or "利息费用" in name: interest = amt
                 if "短期借款" in name or "长期借款" in name: loan += amt
         if interest > 0 and loan > 0:
