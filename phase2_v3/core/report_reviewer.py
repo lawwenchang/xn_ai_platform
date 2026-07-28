@@ -2,7 +2,7 @@
 报告复核工具 v2.0 - 一键审计报告质量检查
 用法:
     from core.report_reviewer import review_report
-    df = review_report("审计报告.docx", "科目余额表.xlsx")
+    df = review_report("审计报告.docx", {"trial_balance": "科目余额表.xlsx"})
     # LLM 自动从环境变量 VLLM_TUNNEL_URL 读取，默认 localhost:18000
 """
 
@@ -18,17 +18,16 @@ VLLM_MODEL_NAME = os.environ.get("VLLM_MODEL", "qwen3-235b")
 
 class ReportReviewer:
 
-    def __init__(self, report_path=None, tb_path=None, prior_tb_path=None):
+    def __init__(self, report_path=None, data_sources=None, prior_report_docx=None):
         self.report_path = Path(report_path) if report_path else None
-        self.tb_path = Path(tb_path) if tb_path else None
-        self.prior_tb_path = Path(prior_tb_path) if prior_tb_path else None
+        self.prior_report_docx = Path(prior_report_docx) if prior_report_docx else None
+        self.src = data_sources or {}
         self.llm_url = VLLM_URL
         self.llm_key = VLLM_KEY
         self.llm_model = VLLM_MODEL_NAME
         self.tables = []
-        self.tb = None
-        self.prior_tb = None
         self.findings = []
+        self.coverage = {}
 
     def set_llm(self, url=None, key=None, model=None):
         if url: self.llm_url = url
@@ -94,11 +93,13 @@ class ReportReviewer:
                         "计算值": round(detail_sum, 2), "差异": diff, "结果": "异常"})
 
     # -- 2. 资产负债表勾稽 --
-    def _check_balance_sheet_equation(self):
-        if self.tb is None:
+    def _check_balance_sheet_equation(self, tb):
+        if tb is None:
+            self.coverage["资产负债勾稽"] = "跳过(缺科目余额表)"
             return
+
         subj_col = amt_col = None
-        for c in self.tb.columns:
+        for c in tb.columns:
             s = str(c)
             if any(kw in s for kw in ["科目", "名称"]):
                 subj_col = c
@@ -107,7 +108,7 @@ class ReportReviewer:
         if subj_col is None or amt_col is None:
             return
         a = l = e = 0.0
-        for _, row in self.tb.iterrows():
+        for _, row in tb.iterrows():
             name = str(row[subj_col])
             amt = float(pd.to_numeric(row[amt_col], errors="coerce") or 0)
             if name[:4].startswith("1"):
@@ -123,11 +124,11 @@ class ReportReviewer:
             "结果": "通过" if abs(diff) < 0.5 else "异常"})
 
     # -- 3. 财务指标 --
-    def _check_financial_ratios(self):
-        if self.tb is None:
+    def _check_financial_ratios(self, tb):
+        if tb is None:
             return
         subj_col = amt_col = None
-        for c in self.tb.columns:
+        for c in tb.columns:
             s = str(c)
             if any(kw in s for kw in ["科目", "名称"]):
                 subj_col = c
@@ -136,7 +137,7 @@ class ReportReviewer:
         if subj_col is None or amt_col is None:
             return
         bal = {}
-        for _, row in self.tb.iterrows():
+        for _, row in tb.iterrows():
             name = str(row[subj_col])
             amt = float(pd.to_numeric(row[amt_col], errors="coerce") or 0)
             for key in ["货币资金", "应收账款", "存货", "流动资产", "固定资产",
@@ -154,11 +155,14 @@ class ReportReviewer:
                 "计算值": round(bal["负债合计"] / bal["资产总计"] * 100, 1), "结果": ""})
 
     # -- 4. 交叉校验 --
-    def _cross_check(self):
-        if self.tb is None or not self.tables:
+    def _cross_check(self, tb):
+        if tb is None or not self.tables:
+            if tb is None: self.coverage["报告交叉校验"] = "跳过(缺科目余额表)"
+            elif not self.tables: self.coverage["报告交叉校验"] = "跳过(缺Word报告)"
             return
+
         subj_col = amt_col = None
-        for c in self.tb.columns:
+        for c in tb.columns:
             s = str(c)
             if any(kw in s for kw in ["科目", "名称"]):
                 subj_col = c
@@ -167,7 +171,7 @@ class ReportReviewer:
         if subj_col is None or amt_col is None:
             return
         tb_vals = {}
-        for _, row in self.tb.iterrows():
+        for _, row in tb.iterrows():
             tb_vals[str(row[subj_col]).strip()] = float(
                 pd.to_numeric(row[amt_col], errors="coerce") or 0)
         for t in self.tables:
@@ -194,11 +198,13 @@ class ReportReviewer:
                             break
 
     # -- 5. 异动分析 --
-    def _variance_analysis(self):
-        if self.tb is None or self.prior_tb is None:
+    def _variance_analysis(self, tb, prior_tb):
+        if tb is None or prior_tb is None:
+            self.coverage["异动分析"] = "跳过(缺{}期数据)".format("本" if tb is None else "上")
             return
+
         subj_col = amt_col = None
-        for c in self.tb.columns:
+        for c in tb.columns:
             if any(kw in str(c) for kw in ["科目", "名称"]):
                 subj_col = c
             if any(kw in str(c) for kw in ["期末余额", "余额", "金额"]):
@@ -207,7 +213,7 @@ class ReportReviewer:
             return
         curr = {}
         prior = {}
-        for _, row in self.tb.iterrows():
+        for _, row in tb.iterrows():
             curr[str(row[subj_col]).strip()] = float(
                 pd.to_numeric(row[amt_col], errors="coerce") or 0)
         for _, row in self.prior_tb.iterrows():
@@ -316,17 +322,24 @@ class ReportReviewer:
     # -- 主流程 --
     def run(self):
         print("[报告复核] 开始...")
-        if self.tb_path:
-            self.tb = pd.read_excel(str(self.tb_path))
-        if self.prior_tb_path:
-            self.prior_tb = pd.read_excel(str(self.prior_tb_path))
+        tb = _load_source(self.src.get('trial_balance'))
+        prior_tb = _load_source(self.src.get('prior_tb'))
         if self.report_path:
             self._extract_docx_tables()
-        self._check_balance_sheet_equation()
-        self._check_financial_ratios()
+        self._check_balance_sheet_equation(tb)
+        self._check_financial_ratios(tb)
         self._check_table_formulas()
-        self._cross_check()
-        self._variance_analysis()
+        self._cross_check(tb)
+        self._variance_analysis(tb, prior_tb)
+        # 新增：银行汇总交叉校验
+        bank_summary = _load_source(self.src.get('bank_summary'))
+        if bank_summary is not None:
+            self._check_bank_consistency(bank_summary, tb)
+        # 新增：账龄分析对接
+        aging = _load_source(self.src.get('aging'))
+        if aging is not None:
+            self._check_aging_consistency(aging, tb)
+        # LLM
         if self.llm_url and self.report_path:
             print("[报告复核] LLM: 错别字检查...")
             self._check_typos()
@@ -336,15 +349,88 @@ class ReportReviewer:
         n = len(df)
         na = (df.get("结果") == "异常").sum() if "结果" in df.columns else 0
         print("[报告复核] {}项: {}异常".format(n, na))
+        # 标注未提供的数据源
+        for key, label in [("trial_balance","科目余额表"), ("prior_tb","上年TB"),
+                           ("unaudited_fs","未审报表"), ("adjustments","调整分录"),
+                           ("aging","账龄表"), ("fixed_assets","固资卡片"),
+                           ("bank_summary","银行汇总"), ("cash_flow","现金流表")]:
+            if key not in self.src:
+                self.coverage[label + "(未提供)"] = "跳过"
         return df
 
+    def _check_bank_consistency(self, bank_summary, tb):
+        """银行流水汇总 vs 科目余额表货币资金"""
+        self.coverage["银行资金勾稽"] = "通过"
+        if "银方净额" in bank_summary.columns:
+            bank_total = bank_summary["银方净额"].sum()
+        elif "期末余额" in bank_summary.columns:
+            bank_total = pd.to_numeric(bank_summary["期末余额"], errors="coerce").sum()
+        else:
+            self.coverage["银行资金勾稽"] = "跳过(列名不识别)"
+            return
+        subj_col = amt_col = 0
+        if tb is not None:
+            for i, c in enumerate(tb.columns):
+                s = str(c)
+                if any(kw in s for kw in ["科目", "名称"]): subj_col = i
+                if any(kw in s for kw in ["期末余额", "余额", "金额"]): amt_col = i
+        cash_amt = 0.0
+        if tb is not None:
+            for _, row in tb.iterrows():
+                if "货币资金" in str(row.iloc[subj_col]):
+                    cash_amt += float(pd.to_numeric(row.iloc[amt_col], errors="coerce") or 0)
+        diff = round(bank_total - cash_amt, 2)
+        self.findings.append({"类别": "银行勾稽", "位置": "货币资金",
+            "检查项": "银行汇总 vs 科目余额表", "银行汇总": round(bank_total, 2),
+            "科目余额表": round(cash_amt, 2), "差异": diff,
+            "结果": "通过" if abs(diff) < 0.5 else "异常"})
+        if abs(diff) >= 0.5:
+            self.coverage["银行资金勾稽"] = "异常"
 
-def review_report(report_docx=None, trial_balance_xlsx=None,
-                  prior_tb_xlsx=None, output_dir=None):
-    r = ReportReviewer(report_docx, trial_balance_xlsx, prior_tb_xlsx)
+    def _check_aging_consistency(self, aging, tb):
+        """账龄分析 vs 科目余额表往来科目"""
+        self.coverage["账龄勾稽"] = "通过"
+        ar_aging = 0.0
+        if "合计" in aging.columns:
+            ar_aging = pd.to_numeric(aging["合计"], errors="coerce").sum()
+        elif "合计金额" in aging.columns:
+            ar_aging = pd.to_numeric(aging["合计金额"], errors="coerce").sum()
+        subj_col = amt_col = 0
+        if tb is not None:
+            for i, c in enumerate(tb.columns):
+                s = str(c)
+                if any(kw in s for kw in ["科目", "名称"]): subj_col = i
+                if any(kw in s for kw in ["期末余额", "余额", "金额"]): amt_col = i
+        ar_tb = 0.0
+        if tb is not None:
+            for _, row in tb.iterrows():
+                if "应收账款" in str(row.iloc[subj_col]):
+                    ar_tb += float(pd.to_numeric(row.iloc[amt_col], errors="coerce") or 0)
+        diff = round(ar_aging - ar_tb, 2)
+        if ar_aging > 0 or ar_tb > 0:
+            self.findings.append({"类别": "账龄勾稽", "位置": "应收账款",
+                "检查项": "账龄表 vs 科目余额表", "账龄合计": round(ar_aging, 2),
+                "科目余额表": round(ar_tb, 2), "差异": diff,
+                "结果": "通过" if abs(diff) < 0.5 else "异常"})
+            if abs(diff) >= 0.5:
+                self.coverage["账龄勾稽"] = "异常"
+
+
+def _load_source(src):
+    """统一数据源加载：支持路径或DataFrame"""
+    if src is None:
+        return None
+    if isinstance(src, pd.DataFrame):
+        return src
+    return pd.read_excel(str(src))
+
+def review_report(report_docx=None, data_sources=None, prior_report_docx=None, output_dir=None):
+    r = ReportReviewer(report_docx, data_sources, prior_report_docx)
     df = r.run()
     if output_dir:
-        out = Path(output_dir)
-        out.mkdir(parents=True, exist_ok=True)
+        out = Path(output_dir); out.mkdir(parents=True, exist_ok=True)
         df.to_excel(str(out / "报告复核结果.xlsx"), index=False)
+        # 覆盖状态表
+        cov = pd.DataFrame([{"检查项": k, "状态": v} for k, v in r.coverage.items()])
+        cov.to_excel(str(out / "校验覆盖状态.xlsx"), index=False)
     return df
