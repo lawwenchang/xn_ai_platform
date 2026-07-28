@@ -424,13 +424,47 @@ def _load_source(src):
         return src
     return pd.read_excel(str(src))
 
-def review_report(report_docx=None, data_sources=None, prior_report_docx=None, output_dir=None):
-    r = ReportReviewer(report_docx, data_sources, prior_report_docx)
+def review_report(report_docx=None, data_files=None, data_sources=None,
+                  prior_report_docx=None, output_dir=None):
+    """报告复核
+    data_files: 文件路径列表，自动根据文件名识别类型
+    data_sources: 手动指定 {键: 路径或DataFrame}，优先级高于 data_files
+    """
+    # 自动归类
+    auto = {}
+    if data_files:
+        AUTO_RULES = {
+            "trial_balance": ["科目余额表", "TB", "trial_balance", "余额表"],
+            "prior_tb":      ["上年科目余额表", "上年余额表", "prior"],
+            "unaudited_fs":  ["未审报表", "资产负债表", "利润表", "unaudited"],
+            "adjustments":   ["调整分录", "审计调整", "adjust", "调整汇总"],
+            "aging":         ["账龄", "aging", "往来明细"],
+            "fixed_assets":  ["固定资产", "折旧明细", "卡片", "fixed_asset"],
+            "bank_summary":  ["银行流水", "银行汇总", "账户汇总", "bank_summary", "对手方收付"],
+            "cash_flow":     ["现金流量", "cash_flow", "现金流"],
+            "tax":           ["应交税费", "税费明细", "tax"],
+            "payroll":       ["应付职工薪酬", "工资薪酬", "payroll", "薪酬"],
+        }
+        for fp in data_files:
+            name = Path(fp).stem
+            for key, keywords in AUTO_RULES.items():
+                if any(kw in name for kw in keywords):
+                    auto[key] = fp
+                    break
+            else:
+                print("[报告复核] 未识别文件类型: {}".format(Path(fp).name))
+        print("[报告复核] 自动识别: {}".format(list(auto.keys())))
+
+    # 合并：手动指定优先
+    src = dict(auto)
+    if data_sources:
+        src.update(data_sources)
+
+    r = ReportReviewer(report_docx, src, prior_report_docx)
     df = r.run()
     if output_dir:
         out = Path(output_dir); out.mkdir(parents=True, exist_ok=True)
         df.to_excel(str(out / "报告复核结果.xlsx"), index=False)
-        # 覆盖状态表
         cov = pd.DataFrame([{"检查项": k, "状态": v} for k, v in r.coverage.items()])
         cov.to_excel(str(out / "校验覆盖状态.xlsx"), index=False)
     return df
