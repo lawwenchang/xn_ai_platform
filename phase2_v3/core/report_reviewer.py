@@ -415,6 +415,151 @@ class ReportReviewer:
             if abs(diff) >= 0.5:
                 self.coverage["账龄勾稽"] = "异常"
 
+    # -- 8. 报表间勾稽 --
+    def _check_cross_statement(self, unaudited_fs, cash_flow, tb):
+        """报表间勾稽：BS净利润→IS、BS货币资金→CF"""
+        self.coverage["报表间勾稽"] = "通过"
+        if unaudited_fs is None and tb is None:
+            self.coverage["报表间勾稽"] = "跳过(缺报表/TB)"
+            return
+
+        # --- 8a. 净利润勾稽：BS未分配利润变动 vs IS净利润 ---
+        bs_end_retained = bs_start_retained = is_net_profit = None
+
+        # 尝试从 unaudited_fs 取
+        if unaudited_fs is not None:
+            bs = is_ = None
+            if isinstance(unaudited_fs, dict):
+                bs = unaudited_fs.get("资产负债表") or unaudited_fs.get("BS")
+                is_ = unaudited_fs.get("利润表") or unaudited_fs.get("IS")
+            elif hasattr(unaudited_fs, 'items'):  # pd.ExcelFile / dict of sheets
+                for k in unaudited_fs.keys():
+                    if "资产负债" in str(k) or "BS" in str(k).upper():
+                        bs = unaudited_fs[k]
+                    if "利润" in str(k) or "IS" in str(k).upper():
+                        is_ = unaudited_fs[k]
+            if bs is not None:
+                bs = pd.DataFrame(bs) if not isinstance(bs, pd.DataFrame) else bs
+                for _, row in bs.iterrows():
+                    name = str(row.iloc[0])
+                    if "未分配利润" in name or "留存收益" in name:
+                        vals = pd.to_numeric(row.iloc[1:], errors="coerce").dropna()
+                        if len(vals) >= 2:
+                            bs_end_retained = float(vals.iloc[-1])
+                            bs_start_retained = float(vals.iloc[-2])
+            if is_ is not None:
+                is_ = pd.DataFrame(is_) if not isinstance(is_, pd.DataFrame) else is_
+                for _, row in is_.iterrows():
+                    if "净利润" in str(row.iloc[0]):
+                        vals = pd.to_numeric(row.iloc[1:], errors="coerce").dropna()
+                        if len(vals) >= 1:
+                            is_net_profit = float(vals.iloc[-1])
+
+        # 从 TB 取（兜底）
+        if tb is not None:
+            subj_col = amt_col = 0
+            for i, c in enumerate(tb.columns):
+                s = str(c)
+                if any(kw in s for kw in ["科目","名称"]): subj_col = i
+                if any(kw in s for kw in ["期末余额","余额","金额"]): amt_col = i
+            for _, row in tb.iterrows():
+                name = str(row.iloc[subj_col])
+                amt = float(pd.to_numeric(row.iloc[amt_col], errors="coerce") or 0)
+                if is_net_profit is None and "净利润" in name and "未分配" not in name:
+                    is_net_profit = amt
+
+        if bs_end_retained is not None and bs_start_retained is not None and is_net_profit is not None:
+            bs_change = bs_end_retained - bs_start_retained
+            diff = round(bs_change - is_net_profit, 2)
+            self.findings.append({"类别": "报表间勾稽", "位置": "BS未分配利润",
+                "检查项": "BS未分配利润变动 vs IS净利润", "BS变动": bs_change,
+                "IS净利润": is_net_profit, "差异": diff,
+                "结果": "通过" if abs(diff) < 0.5 else "异常"})
+            if abs(diff) >= 0.5:
+                self.coverage["报表间勾稽"] = "异常"
+
+        # --- 8b. 货币资金勾稽：BS变动 vs CF期末 ---
+        cf_cash = bs_cash_end = bs_cash_start = None
+        if cash_flow is not None:
+            cf = pd.DataFrame(cash_flow) if not isinstance(cash_flow, pd.DataFrame) else cash_flow
+            for _, row in cf.iterrows():
+                for kw in ["期末现金", "现金及现金等价物", "期末余额"]:
+                    if kw in str(row.iloc[0]):
+                        vals = pd.to_numeric(row.iloc[1:], errors="coerce").dropna()
+                        if len(vals) >= 1: cf_cash = float(vals.iloc[-1])
+                        break
+        if bs is not None:
+            for _, row in bs.iterrows():
+                if "货币资金" in str(row.iloc[0]):
+                    vals = pd.to_numeric(row.iloc[1:], errors="coerce").dropna()
+                    if len(vals) >= 2:
+                        bs_cash_end = float(vals.iloc[-1])
+                        bs_cash_start = float(vals.iloc[-2])
+
+        if cf_cash is not None and bs_cash_end is not None:
+            diff = round(cf_cash - bs_cash_end, 2)
+            self.findings.append({"类别": "报表间勾稽", "位置": "货币资金",
+                "检查项": "CF期末现金 vs BS货币资金期末", "CF期末": cf_cash,
+                "BS余额": bs_cash_end, "差异": diff,
+                "结果": "通过" if abs(diff) < 0.5 else "异常"})
+            if abs(diff) >= 0.5:
+                self.coverage["报表间勾稽"] = "异常"
+
+    # -- 9. 附注跨科目勾稽（合理性检验）--
+    def _check_cross_note_reasonableness(self, tb, fixed_assets):
+        """跨科目合理性：折旧率、利息率是否在合理区间"""
+        self.coverage["附注跨科目勾稽"] = "通过"
+        subj_col = amt_col = 0
+        if tb is not None:
+            for i, c in enumerate(tb.columns):
+                s = str(c)
+                if any(kw in s for kw in ["科目","名称"]): subj_col = i
+                if any(kw in s for kw in ["期末余额","余额","金额"]): amt_col = i
+
+        # --- 9a. 折旧率合理区间 ---
+        dep = fa_orig = 0.0
+        if tb is not None:
+            for _, row in tb.iterrows():
+                name = str(row.iloc[subj_col])
+                amt = abs(float(pd.to_numeric(row.iloc[amt_col], errors="coerce") or 0))
+                if "累计折旧" in name: dep = amt
+                if "固定资产" in name and "累计" not in name and "减值" not in name: fa_orig = amt
+        if fixed_assets is not None:
+            fa_df = pd.DataFrame(fixed_assets) if not isinstance(fixed_assets, pd.DataFrame) else fixed_assets
+            for c in fa_df.columns:
+                if "累计折旧" in str(c):
+                    dep = max(dep, pd.to_numeric(fa_df[c], errors="coerce").sum())
+                if "原值" in str(c) or "账面原值" in str(c):
+                    fa_orig = max(fa_orig, pd.to_numeric(fa_df[c], errors="coerce").sum())
+
+        if dep > 0 and fa_orig > 0:
+            ratio = round(dep / fa_orig * 100, 1)
+            flag = ""
+            if ratio < 1 or ratio > 50:
+                flag = "异常(折旧率{}%偏离正常区间)".format(ratio)
+                self.coverage["附注跨科目勾稽"] = "异常"
+            self.findings.append({"类别": "跨科目勾稽", "位置": "固定资产",
+                "检查项": "累计折旧/原值", "累计折旧": round(dep, 2),
+                "固定资产原值": round(fa_orig, 2), "折旧覆盖率%": ratio, "结果": flag or "通过"})
+
+        # --- 9b. 利息支出与借款余额匹配 ---
+        interest = loan = 0.0
+        if tb is not None:
+            for _, row in tb.iterrows():
+                name = str(row.iloc[subj_col])
+                amt = abs(float(pd.to_numeric(row.iloc[amt_col], errors="coerce") or 0))
+                if "利息支出" in name or "利息费用" in name: interest = amt
+                if "短期借款" in name or "长期借款" in name: loan += amt
+        if interest > 0 and loan > 0:
+            rate = round(interest / loan * 100, 1)
+            flag = ""
+            if rate < 1 or rate > 15:
+                flag = "异常(推算利率{}%偏离合理区间)".format(rate)
+                self.coverage["附注跨科目勾稽"] = "异常"
+            self.findings.append({"类别": "跨科目勾稽", "位置": "借款",
+                "检查项": "利息支出/借款余额≈利率", "利息支出": round(interest, 2),
+                "借款余额": round(loan, 2), "推算年利率%": rate, "结果": flag or "通过"})
+
 
 def _load_source(src):
     """统一数据源加载：支持路径或DataFrame"""
