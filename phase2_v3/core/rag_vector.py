@@ -27,7 +27,7 @@ EMBEDDING_MODEL = os.environ.get(
     "RAG_EMBEDDING_MODEL",
     "paraphrase-multilingual-MiniLM-L12-v2"  # 384-dim, 118MB, 支持中文
 )
-LOCAL_MODEL_DIR = Path(__file__).resolve().parent.parent / "data" / "models" / "sentence-transformers" / "paraphrase-multilingual-MiniLM-L12-v2"
+LOCAL_MODEL_DIR = Path(__file__).resolve().parent.parent / "data" / "models" /"models" / "extradimen" / "paraphrase-multilingual-MiniLM-L12-v2"
 TOP_K = 15
 MIN_SCORE = 0.35
 

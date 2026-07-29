@@ -303,7 +303,7 @@ class EphemeralSandbox:
                         "entrypoint.py": entrypoint_file,
                     }, "/home/auditor/")
 
-                    # 输入数据文件
+                    # 输入数据文件 → /home/auditor/inputs/（LLM代码中 os.path.dirname(__file__)/inputs）
                     input_file_map = {}
                     if input_dir.exists():
                         for fp in input_dir.iterdir():
@@ -312,10 +312,10 @@ class EphemeralSandbox:
                     if input_file_map:
                         container.exec_run(
                             ["python3", "-c",
-                             "import os; os.makedirs('/data/readonly', exist_ok=True)"],
+                             "import os; os.makedirs('/home/auditor/inputs', exist_ok=True)"],
                             stdout=True, stderr=True
                         )
-                        _put_tar(container, input_file_map, "/data/readonly/")
+                        _put_tar(container, input_file_map, "/home/auditor/inputs/")
 
                     # ═══ Step 5: exec_create + exec_start — 回接执行代码 ═══
                     exec_result = _exec_with_timeout(
@@ -335,6 +335,8 @@ class EphemeralSandbox:
                         if exec_result['output'] else ""
                     )
                     result.stdout = raw_output[-5000:] if raw_output else ""
+                    result.stderr = raw_output if raw_output else ""
+
 
                     # ═══ Step 6: get_archive — 拉取成果物 tar 流到本地 ═══
                     try:
