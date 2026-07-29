@@ -159,8 +159,7 @@ def _exec_with_timeout(client, container_id: str, cmd: list, timeout_sec: int) -
     def _do_exec():
         try:
             exec_id = client.api.exec_create(
-                container_id, cmd, stdout=True, stderr=True,
-                working_dir="/home/auditor"
+                container_id, cmd, stdout=True, stderr=True
             )["Id"]
             out = client.api.exec_start(exec_id, detach=False)
             inspect = client.api.exec_inspect(exec_id)
@@ -281,6 +280,7 @@ class EphemeralSandbox:
                     auto_remove=False,
                     detach=True,
                     name=container_name,
+                    working_dir="/home/auditor",
                     environment={
                         "PYTHONDONTWRITEBYTECODE": "1",
                         "PYTHONUNBUFFERED": "1",
