@@ -38,8 +38,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
-# ═══════════════════════════════════════════════════════════════
-# 常量（支持环境变量覆盖，兼容 Windows/Linux）
+def _safe_json(text, default):
+    """安全 JSON 解析：对历史损坏/错位数据返回默认值"""
+    if not text:
+        return default
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return default
+
+
+
 # ═══════════════════════════════════════════════════════════════
 # 获取 run_snapshot.py 所在目录的父目录（项目根目录）
 _BASE_DIR = Path(__file__).parent.parent
@@ -400,7 +409,13 @@ class RunSnapshotManager:
         """插入 Run 记录"""
         with sqlite3.connect(str(DB_PATH)) as conn:
             conn.execute("""
-                INSERT INTO runs VALUES (
+                INSERT INTO runs (
+                    run_id, project_code, subject, version, parent_run_id,
+                    status, user_intent, preset_button, input_files_hash, input_catalog,
+                    dag_blueprint, output_files, container_id, sandbox_code,
+                    execution_logs, retry_count, created_at, started_at, completed_at,
+                    validation_results, all_validations_passed
+                ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
@@ -546,17 +561,17 @@ class RunSnapshotManager:
             user_intent=row["user_intent"] or "",
             preset_button=row["preset_button"],
             input_files_hash=row["input_files_hash"] or "",
-            input_catalog=json.loads(row["input_catalog"]) if row["input_catalog"] else {},
-            dag_blueprint=json.loads(row["dag_blueprint"]) if row["dag_blueprint"] else None,
-            output_files=json.loads(row["output_files"]) if row["output_files"] else [],
+            input_catalog=(_safe_json(row["input_catalog"], {}) if row["input_catalog"] else {}),
+            dag_blueprint=_safe_json(row["dag_blueprint"], None) if row["dag_blueprint"] else None,
+            output_files=_safe_json(row["output_files"], []) if row["output_files"] else [],
             container_id=row["container_id"],
             sandbox_code=row["sandbox_code"],
-            execution_logs=json.loads(row["execution_logs"]) if row["execution_logs"] else [],
+            execution_logs=_safe_json(row["execution_logs"], []) if row["execution_logs"] else [],
             retry_count=row["retry_count"],
             created_at=row["created_at"] or "",
             started_at=row["started_at"],
             completed_at=row["completed_at"],
-            validation_results=json.loads(row["validation_results"]) if row["validation_results"] else [],
+            validation_results=_safe_json(row["validation_results"], []) if row["validation_results"] else [],
             all_validations_passed=bool(row["all_validations_passed"]),
         )
 
