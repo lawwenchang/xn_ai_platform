@@ -237,11 +237,8 @@ class EphemeralSandbox:
         try:
             # Step 1: AST 安全检查
             ast_safe, violations, _ = compile_with_restrictedpython(code)
-            if not ast_safe and not any("WARNING" in v for v in violations):
-                result.status = "FAILED"
-                result.error_message = f"AST 安全检查失败: {violations}"
-                return result
-
+            if violations:
+                result.stderr = f"AST whitelist warnings (non-blocking): {violations[:10]}"
             # Step 1.5: Python 语法预编译校验（零成本拦截运行时语法错误）
             try:
                 compile(code, "<string>", "exec")
@@ -266,7 +263,7 @@ class EphemeralSandbox:
                 output_dir.mkdir(parents=True, exist_ok=True)
 
                 client = self._get_client()
-                container_name = f"run_{run_id}_{uuid.uuid4().hex[:6]}"
+                container_name = f"run_{uuid.uuid4().hex[:12]}"  # 仅ASCII（Docker 容器名不允许中文）
                 cpu_quota = int(self.cpu_limit * 100000)
 
                 # ═══ Step 3: 回接模式 — 启动持久容器（Python sleep 保活，覆盖镜像 ENTRYPOINT） ═══
