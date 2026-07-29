@@ -159,7 +159,8 @@ def _exec_with_timeout(client, container_id: str, cmd: list, timeout_sec: int) -
     def _do_exec():
         try:
             exec_id = client.api.exec_create(
-                container_id, cmd, stdout=True, stderr=True
+                container_id, cmd, stdout=True, stderr=True,
+                working_dir="/home/auditor"
             )["Id"]
             out = client.api.exec_start(exec_id, detach=False)
             inspect = client.api.exec_inspect(exec_id)

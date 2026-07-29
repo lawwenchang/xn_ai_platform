@@ -2335,7 +2335,7 @@ def _dag_to_python(dag: Any, record: RunRecord) -> str:
                     f"                _mask = _mask | {src_var}[_col].astype(str).str.contains(_pat, na=False)",
                     f"    {op_alias} = {src_var}[~_mask].copy()",
                     f"    _removed = len({src_var}) - len({op_alias})",
-                    f"    print(f'[NoiseFilter] cols={cols_safe}, patterns={patterns_repr}, 过滤 {{_removed}} 行, 保留 {{len({op_alias})}} 行')",
+                    f"    print(f\"[NoiseFilter] cols={cols_safe}, patterns={patterns_repr}, 过滤 {{_removed}} 行, 保留 {{len({op_alias})}} 行\")",
                     f"else:",
                     f"    {op_alias} = {src_var}.copy() if '{src_var}' in dir() and {src_var} is not None else pd.DataFrame()",
                     f"    print('[NoiseFilter] 源数据为空，直通')",
